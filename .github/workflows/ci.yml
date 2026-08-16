@@ -1,0 +1,154 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: shellcheck ci scripts
+        run: sudo apt-get update -qq && sudo apt-get install -y shellcheck && shellcheck ci/*.sh
+
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ matrix.os }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # nextest does not run doctests, so they get their own step.
+      - run: cargo nextest run --all-features
+      - run: cargo test --doc --all-features
+
+  # Proves the crate compiles for every platform Flutter ships to.
+  mobile-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          - os: macos-latest
+            targets: aarch64-apple-ios aarch64-apple-ios-sim
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mobile-${{ matrix.os }}
+      - name: cargo check each target
+        run: |
+          for t in ${{ matrix.targets }}; do
+            rustup target add "$t"
+            echo "==> $t"
+            cargo check --target "$t" --all-features
+          done
+
+  wasm:
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [plain, atomics]
+        browser: [chrome, firefox]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select toolchain
+        id: tc
+        run: |
+          if [ "${{ matrix.lane }}" = atomics ]; then
+            echo "name=$(cat ci/wasm-toolchain.txt)" >> "$GITHUB_OUTPUT"
+            echo "components=rust-src" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=stable" >> "$GITHUB_OUTPUT"
+            echo "components=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.tc.outputs.name }}
+          targets: wasm32-unknown-unknown
+          components: ${{ steps.tc.outputs.components }}
+
+      # The build-std lane compiles std into the target dir; giving it a
+      # separate cache key stops it poisoning the stable lane's cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm-${{ matrix.lane }}-${{ matrix.browser }}
+
+      # The runner must match the resolved wasm-bindgen version EXACTLY or it
+      # aborts with a schema-version error. Derive it, never hand-pin it.
+      - name: Resolve wasm-bindgen version
+        id: wbg
+        run: |
+          v=$(cargo metadata --format-version 1 --no-deps=false \
+              | jq -r '.packages[] | select(.name=="wasm-bindgen") | .version' | head -1)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "resolved wasm-bindgen $v"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ steps.wbg.outputs.version }}
+
+      - uses: browser-actions/setup-chrome@v1
+        if: matrix.browser == 'chrome'
+        with:
+          install-chromedriver: true
+
+      - uses: browser-actions/setup-firefox@v1
+        if: matrix.browser == 'firefox'
+      - uses: browser-actions/setup-geckodriver@latest
+        if: matrix.browser == 'firefox'
+
+      # ci/wasm-test.sh refuses to run if any RUSTFLAGS variable is exported,
+      # and asserts a nonzero passing test count so a skipped lane cannot
+      # report success.
+      - run: ci/wasm-test.sh --${{ matrix.lane }} --${{ matrix.browser }}
+
+  # Single required status check for branch protection.
+  ci-green:
+    if: always()
+    needs: [lint, native, mobile-check, wasm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job did not succeed
+        run: |
+          echo '${{ toJSON(needs) }}'
+          if echo '${{ toJSON(needs) }}' | jq -e 'to_entries[] | select(.value.result != "success")' > /dev/null; then
+            echo "one or more jobs failed"
+            exit 1
+          fi
+          echo "all jobs succeeded"

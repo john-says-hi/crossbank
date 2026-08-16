@@ -24,9 +24,14 @@ use wasm_bindgen_test::*;
 wasm_bindgen_test_configure!(run_in_browser);
 
 /// Baseline: proves the browser runner executes anything at all.
+///
+/// Deliberately not `assert_eq!(2 + 2, 4)` — that is constant-folded, so it
+/// proves the compiler ran, not that the browser did. Calling into JS and
+/// getting a value back proves the wasm module actually executed in a host.
 #[wasm_bindgen_test]
 fn browser_runner_executes() {
-    assert_eq!(2 + 2, 4);
+    let now = js_sys::Date::now();
+    assert!(now > 0.0, "Date.now() returned {now} — no live JS host");
 }
 
 /// Proves we are in a real browser context with a DOM, not Node.
@@ -78,8 +83,8 @@ fn report_cross_origin_isolation() {
 #[wasm_bindgen_test]
 fn indexeddb_factory_is_reachable() {
     let window = web_sys::window().expect("no Window");
-    let factory = js_sys::Reflect::get(&window, &"indexedDB".into())
-        .expect("indexedDB lookup threw");
+    let factory =
+        js_sys::Reflect::get(&window, &"indexedDB".into()).expect("indexedDB lookup threw");
 
     assert!(
         !factory.is_undefined() && !factory.is_null(),

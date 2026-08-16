@@ -114,7 +114,11 @@ async fn one_mib_round_trips_via_copy() {
         .expect("read failed")
         .expect("1 MiB value missing");
 
-    assert_eq!(Uint8Array::new(&got).to_vec(), payload, "1 MiB value changed");
+    assert_eq!(
+        Uint8Array::new(&got).to_vec(),
+        payload,
+        "1 MiB value changed"
+    );
 
     db.close();
 }

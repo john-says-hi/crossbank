@@ -31,11 +31,13 @@
 #![warn(missing_debug_implementations)]
 
 pub mod backend;
+pub mod bank;
 pub mod codec;
 pub mod error;
 pub mod key;
 
 pub use backend::{Backend, MemoryBackend};
+pub use bank::{Bank, BankConfig, Location};
 pub use codec::{Filter, FilterChain};
 pub use error::{Error, Result};
 

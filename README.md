@@ -6,9 +6,10 @@ Cross-platform persistent key/value storage for Rust. One API on native and in t
 > original plan, why this project exists, the Flutter Hive parity we are matching, and the
 > traps that cost a day each.
 
-> **Status: pre-alpha.** The API and the in-memory backend work and are covered by a shared
-> conformance suite that runs natively and in real browsers. The `redb` and IndexedDB
-> backends are not written yet, so nothing persists. Do not depend on this.
+> **Status: pre-alpha.** The API, the in-memory backend and the `redb` backend all work and
+> are covered by a shared conformance suite that runs natively and in real browsers. Data
+> persists on desktop and mobile. The IndexedDB backend is not written yet, so **nothing
+> persists on the web**. Do not depend on this.
 
 ## Why
 

@@ -31,6 +31,9 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 # for every platform Flutter ships to.
 redb = "4.1"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile = "3"
+
 [dev-dependencies]
 # The shared spec. Cargo permits a dev-dependency cycle, which is what lets the
 # suite live in its own crate while still being run from crossbank's tests.

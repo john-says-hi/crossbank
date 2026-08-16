@@ -1,8 +1,9 @@
 # crossbank — build plan
 
-**Status: M1 complete.** 149 tests green natively; the conformance suite also runs in real
-browsers on both wasm lanes. Full CI matrix green — 11 jobs across Linux/macOS/Windows,
-Android/iOS compile checks, and wasm × 2 lanes × 2 browsers. M2 (the redb backend) is next.
+**Status: M2 complete.** 178 tests green natively — including the full conformance suite
+against **both** the memory and `redb` backends, plus crash-and-reopen tests that kill a real
+process. The suite also runs in real browsers on both wasm lanes. **Data now persists on
+desktop.** M3 (the IndexedDB backend) is next.
 
 > Resuming this project? Start with **[RESUME_HERE.md](RESUME_HERE.md)** — purpose, working
 > agreements, current state, and the known traps. This file is the technical plan.
@@ -284,7 +285,12 @@ conformance suite that runs natively *and* in a browser.
 negative-controlled — a harness that lies about persistence fails, and a spec list out of step
 with `CASE_COUNT` fails.*
 
-**M2 — redb backend + `Offload`.** Passes the suite unmodified. Crash-and-reopen.
+**M2 — redb backend. ✅ COMPLETE.** Passes the conformance suite unmodified — the whole
+backend cost one four-line test file, which is the suite's payoff. Crash-and-reopen tests
+spawn a real child process and abort it. `Offload` was not needed: because `commit(Vec<Op>)`
+takes a complete op list, every backend method is a single synchronous block with no await
+inside, so a `WriteTransaction` can never be held across an await. Revisit only if profiling
+demands it.
 
 **M3 — IndexedDB backend.** Same suite, Chrome and Firefox, plain and atomics. Should be
 mechanical if M1 held.

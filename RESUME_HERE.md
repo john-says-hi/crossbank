@@ -9,7 +9,7 @@ you rediscover them the hard way.
 - **Local checkout:** `~/Documents/crossbank`
 - **Owner:** John (`john-says-hi`)
 - **Started:** 2026-08-15 · **Last worked:** 2026-08-16
-- **State:** M0 and M1 complete. **M2 (the redb backend) is next.**
+- **State:** M0, M1 and M2 complete. **M3 (the IndexedDB backend) is next.**
 
 ---
 
@@ -144,13 +144,17 @@ envelope and filter chain, `Bank` with a locker registry and schema guard, eager
 lockers, closure-scoped transactions, bounded watch, `RemoteBank`, and an 18-case conformance
 suite that runs natively **and** in real browsers.
 
-**149 tests native. 28 in browsers on both wasm lanes. 11/11 CI jobs green. 19 commits.**
+**M2 — complete.** The `redb` backend. Passes the conformance suite unmodified — the entire
+backend cost one four-line test file. Plus crash-and-reopen tests that spawn a real child
+process and `abort()` it, proving a returned commit survives process death and a transaction
+killed before commit leaves nothing behind. **Data persists on desktop and mobile.**
+
+**178 tests native. 28 in browsers on both wasm lanes. 11/11 CI jobs green.**
 
 ### Remaining milestones
 
-- **M2 — redb backend** ← *next*. Must pass the conformance suite unmodified. Add native
-  crash-and-reopen tests. Exit: real persistence on desktop.
-- **M3 — IndexedDB backend.** Same suite, Chrome and Firefox, plain and atomics lanes.
+- **M3 — IndexedDB backend** ← *next*. Same suite, Chrome and Firefox, plain and atomics
+  lanes. Exit: real persistence on the web, which is the platform that actually ships.
 - **M4 — Big data.** Per-chunk framing, streaming `Writer`/`Reader`, orphan-chunk GC. Exit
   criterion is *bounded peak RSS*, not raw size — "multi-GB" is not testable on a 4 GiB target.
 - **M5 — Quota, eviction, coherence.** `persist()`, quota API, byte-budget LRU on a logical
@@ -222,9 +226,14 @@ Every one of these was hit and paid for already. Do not rediscover them.
 
 1. Read `PLAN.md`.
 2. Run `cargo nextest run` and one browser lane, and confirm green before changing anything.
-3. Start M2: write `src/backend/redb.rs`, add a `RedbHarness` to
-   `crossbank-conformance/src/harness.rs`, and add `tests/conformance_redb.rs` — which should
-   be four lines, because that is the whole point of the suite.
-4. The new harness sets `persists_across_open: true`, and
-   `reopen_matches_declared_persistence` will then genuinely test persistence rather than
-   asserting its absence.
+3. Start M3: write `src/backend/indexeddb.rs` on `indexed-db` 0.4.2, add an `IndexedDbHarness`
+   to `crossbank-conformance/src/harness.rs`, and add `tests/conformance_indexeddb.rs` — which
+   should be four lines, exactly as `tests/conformance_redb.rs` is. Follow `redb.rs` as the
+   worked example of what a backend looks like.
+4. Trap 8 below is the one that will bite: every method must be **one**
+   `db.transaction(...).run(...)` awaiting only IDB requests. `tests/spike_indexeddb.rs` and
+   `tests/spike_key_ordering.rs` already show the working shape against real IndexedDB.
+5. Consider adding the Safari lane at the same time — `wasm-bindgen-test-runner` supports
+   `safaridriver`, and GitHub's macOS runners ship it enabled. Safari has **zero** coverage
+   today, and its ITP deletes IndexedDB after 7 days without user interaction, which is a
+   product-level risk M5 must handle deliberately.

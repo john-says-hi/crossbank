@@ -39,6 +39,8 @@ pub mod locker;
 pub mod remote;
 pub mod watch;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use backend::RedbBackend;
 pub use backend::{Backend, MemoryBackend};
 pub use bank::{Bank, BankConfig, Location};
 pub use codec::{Filter, FilterChain};

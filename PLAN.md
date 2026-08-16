@@ -4,6 +4,9 @@
 browsers on both wasm lanes. Full CI matrix green — 11 jobs across Linux/macOS/Windows,
 Android/iOS compile checks, and wasm × 2 lanes × 2 browsers. M2 (the redb backend) is next.
 
+> Resuming this project? Start with **[RESUME_HERE.md](RESUME_HERE.md)** — purpose, working
+> agreements, current state, and the known traps. This file is the technical plan.
+
 ## Context
 
 wise_apple's Rust hub owns real persistent state — the encrypted vault, the macro-data

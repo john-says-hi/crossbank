@@ -32,6 +32,7 @@
 
 pub mod backend;
 pub mod error;
+pub mod key;
 
 pub use backend::{Backend, MemoryBackend};
 pub use error::{Error, Result};

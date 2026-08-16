@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crossbank-conformance"]
+
 [package]
 name = "crossbank"
 version = "0.0.0"
@@ -29,6 +32,9 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 redb = "4.1"
 
 [dev-dependencies]
+# The shared spec. Cargo permits a dev-dependency cycle, which is what lets the
+# suite live in its own crate while still being run from crossbank's tests.
+crossbank-conformance = { path = "crossbank-conformance" }
 # Test-only executor. crossbank itself never depends on an async runtime —
 # `futures::executor::block_on` needs no Send bounds, which is what lets the
 # same conformance cases run natively and under wasm_bindgen_test.

@@ -1,10 +1,14 @@
 //! Per-locker limits and retention policy.
 
 /// What happens to a locker's contents when storage runs short.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Policy {
     /// Never shed anything. The right choice for data that cannot be
     /// regenerated — saved reports, user documents, vault contents.
+    ///
+    /// The default: silently losing data for anyone who did not think about
+    /// retention would be the wrong way round. Opt in to loss, never out.
+    #[default]
     Precious,
 
     /// Shed least-recently-used entries to stay under `max_bytes`.
@@ -15,12 +19,6 @@ pub enum Policy {
     /// locker — so a policy expressed against it would be untestable natively
     /// and unenforceable anywhere.
     Evictable { max_bytes: u64 },
-}
-
-impl Default for Policy {
-    fn default() -> Self {
-        Self::Precious
-    }
 }
 
 /// Limits applied to one locker.

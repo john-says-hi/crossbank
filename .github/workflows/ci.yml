@@ -20,7 +20,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -39,7 +39,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -63,7 +63,7 @@ jobs:
             targets: aarch64-apple-ios aarch64-apple-ios-sim
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -84,7 +84,7 @@ jobs:
         browser: [chrome, firefox]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Select toolchain
         id: tc
@@ -131,10 +131,19 @@ jobs:
         with:
           tool: wasm-bindgen-cli@${{ steps.wbg.outputs.version }}
 
-      - uses: browser-actions/setup-chrome@v1
+      # Use the runner image's preinstalled Chrome + chromedriver pair rather
+      # than installing one. They ship together and are therefore
+      # version-matched by construction. browser-actions/setup-chrome with
+      # install-chromedriver pulled a dev chromedriver (153.0.8010.0) against
+      # the image's stable Chrome and failed with "session not created: This
+      # version of ChromeDriver only supports Chrome version 153".
+      - name: Point at the runner's matched chromedriver
         if: matrix.browser == 'chrome'
-        with:
-          install-chromedriver: true
+        run: |
+          test -n "${CHROMEWEBDRIVER:-}" || { echo "CHROMEWEBDRIVER unset on this image" >&2; exit 1; }
+          echo "CHROMEDRIVER=${CHROMEWEBDRIVER}/chromedriver" >> "$GITHUB_ENV"
+          "${CHROMEWEBDRIVER}/chromedriver" --version
+          google-chrome --version
 
       - uses: browser-actions/setup-firefox@v1
         if: matrix.browser == 'firefox'

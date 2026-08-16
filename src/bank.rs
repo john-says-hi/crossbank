@@ -17,9 +17,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::api::{Backend, Op, ScanRequest, Table};
 use crate::backend::KeyRange;
-use crate::codec::{default_chain, FilterChain};
+use crate::codec::{default_chain, type_tag, FilterChain};
 use crate::error::{Error, Result};
+
 use crate::key::LockerId;
+use crate::locker::{LazyLocker, Locker, LockerConfig};
+use serde::{de::DeserializeOwned, Serialize};
 
 /// On-disk format version for the bank as a whole.
 ///
@@ -205,6 +208,74 @@ impl Bank {
             .await?;
 
         self.cache(name, id);
+        Ok(id)
+    }
+
+    /// Open an eager locker: values resident, reads synchronous.
+    ///
+    /// For settings-shaped data — small, hot, read from paths that cannot
+    /// await. Fails if the stored contents exceed the configured budget, which
+    /// is the guardrail against reaching for this where a lazy locker was
+    /// meant.
+    pub async fn locker<T>(&self, name: &str) -> Result<Locker<T>>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        self.locker_with(name, LockerConfig::default()).await
+    }
+
+    /// As [`Bank::locker`], with explicit limits.
+    pub async fn locker_with<T>(&self, name: &str, config: LockerConfig) -> Result<Locker<T>>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        let id = self.prepare::<T>(name).await?;
+        Locker::open(
+            self.backend.clone(),
+            self.chain.clone(),
+            id,
+            name.to_string(),
+            config,
+        )
+        .await
+    }
+
+    /// Open a lazy locker: key index resident, values fetched on demand.
+    ///
+    /// For bulk data. Open cost scales with the number of keys, not the size
+    /// of the data.
+    pub async fn lazy_locker<T>(&self, name: &str) -> Result<LazyLocker<T>>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        self.lazy_locker_with(name, LockerConfig::default()).await
+    }
+
+    /// As [`Bank::lazy_locker`], with explicit limits.
+    pub async fn lazy_locker_with<T>(
+        &self,
+        name: &str,
+        config: LockerConfig,
+    ) -> Result<LazyLocker<T>>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        let id = self.prepare::<T>(name).await?;
+        LazyLocker::open(
+            self.backend.clone(),
+            self.chain.clone(),
+            id,
+            name.to_string(),
+            config,
+        )
+        .await
+    }
+
+    /// Resolve the id and bind the value type, so reopening a locker under a
+    /// different `T` is caught rather than silently mis-decoded.
+    async fn prepare<T>(&self, name: &str) -> Result<LockerId> {
+        let id = self.locker_id(name).await?;
+        self.bind_schema(id, &type_tag::<T>()).await?;
         Ok(id)
     }
 
@@ -404,6 +475,54 @@ mod tests {
         let two = block_on(b.locker_id("two")).unwrap();
         block_on(b.bind_schema(one, "Settings")).unwrap();
         block_on(b.bind_schema(two, "ReportMeta")).unwrap();
+    }
+
+    #[test]
+    fn lockers_open_from_the_bank_and_persist() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+
+        let first = block_on(Bank::with_backend(backend.clone())).unwrap();
+        let settings = block_on(first.locker::<String>("ui_settings")).unwrap();
+        block_on(settings.put("theme", "dark".into())).unwrap();
+
+        let candles = block_on(first.lazy_locker::<String>("candle_cache")).unwrap();
+        block_on(candles.put("BTCUSDT::1", &"ohlc".to_string())).unwrap();
+        drop(first);
+
+        let second = block_on(Bank::with_backend(backend)).unwrap();
+        let settings = block_on(second.locker::<String>("ui_settings")).unwrap();
+        assert_eq!(settings.get("theme").as_deref(), Some(&"dark".to_string()));
+
+        let candles = block_on(second.lazy_locker::<String>("candle_cache")).unwrap();
+        assert_eq!(
+            block_on(candles.get("BTCUSDT::1")).unwrap(),
+            Some("ohlc".into())
+        );
+    }
+
+    #[test]
+    fn two_lockers_do_not_see_each_other() {
+        let b = bank();
+        let one = block_on(b.locker::<String>("one")).unwrap();
+        let two = block_on(b.locker::<String>("two")).unwrap();
+
+        block_on(one.put("k", "from one".into())).unwrap();
+        block_on(two.put("k", "from two".into())).unwrap();
+
+        assert_eq!(one.get("k").as_deref(), Some(&"from one".to_string()));
+        assert_eq!(two.get("k").as_deref(), Some(&"from two".to_string()));
+    }
+
+    #[test]
+    fn reopening_a_locker_as_a_different_type_is_refused() {
+        // The schema guard, exercised end to end through the public API.
+        let b = bank();
+        block_on(b.locker::<String>("x")).unwrap();
+
+        match block_on(b.locker::<u64>("x")) {
+            Err(Error::SchemaMismatch { .. }) => {}
+            other => panic!("expected a schema mismatch, got {:?}", other.map(|_| "ok")),
+        }
     }
 
     #[test]

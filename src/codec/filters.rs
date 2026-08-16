@@ -2,7 +2,7 @@
 //!
 //! Compression and checksumming only. No cipher — crossbank deliberately
 //! ships none, so that key handling stays with the application that owns the
-//! keys. Implement [`Filter`](super::api::Filter) to add one.
+//! keys. Implement [`Filter`] to add one.
 
 use super::api::{Filter, MAX_DECODED_BYTES};
 use crate::error::{Error, Result};

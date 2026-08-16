@@ -52,6 +52,9 @@ pub enum Error {
     /// A user-supplied codec or cipher failed.
     Filter(String),
 
+    /// A locker was opened with settings that contradict each other.
+    InvalidConfig(String),
+
     /// The `Bank` this handle belongs to has shut down.
     Closed,
 }
@@ -84,6 +87,7 @@ impl fmt::Display for Error {
                 "envelope version {found} is not readable by this build (supports {supported})"
             ),
             Self::Filter(msg) => write!(f, "codec or cipher failed: {msg}"),
+            Self::InvalidConfig(msg) => write!(f, "invalid locker configuration: {msg}"),
             Self::Closed => write!(f, "the bank has been closed"),
         }
     }

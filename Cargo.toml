@@ -1,0 +1,23 @@
+[package]
+name = "crossbank"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Cross-platform persistent key/value storage for Rust — one API on native and in the browser."
+repository = "https://github.com/john-says-hi/crossbank"
+readme = "README.md"
+keywords = ["storage", "key-value", "wasm", "indexeddb", "embedded"]
+categories = ["database-implementations", "wasm"]
+# Flipped on at M6. Guards against an accidental early publish.
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-test = "0.3"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "console"] }

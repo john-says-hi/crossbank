@@ -1,6 +1,8 @@
 # crossbank — build plan
 
-**Status: M0 complete.** Both wasm lanes green, 10 tests each. M1 is next.
+**Status: M0 complete.** Full CI matrix green — 11 jobs: lint, native on Linux/macOS/Windows,
+Android and iOS compile checks, and wasm across both lanes × Chrome and Firefox. 10 tests per
+wasm lane. M1 is next.
 
 ## Context
 

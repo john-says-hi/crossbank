@@ -114,8 +114,16 @@ jobs:
       - name: Resolve wasm-bindgen version
         id: wbg
         run: |
-          v=$(cargo metadata --format-version 1 --no-deps=false \
+          # --no-deps is a flag, not a key=value. Passing --no-deps=false is a
+          # hard error, which resolved this to an empty string and made the
+          # install step ask for "wasm-bindgen-cli@". Resolve WITH deps, which
+          # is the default, and refuse to continue on an empty result.
+          v=$(cargo metadata --format-version 1 \
               | jq -r '.packages[] | select(.name=="wasm-bindgen") | .version' | head -1)
+          if [ -z "$v" ]; then
+            echo "FATAL: could not resolve a wasm-bindgen version" >&2
+            exit 1
+          fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "resolved wasm-bindgen $v"
 

@@ -19,5 +19,10 @@ publish = false
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-test = "0.3"
+wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["Window", "console"] }
+# M0 spike: the candidate web backend. Chosen over `indexed_db_futures`
+# because that crate pulls tokio in for one of its features, and crossbank
+# must never depend on an async runtime.
+indexed-db = "0.4.2"

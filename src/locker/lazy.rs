@@ -21,6 +21,7 @@ use crate::key::LockerId;
 
 use super::inner::Inner;
 use super::policy::LockerConfig;
+use super::transaction::{Staged, Transaction};
 
 /// A locker that keeps only its key index in memory.
 pub struct LazyLocker<T> {
@@ -50,6 +51,7 @@ where
         config: LockerConfig,
     ) -> Result<Self> {
         let inner = Arc::new(Inner {
+            write_lock: futures::lock::Mutex::new(()),
             backend,
             chain,
             id,
@@ -110,6 +112,56 @@ where
     pub async fn clear(&self) -> Result<()> {
         self.inner.commit(vec![self.inner.clear_op()]).await?;
         self.touch_index(|i| i.clear());
+        Ok(())
+    }
+
+    /// Run a transaction: every staged write lands together, or none does.
+    ///
+    /// The closure form is deliberate. Staging in memory means no backend
+    /// transaction is open while your code runs, which is what makes this safe
+    /// on IndexedDB — see the module docs on [`Transaction`].
+    ///
+    /// Returning `Err` rolls back: nothing is written and the index is
+    /// untouched.
+    pub async fn transact<F, Fut>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(Transaction<T>) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let _guard = self.inner.write_lock.lock().await;
+
+        let tx = Transaction::new(self.inner.clone());
+        let staged = tx.staged_handle();
+        f(tx).await?;
+
+        let entries = {
+            let mut guard = staged
+                .lock()
+                .map_err(|_| Error::backend("transaction lock was poisoned"))?;
+            std::mem::take(&mut *guard)
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let ops = Transaction::<T>::ops_for(&self.inner, &entries);
+        self.inner.commit(ops).await?;
+
+        // Index updates only after the commit lands, so a failed write cannot
+        // leave the index claiming keys that were never stored.
+        self.touch_index(|i| {
+            for entry in &entries {
+                match entry {
+                    Staged::Put { key, .. } => {
+                        i.insert(key.clone());
+                    }
+                    Staged::Delete { key } => {
+                        i.remove(key);
+                    }
+                    Staged::Clear => i.clear(),
+                }
+            }
+        });
         Ok(())
     }
 
@@ -304,6 +356,91 @@ mod tests {
     fn deleting_an_absent_key_is_not_an_error() {
         let l = locker();
         block_on(l.delete("ghost")).unwrap();
+    }
+
+    #[test]
+    fn a_transaction_commits_every_write_together() {
+        let l = locker();
+        block_on(l.transact(|tx| async move {
+            tx.put("a", "1".to_string())?;
+            tx.put("b", "2".to_string())?;
+            tx.put("manifest", "done".to_string())?;
+            Ok(())
+        }))
+        .unwrap();
+
+        assert_eq!(l.len(), 3);
+        assert_eq!(block_on(l.get("manifest")).unwrap(), Some("done".into()));
+    }
+
+    #[test]
+    fn a_failed_transaction_writes_nothing() {
+        // The property that makes chunked writes safe: a crash or error partway
+        // through must leave the previous state intact, not a half-written one.
+        let l = seeded(&[("existing", "old")]);
+
+        let outcome: Result<()> = block_on(l.transact(|tx| async move {
+            tx.put("a", "1".to_string())?;
+            tx.put("b", "2".to_string())?;
+            Err(Error::backend("something went wrong"))
+        }));
+        assert!(outcome.is_err());
+
+        assert_eq!(block_on(l.get("a")).unwrap(), None);
+        assert_eq!(block_on(l.get("b")).unwrap(), None);
+        assert_eq!(block_on(l.get("existing")).unwrap(), Some("old".into()));
+        assert_eq!(l.len(), 1, "the index must not have been touched either");
+    }
+
+    #[test]
+    fn a_transaction_reads_its_own_writes() {
+        let l = seeded(&[("k", "stored")]);
+        block_on(l.transact(|tx| async move {
+            assert_eq!(tx.get("k").await?, Some("stored".to_string()));
+            tx.put("k", "staged".to_string())?;
+            assert_eq!(tx.get("k").await?, Some("staged".to_string()));
+            tx.delete("k")?;
+            assert_eq!(tx.get("k").await?, None);
+            Ok(())
+        }))
+        .unwrap();
+
+        assert_eq!(block_on(l.get("k")).unwrap(), None);
+    }
+
+    #[test]
+    fn later_staged_writes_win_over_earlier_ones() {
+        let l = locker();
+        block_on(l.transact(|tx| async move {
+            tx.put("k", "first".to_string())?;
+            tx.put("k", "second".to_string())?;
+            Ok(())
+        }))
+        .unwrap();
+        assert_eq!(block_on(l.get("k")).unwrap(), Some("second".into()));
+    }
+
+    #[test]
+    fn an_empty_transaction_is_a_no_op() {
+        let l = seeded(&[("k", "v")]);
+        block_on(l.transact(|_tx| async move { Ok(()) })).unwrap();
+        assert_eq!(block_on(l.get("k")).unwrap(), Some("v".into()));
+    }
+
+    #[test]
+    fn a_staged_clear_hides_earlier_keys_from_reads() {
+        let l = seeded(&[("a", "1")]);
+        block_on(l.transact(|tx| async move {
+            tx.clear()?;
+            assert_eq!(tx.get("a").await?, None);
+            tx.put("fresh", "new".to_string())?;
+            Ok(())
+        }))
+        .unwrap();
+
+        assert_eq!(block_on(l.get("a")).unwrap(), None);
+        assert_eq!(block_on(l.get("fresh")).unwrap(), Some("new".into()));
+        assert_eq!(l.len(), 1);
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::key::LockerId;
 
 use super::inner::Inner;
 use super::policy::{LockerConfig, Policy};
+use super::transaction::{Staged, Transaction};
 
 /// A locker whose values live in memory.
 pub struct Locker<T> {
@@ -68,6 +69,7 @@ where
         }
 
         let inner = Arc::new(Inner {
+            write_lock: futures::lock::Mutex::new(()),
             backend,
             chain,
             id,
@@ -142,6 +144,63 @@ where
             guard.insert(key.to_string(), shared.clone());
         }
         Ok(shared)
+    }
+
+    /// Run a transaction: every staged write lands together, or none does.
+    ///
+    /// Returning `Err` rolls back — nothing is written and the resident copy
+    /// is untouched.
+    pub async fn transact<F, Fut>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(Transaction<T>) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let _guard = self.inner.write_lock.lock().await;
+
+        let tx = Transaction::new(self.inner.clone());
+        let staged = tx.staged_handle();
+        f(tx).await?;
+
+        let entries = {
+            let mut guard = staged
+                .lock()
+                .map_err(|_| Error::backend("transaction lock was poisoned"))?;
+            std::mem::take(&mut *guard)
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // An eager locker holds its values, so the size limit applies to
+        // transactional writes exactly as it does to a plain put.
+        for entry in &entries {
+            if let Staged::Put { bytes, .. } = entry {
+                if bytes.len() > self.inner.config.max_inline {
+                    return Err(Error::ValueTooLarge {
+                        bytes: bytes.len(),
+                        max_inline: self.inner.config.max_inline,
+                    });
+                }
+            }
+        }
+
+        let ops = Transaction::<T>::ops_for(&self.inner, &entries);
+        self.inner.commit(ops).await?;
+
+        if let Ok(mut guard) = self.values.lock() {
+            for entry in entries {
+                match entry {
+                    Staged::Put { key, value, .. } => {
+                        guard.insert(key, value);
+                    }
+                    Staged::Delete { key } => {
+                        guard.remove(&key);
+                    }
+                    Staged::Clear => guard.clear(),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Remove a key. Removing an absent key is not an error.
@@ -271,6 +330,51 @@ mod tests {
         block_on(l.delete("k")).unwrap();
         assert!(l.get("k").is_none());
         assert_eq!(l.len(), 0);
+    }
+
+    #[test]
+    fn a_transaction_updates_ram_only_after_it_commits() {
+        let l = locker();
+        block_on(l.transact(|tx| async move {
+            tx.put("a", "1".to_string())?;
+            tx.put("b", "2".to_string())?;
+            Ok(())
+        }))
+        .unwrap();
+
+        assert_eq!(l.len(), 2);
+        assert_eq!(l.get("a").as_deref(), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn a_failed_transaction_leaves_the_resident_copy_alone() {
+        let l = locker();
+        block_on(l.put("existing", "old".into())).unwrap();
+
+        let outcome: Result<()> = block_on(l.transact(|tx| async move {
+            tx.put("a", "1".to_string())?;
+            Err(Error::backend("nope"))
+        }));
+        assert!(outcome.is_err());
+
+        assert!(l.get("a").is_none());
+        assert_eq!(l.get("existing").as_deref(), Some(&"old".to_string()));
+        assert_eq!(l.len(), 1);
+    }
+
+    #[test]
+    fn a_transaction_respects_the_inline_size_limit() {
+        // The limit must not be bypassable by routing a write through a
+        // transaction instead of put().
+        let l = open_with(LockerConfig::default().with_max_inline(64)).unwrap();
+
+        let outcome: Result<()> = block_on(l.transact(|tx| async move {
+            tx.put("big", "x".repeat(10_000))?;
+            Ok(())
+        }));
+
+        assert!(matches!(outcome, Err(Error::ValueTooLarge { .. })));
+        assert!(l.get("big").is_none());
     }
 
     #[test]

@@ -19,6 +19,9 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 lz4_flex = "0.14"
 crc32fast = "1"
+# For `futures::lock::Mutex` and, later, channels. Explicitly NOT an async
+# runtime: crossbank spawns nothing and leaves execution to the caller.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # M0 spike: the candidate native backend. Pure Rust, ACID, and it must build

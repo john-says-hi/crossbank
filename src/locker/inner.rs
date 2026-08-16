@@ -21,6 +21,10 @@ use super::policy::LockerConfig;
 pub(crate) const SCAN_PAGE: usize = 256;
 
 pub(crate) struct Inner {
+    /// Held for the duration of a transaction, so two overlapping transactions
+    /// on one locker cannot lose each other's updates. A futures mutex rather
+    /// than a std one because it is held across await points.
+    pub(crate) write_lock: futures::lock::Mutex<()>,
     pub(crate) backend: Arc<dyn Backend>,
     pub(crate) chain: Arc<FilterChain>,
     pub(crate) id: LockerId,

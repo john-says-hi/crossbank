@@ -1,0 +1,28 @@
+# Threaded / shared-memory wasm profile.
+#
+# Selected with `cargo --config ci/wasm-atomics.toml ...` rather than a
+# RUSTFLAGS environment variable, on purpose. Exporting RUSTFLAGS *replaces*
+# a .cargo/config.toml `target.*.rustflags` array instead of appending to it,
+# which silently breaks shared-memory linking. Keeping these flags in a
+# separate config file that is opted into means crossbank's own
+# .cargo/config.toml stays free of wasm rustflags entirely, and the plain
+# lane is simply the absence of this file.
+#
+# These must stay byte-identical to what a threaded consumer ships. See
+# docs/consumer-cargo-config.toml.
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+  "-C", "link-arg=--shared-memory",
+  "-C", "link-arg=--import-memory",
+  "-C", "link-arg=--export-memory=memory",
+  "-C", "link-arg=--max-memory=4294967296",
+  # Required, not optional. Without these, wasm-bindgen's threading pass fails
+  # with "failed to prepare module for threading: failed to find
+  # `__wasm_init_tls`". Verified by omitting them and watching it break.
+  "-C", "link-arg=--export=__wasm_init_tls",
+  "-C", "link-arg=--export=__tls_base",
+  "-C", "link-arg=--export-if-defined=__tls_size",
+  "-C", "link-arg=--export-if-defined=__tls_align",
+]

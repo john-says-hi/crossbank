@@ -13,6 +13,12 @@ categories = ["database-implementations", "wasm"]
 publish = false
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+# Compact and stable, but deliberately NOT self-describing — which is why a
+# locker records a schema tag.
+postcard = { version = "1", features = ["use-std"] }
+lz4_flex = "0.14"
+crc32fast = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # M0 spike: the candidate native backend. Pure Rust, ACID, and it must build

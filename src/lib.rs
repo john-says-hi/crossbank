@@ -31,10 +31,12 @@
 #![warn(missing_debug_implementations)]
 
 pub mod backend;
+pub mod codec;
 pub mod error;
 pub mod key;
 
 pub use backend::{Backend, MemoryBackend};
+pub use codec::{Filter, FilterChain};
 pub use error::{Error, Result};
 
 /// The crate name, useful in diagnostics.

@@ -31,6 +31,7 @@ use crate::key::LockerId;
 use super::inner::Inner;
 use super::policy::{LockerConfig, Policy};
 use super::transaction::{Staged, Transaction};
+use crate::watch::Event;
 
 /// A locker whose values live in memory.
 pub struct Locker<T> {
@@ -75,6 +76,7 @@ where
             id,
             name,
             config,
+            watchers: Default::default(),
         });
 
         let mut values = BTreeMap::new();
@@ -143,6 +145,9 @@ where
         if let Ok(mut guard) = self.values.lock() {
             guard.insert(key.to_string(), shared.clone());
         }
+        self.inner.announce(Event::Put {
+            key: key.to_string(),
+        });
         Ok(shared)
     }
 
@@ -188,16 +193,24 @@ where
         self.inner.commit(ops).await?;
 
         if let Ok(mut guard) = self.values.lock() {
-            for entry in entries {
+            for entry in &entries {
                 match entry {
                     Staged::Put { key, value, .. } => {
-                        guard.insert(key, value);
+                        guard.insert(key.clone(), value.clone());
                     }
                     Staged::Delete { key } => {
-                        guard.remove(&key);
+                        guard.remove(key);
                     }
                     Staged::Clear => guard.clear(),
                 }
+            }
+        }
+
+        for entry in &entries {
+            match entry {
+                Staged::Put { key, .. } => self.inner.announce(Event::Put { key: key.clone() }),
+                Staged::Delete { key } => self.inner.announce(Event::Deleted { key: key.clone() }),
+                Staged::Clear => self.inner.announce(Event::Cleared),
             }
         }
         Ok(())
@@ -209,6 +222,9 @@ where
         if let Ok(mut guard) = self.values.lock() {
             guard.remove(key);
         }
+        self.inner.announce(Event::Deleted {
+            key: key.to_string(),
+        });
         Ok(())
     }
 
@@ -218,6 +234,7 @@ where
         if let Ok(mut guard) = self.values.lock() {
             guard.clear();
         }
+        self.inner.announce(Event::Cleared);
         Ok(())
     }
 }
@@ -270,6 +287,22 @@ impl<T> Locker<T> {
             .unwrap_or_default()
     }
 
+    /// Subscribe to every change in this locker.
+    pub fn watch(&self) -> crate::watch::EventStream {
+        self.inner
+            .watchers
+            .subscribe(None, crate::watch::DEFAULT_CAPACITY)
+    }
+
+    /// Subscribe to changes affecting one key.
+    ///
+    /// `Cleared` still arrives, because a clear affects every key.
+    pub fn watch_key(&self, key: &str) -> crate::watch::EventStream {
+        self.inner
+            .watchers
+            .subscribe(Some(key.to_string()), crate::watch::DEFAULT_CAPACITY)
+    }
+
     /// A snapshot of every entry, in byte order.
     pub fn entries(&self) -> Vec<(String, Arc<T>)> {
         self.values
@@ -285,6 +318,7 @@ mod tests {
     use crate::backend::MemoryBackend;
     use crate::codec::default_chain;
     use futures::executor::block_on;
+    use futures::StreamExt;
 
     fn open_with(config: LockerConfig) -> Result<Locker<String>> {
         block_on(Locker::open(
@@ -375,6 +409,21 @@ mod tests {
 
         assert!(matches!(outcome, Err(Error::ValueTooLarge { .. })));
         assert!(l.get("big").is_none());
+    }
+
+    #[test]
+    fn an_eager_locker_announces_its_writes() {
+        let l = locker();
+        let mut events = l.watch();
+
+        block_on(l.put("theme", "dark".into())).unwrap();
+
+        assert_eq!(
+            block_on(events.next()),
+            Some(crate::watch::Event::Put {
+                key: "theme".into()
+            })
+        );
     }
 
     #[test]

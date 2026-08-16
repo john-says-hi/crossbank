@@ -36,12 +36,14 @@ pub mod codec;
 pub mod error;
 pub mod key;
 pub mod locker;
+pub mod watch;
 
 pub use backend::{Backend, MemoryBackend};
 pub use bank::{Bank, BankConfig, Location};
 pub use codec::{Filter, FilterChain};
 pub use error::{Error, Result};
-pub use locker::{LazyLocker, Locker, LockerConfig, Policy};
+pub use locker::{LazyLocker, Locker, LockerConfig, Policy, Transaction};
+pub use watch::{Event, EventStream};
 
 /// The crate name, useful in diagnostics.
 pub const NAME: &str = "crossbank";

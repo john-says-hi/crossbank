@@ -15,6 +15,7 @@ use crate::error::Result;
 use crate::key::{self, LockerId};
 
 use super::policy::LockerConfig;
+use crate::watch::{Event, Watchers};
 
 /// How many records a single scan page pulls. Bounded because an IndexedDB
 /// cursor cannot outlive its transaction, so every scan pages regardless.
@@ -30,6 +31,7 @@ pub(crate) struct Inner {
     pub(crate) id: LockerId,
     pub(crate) name: String,
     pub(crate) config: LockerConfig,
+    pub(crate) watchers: Watchers,
 }
 
 impl std::fmt::Debug for Inner {
@@ -83,6 +85,12 @@ impl Inner {
 
     pub(crate) async fn commit(&self, ops: Vec<Op>) -> Result<()> {
         self.backend.commit(ops).await
+    }
+
+    /// Announce a change. Called only AFTER a commit lands, so a subscriber is
+    /// never told about a write that did not happen.
+    pub(crate) fn announce(&self, event: Event) {
+        self.watchers.broadcast(&event);
     }
 
     /// Walk every record in a range, paging until exhausted.

@@ -22,6 +22,7 @@ use crate::key::LockerId;
 use super::inner::Inner;
 use super::policy::LockerConfig;
 use super::transaction::{Staged, Transaction};
+use crate::watch::Event;
 
 /// A locker that keeps only its key index in memory.
 pub struct LazyLocker<T> {
@@ -57,6 +58,7 @@ where
             id,
             name,
             config,
+            watchers: Default::default(),
         });
 
         // Keys only. Reading values here would defeat the entire point.
@@ -96,6 +98,9 @@ where
         self.touch_index(|i| {
             i.insert(key.to_string());
         });
+        self.inner.announce(Event::Put {
+            key: key.to_string(),
+        });
         Ok(())
     }
 
@@ -105,6 +110,9 @@ where
         self.touch_index(|i| {
             i.remove(key);
         });
+        self.inner.announce(Event::Deleted {
+            key: key.to_string(),
+        });
         Ok(())
     }
 
@@ -112,6 +120,7 @@ where
     pub async fn clear(&self) -> Result<()> {
         self.inner.commit(vec![self.inner.clear_op()]).await?;
         self.touch_index(|i| i.clear());
+        self.inner.announce(Event::Cleared);
         Ok(())
     }
 
@@ -162,6 +171,14 @@ where
                 }
             }
         });
+
+        for entry in &entries {
+            match entry {
+                Staged::Put { key, .. } => self.inner.announce(Event::Put { key: key.clone() }),
+                Staged::Delete { key } => self.inner.announce(Event::Deleted { key: key.clone() }),
+                Staged::Clear => self.inner.announce(Event::Cleared),
+            }
+        }
         Ok(())
     }
 
@@ -270,6 +287,22 @@ impl<T> LazyLocker<T> {
             .unwrap_or_default()
     }
 
+    /// Subscribe to every change in this locker.
+    pub fn watch(&self) -> crate::watch::EventStream {
+        self.inner
+            .watchers
+            .subscribe(None, crate::watch::DEFAULT_CAPACITY)
+    }
+
+    /// Subscribe to changes affecting one key.
+    ///
+    /// `Cleared` still arrives, because a clear affects every key.
+    pub fn watch_key(&self, key: &str) -> crate::watch::EventStream {
+        self.inner
+            .watchers
+            .subscribe(Some(key.to_string()), crate::watch::DEFAULT_CAPACITY)
+    }
+
     fn touch_index(&self, f: impl FnOnce(&mut BTreeSet<String>)) {
         if let Ok(mut guard) = self.index.lock() {
             f(&mut guard);
@@ -292,7 +325,9 @@ mod tests {
     use super::*;
     use crate::backend::MemoryBackend;
     use crate::codec::default_chain;
+    use crate::watch::Event;
     use futures::executor::block_on;
+    use futures::StreamExt;
 
     fn locker() -> LazyLocker<String> {
         block_on(LazyLocker::open(
@@ -441,6 +476,92 @@ mod tests {
         assert_eq!(block_on(l.get("a")).unwrap(), None);
         assert_eq!(block_on(l.get("fresh")).unwrap(), Some("new".into()));
         assert_eq!(l.len(), 1);
+    }
+
+    #[test]
+    fn writes_and_deletes_are_announced_to_watchers() {
+        let l = locker();
+        let mut events = l.watch();
+
+        block_on(l.put("k", &"v".to_string())).unwrap();
+        block_on(l.delete("k")).unwrap();
+
+        assert_eq!(
+            block_on(events.next()),
+            Some(Event::Put { key: "k".into() })
+        );
+        assert_eq!(
+            block_on(events.next()),
+            Some(Event::Deleted { key: "k".into() })
+        );
+    }
+
+    #[test]
+    fn clearing_announces_one_event_not_one_per_key() {
+        // A clear over a hundred thousand keys must not flood subscribers.
+        let l = seeded(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        let mut events = l.watch();
+
+        block_on(l.clear()).unwrap();
+
+        assert_eq!(block_on(events.next()), Some(Event::Cleared));
+        assert!(
+            events.try_recv().is_none(),
+            "clear must produce exactly one event"
+        );
+    }
+
+    #[test]
+    fn a_key_watcher_ignores_other_keys() {
+        let l = locker();
+        let mut events = l.watch_key("wanted");
+
+        block_on(l.put("ignored", &"x".to_string())).unwrap();
+        block_on(l.put("wanted", &"y".to_string())).unwrap();
+
+        assert_eq!(
+            block_on(events.next()),
+            Some(Event::Put {
+                key: "wanted".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_rolled_back_transaction_announces_nothing() {
+        // Subscribers must never be told about a write that did not happen.
+        let l = locker();
+        let mut events = l.watch();
+
+        let outcome: Result<()> = block_on(l.transact(|tx| async move {
+            tx.put("a", "1".to_string())?;
+            Err(Error::backend("nope"))
+        }));
+        assert!(outcome.is_err());
+
+        assert!(events.try_recv().is_none(), "rollback must be silent");
+    }
+
+    #[test]
+    fn a_committed_transaction_announces_every_change() {
+        let l = locker();
+        let mut events = l.watch();
+
+        block_on(l.transact(|tx| async move {
+            tx.put("a", "1".to_string())?;
+            tx.put("b", "2".to_string())?;
+            Ok(())
+        }))
+        .unwrap();
+
+        assert_eq!(
+            block_on(events.next()),
+            Some(Event::Put { key: "a".into() })
+        );
+        assert_eq!(
+            block_on(events.next()),
+            Some(Event::Put { key: "b".into() })
+        );
     }
 
     #[test]

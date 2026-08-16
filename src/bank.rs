@@ -15,6 +15,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use futures::channel::mpsc;
+
 use crate::backend::api::{Backend, Op, ScanRequest, Table};
 use crate::backend::KeyRange;
 use crate::codec::{default_chain, type_tag, FilterChain};
@@ -22,6 +24,7 @@ use crate::error::{Error, Result};
 
 use crate::key::LockerId;
 use crate::locker::{LazyLocker, Locker, LockerConfig};
+use crate::remote::{Job, JOB_QUEUE};
 use serde::{de::DeserializeOwned, Serialize};
 
 /// On-disk format version for the bank as a whole.
@@ -102,6 +105,11 @@ pub struct Bank {
     chain: Arc<FilterChain>,
     /// Name to id, cached so opening a locker twice does not re-read `meta`.
     registry: Mutex<HashMap<String, LockerId>>,
+    /// Cloned into every `RemoteBank`.
+    job_sender: mpsc::Sender<Job>,
+    /// Taken exactly once, by `into_service`. A second service would silently
+    /// steal jobs from the first.
+    job_receiver: Mutex<Option<mpsc::Receiver<Job>>>,
 }
 
 impl std::fmt::Debug for Bank {
@@ -124,10 +132,13 @@ impl Bank {
         backend: Arc<dyn Backend>,
         chain: FilterChain,
     ) -> Result<Self> {
+        let (job_sender, job_receiver) = mpsc::channel(JOB_QUEUE);
         let bank = Self {
             backend,
             chain: Arc::new(chain),
             registry: Mutex::new(HashMap::new()),
+            job_sender,
+            job_receiver: Mutex::new(Some(job_receiver)),
         };
         bank.check_or_write_format_version().await?;
         Ok(bank)
@@ -277,6 +288,94 @@ impl Bank {
         let id = self.locker_id(name).await?;
         self.bind_schema(id, &type_tag::<T>()).await?;
         Ok(id)
+    }
+
+    pub(crate) fn job_sender(&self) -> mpsc::Sender<Job> {
+        self.job_sender.clone()
+    }
+
+    pub(crate) fn take_job_receiver(&self) -> Option<mpsc::Receiver<Job>> {
+        self.job_receiver.lock().ok()?.take()
+    }
+
+    /// Bytes-level access, used by the remote handle.
+    ///
+    /// Values go through the same envelope and filter chain as typed ones, and
+    /// bind the same schema tag, so a locker reached this way is precisely a
+    /// `Locker<Vec<u8>>` — the two views cannot disagree.
+    async fn raw_locker(&self, name: &str) -> Result<LockerId> {
+        self.prepare::<Vec<u8>>(name).await
+    }
+
+    pub(crate) async fn raw_get(&self, locker: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let id = self.raw_locker(locker).await?;
+        let encoded = crate::key::encode(id, key);
+        match self.backend.get(Table::Records, &encoded).await? {
+            Some(stored) => Ok(Some(crate::codec::decode(&stored, &self.chain)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn raw_put(&self, locker: &str, key: &str, value: Vec<u8>) -> Result<()> {
+        let id = self.raw_locker(locker).await?;
+        let sealed = crate::codec::encode(&value, &self.chain)?;
+        self.backend
+            .commit(vec![Op::Put {
+                table: Table::Records,
+                key: crate::key::encode(id, key),
+                value: sealed,
+            }])
+            .await
+    }
+
+    pub(crate) async fn raw_delete(&self, locker: &str, key: &str) -> Result<()> {
+        let id = self.raw_locker(locker).await?;
+        self.backend
+            .commit(vec![Op::Delete {
+                table: Table::Records,
+                key: crate::key::encode(id, key),
+            }])
+            .await
+    }
+
+    pub(crate) async fn raw_clear(&self, locker: &str) -> Result<()> {
+        let id = self.raw_locker(locker).await?;
+        self.backend
+            .commit(vec![Op::DeleteRange {
+                table: Table::Records,
+                range: crate::key::locker_range(id),
+            }])
+            .await
+    }
+
+    pub(crate) async fn raw_keys(&self, locker: &str, prefix: &str) -> Result<Vec<String>> {
+        let id = self.raw_locker(locker).await?;
+        let mut range = crate::key::prefix_range(id, prefix);
+        let mut keys = Vec::new();
+
+        loop {
+            let page = self
+                .backend
+                .scan(ScanRequest {
+                    table: Table::Records,
+                    range: range.clone(),
+                    reverse: false,
+                    limit: 256,
+                    want_values: false,
+                })
+                .await?;
+
+            for (encoded, _) in &page.items {
+                keys.push(crate::key::decode(id, encoded)?.to_string());
+            }
+
+            match page.resume {
+                Some(last) => range.start = std::ops::Bound::Excluded(last),
+                None => break,
+            }
+        }
+
+        Ok(keys)
     }
 
     /// Record, or verify, the schema tag a locker was written with.

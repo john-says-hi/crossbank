@@ -1,8 +1,8 @@
 # crossbank — build plan
 
-**Status: M0 complete.** Full CI matrix green — 11 jobs: lint, native on Linux/macOS/Windows,
-Android and iOS compile checks, and wasm across both lanes × Chrome and Firefox. 10 tests per
-wasm lane. M1 is next.
+**Status: M1 complete.** 149 tests green natively; the conformance suite also runs in real
+browsers on both wasm lanes. Full CI matrix green — 11 jobs across Linux/macOS/Windows,
+Android/iOS compile checks, and wasm × 2 lanes × 2 browsers. M2 (the redb backend) is next.
 
 ## Context
 
@@ -273,11 +273,13 @@ silently unlinks shared memory. `ci/guard-rustflags.sh` enforces this.
 
 **M0 — Spike and scaffold. ✅ COMPLETE.** See results above.
 
-**M1 — Walking skeleton.** Memory backend, the `Backend` trait above, three fixed tables,
-binary keys, closure-scoped transactions, `Arc<T>` eager lockers with a budget ceiling,
-`RemoteBank` + `into_service()`, bounded watch, `schema_tag`, the conformance suite running
-against both `Bank` and `RemoteBank`.
-*Exit: API stable; remaining backends only have to satisfy the suite.*
+**M1 — Walking skeleton. ✅ COMPLETE.** Memory backend, the `Backend` trait above, three
+fixed tables, binary keys, closure-scoped transactions, `Arc<T>` eager lockers with a budget
+ceiling, `RemoteBank` + `into_service()`, bounded watch, `schema_tag`, and an 18-case
+conformance suite that runs natively *and* in a browser.
+*Exit met: adding a backend now costs one four-line file. Both suite guards were
+negative-controlled — a harness that lies about persistence fails, and a spec list out of step
+with `CASE_COUNT` fails.*
 
 **M2 — redb backend + `Offload`.** Passes the suite unmodified. Crash-and-reopen.
 

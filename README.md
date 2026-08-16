@@ -2,8 +2,9 @@
 
 Cross-platform persistent key/value storage for Rust. One API on native and in the browser.
 
-> **Status: pre-alpha, milestone zero.** Nothing works yet. The crate is an empty scaffold
-> while the test lanes are being proven. Do not depend on this.
+> **Status: pre-alpha.** The API and the in-memory backend work and are covered by a shared
+> conformance suite that runs natively and in real browsers. The `redb` and IndexedDB
+> backends are not written yet, so nothing persists. Do not depend on this.
 
 ## Why
 

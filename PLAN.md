@@ -323,6 +323,34 @@ proxy landed in M1.
 
 ---
 
+## Performance
+
+Dated snapshot, not a CI gate. Reproduce with `cargo bench --bench kv` and
+`ci/bench.sh`. Machine: 12th Gen Intel Core i9-12900HK, Linux 7.0.11 x86_64,
+2026-08-20.
+
+| Workload | Backend | p50-ish | Notes |
+|---|---|---|---|
+| `txn_batch` (100 puts, one `transact`) | memory | 100 µs | ~1.0 M puts/s |
+| `txn_batch` | redb | 1.02 ms | ~98 k puts/s |
+| `envelope_tax` (200 × 1 KiB, **one put each**) | crossbank redb, default LZ4+CRC | 97.5 ms | ~2.0 MiB/s |
+| same | crossbank redb, raw chain | 111 ms | LZ4 *helps* on this ramp payload |
+| same | raw redb, one write txn | 2.82 ms | ~69 MiB/s |
+
+**How to read this.** The 35× gap between `envelope_tax/raw_redb` and
+`envelope_tax/crossbank_*` is mostly **one commit per put**, not the envelope.
+`txn_batch` is the fair comparison: 100 puts in one closure-scoped transaction
+on redb is about 1 ms. Callers who care about bulk ingest should `transact`.
+
+LZ4 on a sequential-byte payload is a win here. The open question of LZ4 on
+dense `f64` candle data is still open — this snapshot used a compressible
+ramp, not IEEE floats. Do not drop LZ4 from the default chain on this evidence.
+
+Web timings (`tests/bench_web.rs`, ignored) land the same named workloads
+against IndexedDB; they are not in this table yet.
+
+---
+
 ## Open questions
 
 - Chunk size default — 8 MiB is a guess; M4 torture tests pick the real number.

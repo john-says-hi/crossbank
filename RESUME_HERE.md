@@ -170,6 +170,8 @@ cd ~/Documents/crossbank
 cargo nextest run                      # native, all backends (181 tests)
 cargo +1.97.1 clippy --workspace --all-targets --all-features   # see §7
 cargo test --doc --workspace           # nextest does NOT run doctests
+cargo bench --bench kv                 # native Criterion; not a CI gate
+ci/bench.sh                            # same, plus optional --web --firefox
 
 # Real browsers. Both lanes must pass.
 export CROSSBANK_WBG_RUNNER=<path to a wasm-bindgen-test-runner matching Cargo.lock>

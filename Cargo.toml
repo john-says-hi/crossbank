@@ -33,6 +33,11 @@ redb = "4.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "kv"
+harness = false
 
 [dev-dependencies]
 # The shared spec. Cargo permits a dev-dependency cycle, which is what lets the

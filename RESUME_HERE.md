@@ -8,8 +8,8 @@ you rediscover them the hard way.
 - **Repo:** `github.com/john-says-hi/crossbank` (public)
 - **Local checkout:** `~/Documents/crossbank`
 - **Owner:** John (`john-says-hi`)
-- **Started:** 2026-08-15 · **Last worked:** 2026-08-16
-- **State:** M0, M1 and M2 complete. **M3 (the IndexedDB backend) is next.**
+- **Started:** 2026-08-15 · **Last worked:** 2026-08-20
+- **State:** M0, M1, M2 and M3 complete. **M4 (chunking / streaming Writer/Reader) is next.**
 
 ---
 
@@ -153,10 +153,11 @@ killed before commit leaves nothing behind. **Data persists on desktop and mobil
 
 ### Remaining milestones
 
-- **M3 — IndexedDB backend** ← *next*. Same suite, Chrome and Firefox, plain and atomics
-  lanes. Exit: real persistence on the web, which is the platform that actually ships.
-- **M4 — Big data.** Per-chunk framing, streaming `Writer`/`Reader`, orphan-chunk GC. Exit
-  criterion is *bounded peak RSS*, not raw size — "multi-GB" is not testable on a 4 GiB target.
+- **M3 — IndexedDB backend** ✅. Same suite, Chrome and Firefox, plain and atomics.
+  Data now persists on the web.
+- **M4 — Big data.** ← *next*. Per-chunk framing, streaming `Writer`/`Reader`, orphan-chunk
+  GC. Exit criterion is *bounded peak RSS*, not raw size — "multi-GB" is not testable on a
+  4 GiB target.
 - **M5 — Quota, eviction, coherence.** `persist()`, quota API, byte-budget LRU on a logical
   counter, BroadcastChannel cross-tab invalidation.
 - **M6 — Consumer readiness.** Docs, worked example, publish to crates.io.
@@ -166,7 +167,7 @@ killed before commit leaves nothing behind. **Data persists on desktop and mobil
 ```sh
 cd ~/Documents/crossbank
 
-cargo nextest run                      # native, all backends (149 tests)
+cargo nextest run                      # native, all backends (181 tests)
 cargo +1.97.1 clippy --workspace --all-targets --all-features   # see §7
 cargo test --doc --workspace           # nextest does NOT run doctests
 
@@ -226,14 +227,11 @@ Every one of these was hit and paid for already. Do not rediscover them.
 
 1. Read `PLAN.md`.
 2. Run `cargo nextest run` and one browser lane, and confirm green before changing anything.
-3. Start M3: write `src/backend/indexeddb.rs` on `indexed-db` 0.4.2, add an `IndexedDbHarness`
-   to `crossbank-conformance/src/harness.rs`, and add `tests/conformance_indexeddb.rs` — which
-   should be four lines, exactly as `tests/conformance_redb.rs` is. Follow `redb.rs` as the
-   worked example of what a backend looks like.
-4. Trap 8 below is the one that will bite: every method must be **one**
-   `db.transaction(...).run(...)` awaiting only IDB requests. `tests/spike_indexeddb.rs` and
-   `tests/spike_key_ordering.rs` already show the working shape against real IndexedDB.
-5. Consider adding the Safari lane at the same time — `wasm-bindgen-test-runner` supports
-   `safaridriver`, and GitHub's macOS runners ship it enabled. Safari has **zero** coverage
-   today, and its ITP deletes IndexedDB after 7 days without user interaction, which is a
-   product-level risk M5 must handle deliberately.
+3. Start M4: auto-chunk values above `max_inline` in `LazyLocker`, add streaming
+   `Writer`/`Reader`, and prove peak RSS is bounded by a small multiple of chunk size.
+   Eager lockers still refuse oversized values. Writer is not inside `transact()`.
+4. Trap 8 still applies to any IndexedDB work: every backend method must be **one**
+   `db.transaction(...).run(...)` awaiting only IDB requests.
+5. Safari CI (`safaridriver` on macOS runners) is still a follow-up. Safari has **zero**
+   coverage today, and its ITP deletes IndexedDB after 7 days without user interaction,
+   which is a product-level risk M5 must handle deliberately.

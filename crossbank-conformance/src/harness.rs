@@ -97,3 +97,44 @@ impl Harness for RedbHarness {
         }
     }
 }
+
+/// Runs the suite against the IndexedDB backend in a real browser.
+///
+/// Each `open` returns a fresh connection to the **same named database**,
+/// which is what makes `reopen_matches_declared_persistence` a real
+/// persistence test rather than an in-memory round trip. `destroy` deletes
+/// that database so one case cannot leak into the next.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug)]
+pub struct IndexedDbHarness {
+    name: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl IndexedDbHarness {
+    pub fn new(case: &str) -> Self {
+        Self {
+            name: format!("crossbank-conformance-{case}"),
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Harness for IndexedDbHarness {
+    async fn open(&self) -> Result<Arc<dyn Backend>> {
+        Ok(Arc::new(
+            crossbank::backend::IndexedDbBackend::open(&self.name).await?,
+        ))
+    }
+
+    async fn destroy(&self) -> Result<()> {
+        crossbank::backend::IndexedDbBackend::delete_database(&self.name).await
+    }
+
+    fn caps(&self) -> Caps {
+        Caps {
+            persists_across_open: true,
+            reports_usage: true,
+        }
+    }
+}

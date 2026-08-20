@@ -1,9 +1,10 @@
 # crossbank — build plan
 
-**Status: M2 complete.** 178 tests green natively — including the full conformance suite
+**Status: M3 complete.** 181 tests green natively — including the full conformance suite
 against **both** the memory and `redb` backends, plus crash-and-reopen tests that kill a real
-process. The suite also runs in real browsers on both wasm lanes. **Data now persists on
-desktop.** M3 (the IndexedDB backend) is next.
+process. The same 18-case suite now also passes against **IndexedDB** in Chrome and Firefox
+on both wasm lanes (plain and atomics). **Data now persists on desktop, mobile, and the
+web.** M4 (chunking / streaming Writer/Reader) is next.
 
 > Resuming this project? Start with **[RESUME_HERE.md](RESUME_HERE.md)** — purpose, working
 > agreements, current state, and the known traps. This file is the technical plan.
@@ -292,8 +293,10 @@ takes a complete op list, every backend method is a single synchronous block wit
 inside, so a `WriteTransaction` can never be held across an await. Revisit only if profiling
 demands it.
 
-**M3 — IndexedDB backend.** Same suite, Chrome and Firefox, plain and atomics. Should be
-mechanical if M1 held.
+**M3 — IndexedDB backend. ✅ COMPLETE.** Same suite, Chrome and Firefox, plain and
+atomics. `Bank::open` wires `Location::{Memory, Path, Web}`. The persistence
+case was negative-controlled: a harness that lied about `persists_across_open`
+went red in Firefox before the honest cap was restored.
 
 **M4 — Big data.** Per-chunk framing, streaming Writer/Reader, orphan-chunk GC, peak-RSS
 assertions. *Exit criterion is bounded peak memory, not raw size — "multi-GB" is not testable

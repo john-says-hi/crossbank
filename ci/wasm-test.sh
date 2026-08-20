@@ -45,6 +45,19 @@ RUNNER="${CROSSBANK_WBG_RUNNER:-$(command -v wasm-bindgen-test-runner || true)}"
 export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="${RUNNER}"
 
 export WASM_BINDGEN_USE_BROWSER=1
+# wasm-bindgen-test-runner prefers the first of GECKODRIVER / CHROMEDRIVER
+# that is set. Pin exactly one so `--chrome` cannot silently run Firefox.
+if [ "${BROWSER}" = chrome ]; then
+    unset GECKODRIVER GECKODRIVER_REMOTE || true
+    : "${CHROMEDRIVER:=$(command -v chromedriver || true)}"
+    [ -n "${CHROMEDRIVER}" ] || { echo "no chromedriver found" >&2; exit 2; }
+    export CHROMEDRIVER
+else
+    unset CHROMEDRIVER CHROMEDRIVER_REMOTE || true
+    : "${GECKODRIVER:=$(command -v geckodriver || true)}"
+    [ -n "${GECKODRIVER}" ] || { echo "no geckodriver found" >&2; exit 2; }
+    export GECKODRIVER
+fi
 export WASM_BINDGEN_TEST_TIMEOUT="${WASM_BINDGEN_TEST_TIMEOUT:-180}"
 # NEVER set WASM_BINDGEN_TEST_NO_ORIGIN_ISOLATION — the runner sets
 # COOP/COEP by default, which is what makes SharedArrayBuffer reachable.

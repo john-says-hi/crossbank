@@ -6,10 +6,11 @@ Cross-platform persistent key/value storage for Rust. One API on native and in t
 > original plan, why this project exists, the Flutter Hive parity we are matching, and the
 > traps that cost a day each.
 
-> **Status: pre-alpha.** The API, the in-memory backend and the `redb` backend all work and
-> are covered by a shared conformance suite that runs natively and in real browsers. Data
-> persists on desktop and mobile. The IndexedDB backend is not written yet, so **nothing
-> persists on the web**. Do not depend on this.
+> **Status: pre-alpha.** The API, the in-memory backend, the `redb` backend and the
+> IndexedDB backend all work and are covered by a shared conformance suite that runs
+> natively and in real browsers (Chrome and Firefox, plain and atomics). Data persists
+> on desktop, mobile, and the web. Chunking / streaming I/O is not written yet. Do not
+> depend on this.
 
 ## Why
 
@@ -61,7 +62,8 @@ is not a guaranteed behaviour.
 
 ```sh
 cargo nextest run                              # native, all backends
-wasm-pack test --headless --firefox            # IndexedDB in a real browser
+ci/wasm-test.sh --plain --firefox              # IndexedDB in a real browser
+ci/wasm-test.sh --atomics --chrome             # shared-memory lane
 ```
 
 ## License

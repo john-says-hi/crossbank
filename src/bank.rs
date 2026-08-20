@@ -63,9 +63,9 @@ fn u32_from(bytes: &[u8], what: &str) -> Result<u32> {
 pub enum Location {
     /// Nothing is persisted; the data dies with the handle.
     Memory,
-    /// A file on disk. Native only; wired up in M2 with the redb backend.
+    /// A file on disk. Native only.
     Path(std::path::PathBuf),
-    /// A named IndexedDB database. Web only; wired up in M3.
+    /// A named IndexedDB database. Web only.
     Web(String),
 }
 
@@ -119,10 +119,47 @@ impl std::fmt::Debug for Bank {
 }
 
 impl Bank {
-    /// Open a bank over an already-constructed backend.
+    /// Open a bank at the location named in `config`.
     ///
-    /// The convenience constructors that build a backend from a [`Location`]
-    /// arrive with those backends, in M2 and M3.
+    /// The location is always explicit. `Location::Path` is native-only;
+    /// `Location::Web` is wasm-only. The other combination is
+    /// [`Error::InvalidConfig`].
+    pub async fn open(config: BankConfig) -> Result<Self> {
+        match config.location {
+            Location::Memory => {
+                Self::with_backend(Arc::new(crate::backend::MemoryBackend::new())).await
+            }
+            Location::Path(path) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    Self::with_backend(Arc::new(crate::backend::RedbBackend::open(path)?)).await
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = path;
+                    Err(Error::InvalidConfig(
+                        "Location::Path is native-only; use Location::Web on wasm".into(),
+                    ))
+                }
+            }
+            Location::Web(name) => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let backend = crate::backend::IndexedDbBackend::open(name).await?;
+                    Self::with_backend(Arc::new(backend)).await
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = name;
+                    Err(Error::InvalidConfig(
+                        "Location::Web is wasm-only; use Location::Path on native".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Open a bank over an already-constructed backend.
     pub async fn with_backend(backend: Arc<dyn Backend>) -> Result<Self> {
         Self::with_backend_and_chain(backend, default_chain()).await
     }
@@ -638,5 +675,40 @@ mod tests {
             block_on(Bank::with_backend(backend)),
             Err(Error::UnsupportedVersion { .. })
         ));
+    }
+
+    #[test]
+    fn open_memory_round_trips() {
+        let bank = block_on(Bank::open(BankConfig::memory())).unwrap();
+        let locker = block_on(bank.locker::<String>("ui_settings")).unwrap();
+        block_on(locker.put("theme", "dark".into())).unwrap();
+        assert_eq!(locker.get("theme").as_deref(), Some(&"dark".to_string()));
+    }
+
+    #[test]
+    fn open_web_is_refused_on_native() {
+        match block_on(Bank::open(BankConfig::web("should-not-open"))) {
+            Err(Error::InvalidConfig(msg)) => {
+                assert!(msg.contains("wasm-only"), "{msg}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn open_path_persists_across_handles() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bank.redb");
+
+        {
+            let bank = block_on(Bank::open(BankConfig::at(&path))).unwrap();
+            let locker = block_on(bank.locker::<String>("ui_settings")).unwrap();
+            block_on(locker.put("theme", "dark".into())).unwrap();
+        }
+
+        let bank = block_on(Bank::open(BankConfig::at(&path))).unwrap();
+        let locker = block_on(bank.locker::<String>("ui_settings")).unwrap();
+        assert_eq!(locker.get("theme").as_deref(), Some(&"dark".to_string()));
     }
 }

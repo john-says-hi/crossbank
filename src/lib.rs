@@ -8,8 +8,9 @@
 //!
 //! # Status
 //!
-//! Pre-alpha. M0 (proving the test lanes) is complete; M1 (this layer) is in
-//! progress. The public API is not yet stable and the crate is not published.
+//! Pre-alpha. M0–M2 are complete. M3 (IndexedDB) is in this crate: data
+//! persists in real browsers. The public API is not yet stable and the crate
+//! is not published.
 //!
 //! # Shape
 //!
@@ -39,6 +40,8 @@ pub mod locker;
 pub mod remote;
 pub mod watch;
 
+#[cfg(target_arch = "wasm32")]
+pub use backend::IndexedDbBackend;
 #[cfg(not(target_arch = "wasm32"))]
 pub use backend::RedbBackend;
 pub use backend::{Backend, MemoryBackend};

@@ -9,7 +9,7 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use crossbank::backend::{Backend, MemoryBackend, Op, Table};
 use crossbank::codec::FilterChain;
-use crossbank::{Bank, BankConfig, LazyLocker, Locker, LockerConfig};
+use crossbank::{Bank, BankConfig, Durability, LazyLocker, Locker, LockerConfig};
 use futures::executor::block_on;
 use redb::{Database, TableDefinition};
 use tempfile::TempDir;
@@ -63,6 +63,13 @@ fn redb_raw_chain() -> NativeBank {
     }
 }
 
+/// A locker config at the given durability. `Eventual` is what the
+/// `*_eventual` bench arms measure: same code path, one fsync per commit
+/// removed.
+fn cfg(durability: Durability) -> LockerConfig {
+    LockerConfig::default().with_durability(durability)
+}
+
 fn fill_eager(locker: &Locker<Vec<u8>>, n: usize, bytes: usize) {
     for i in 0..n {
         wait(locker.put(&key(i), payload(bytes, i as u8))).unwrap();
@@ -82,13 +89,19 @@ fn settings_eager(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(200));
     group.measurement_time(Duration::from_secs(2));
 
-    for (label, factory) in [
-        ("memory", memory_bank as fn() -> NativeBank),
-        ("redb", redb_bank as fn() -> NativeBank),
+    for (label, factory, durability) in [
+        ("memory", memory_bank as fn() -> NativeBank, Durability::Immediate),
+        ("redb", redb_bank as fn() -> NativeBank, Durability::Immediate),
+        (
+            "redb_eventual",
+            redb_bank as fn() -> NativeBank,
+            Durability::Eventual,
+        ),
     ] {
         group.bench_function(BenchmarkId::from_parameter(label), |b| {
             let native = factory();
-            let locker = wait(native.bank.locker::<Vec<u8>>("settings")).unwrap();
+            let locker = wait(native.bank.locker_with::<Vec<u8>>("settings", cfg(durability)))
+                .unwrap();
             fill_eager(&locker, SETTINGS_N, SETTINGS_BYTES);
             let mut i = 0usize;
             b.iter(|| {
@@ -113,14 +126,23 @@ fn bulk_lazy_put(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(200));
     group.measurement_time(Duration::from_secs(3));
 
-    for (label, factory) in [
-        ("memory", memory_bank as fn() -> NativeBank),
-        ("redb", redb_bank as fn() -> NativeBank),
+    for (label, factory, durability) in [
+        ("memory", memory_bank as fn() -> NativeBank, Durability::Immediate),
+        ("redb", redb_bank as fn() -> NativeBank, Durability::Immediate),
+        (
+            "redb_eventual",
+            redb_bank as fn() -> NativeBank,
+            Durability::Eventual,
+        ),
     ] {
         group.bench_function(BenchmarkId::from_parameter(label), |b| {
             b.iter_with_setup(factory, |native| {
-                let locker = wait(native.bank.lazy_locker::<Vec<u8>>("bulk")).unwrap();
+                let locker =
+                    wait(native.bank.lazy_locker_with::<Vec<u8>>("bulk", cfg(durability))).unwrap();
                 fill_lazy(&locker, BULK_N, BULK_BYTES);
+                // An eventual run must pay for the fsync it deferred, or the
+                // number is a lie rather than a trade.
+                wait(locker.flush()).unwrap();
                 native
             });
         });

@@ -29,7 +29,9 @@ use crate::watch::Event;
 /// A locker that keeps only its key index in memory.
 pub struct LazyLocker<T> {
     pub(crate) inner: Arc<Inner>,
-    index: Mutex<BTreeSet<Vec<u8>>>,
+    /// Shared with the coherence sink, which updates it from another tab's
+    /// news without going through the locker handle.
+    index: Arc<Mutex<BTreeSet<Vec<u8>>>>,
     /// Keys whose stored bytes failed to decode on a `get`. See
     /// [`LazyLocker::corrupt_keys`].
     corrupt: Mutex<BTreeSet<Vec<u8>>>,
@@ -38,6 +40,10 @@ pub struct LazyLocker<T> {
     /// `None` for a `Precious` locker, which is what makes eviction cost
     /// exactly nothing for the lockers that refuse it.
     lru: Option<Mutex<LruState>>,
+    /// Keeps this locker's coherence registration alive; the channel holds
+    /// only a `Weak`, so dropping the locker unregisters it.
+    #[cfg(target_arch = "wasm32")]
+    sink: Mutex<Option<crate::coherence::SinkHandle>>,
     _value: PhantomData<fn() -> T>,
 }
 
@@ -60,7 +66,7 @@ where
         id: LockerId,
         name: String,
         config: LockerConfig,
-        counters: Arc<super::inner::Counters>,
+        shared: Arc<super::inner::Shared>,
     ) -> Result<Self> {
         let inner = Arc::new(Inner {
             write_lock: futures::lock::Mutex::new(()),
@@ -69,7 +75,7 @@ where
             id,
             name,
             config,
-            counters,
+            shared,
             watchers: Default::default(),
             closed: AtomicBool::new(false),
         });
@@ -109,9 +115,11 @@ where
 
         Ok(Self {
             inner,
-            index: Mutex::new(index),
+            index: Arc::new(Mutex::new(index)),
             corrupt: Mutex::new(BTreeSet::new()),
             lru,
+            #[cfg(target_arch = "wasm32")]
+            sink: Mutex::new(None),
             _value: PhantomData,
         })
     }
@@ -139,7 +147,7 @@ where
             // crash costs nothing but eviction order.
             let tick = self
                 .inner
-                .counters
+                .shared
                 .ticks
                 .allocate(self.inner.backend.as_ref())
                 .await?;
@@ -469,7 +477,7 @@ where
 
         let tick = self
             .inner
-            .counters
+            .shared
             .ticks
             .allocate(self.inner.backend.as_ref())
             .await?;
@@ -510,7 +518,7 @@ where
             ops.extend(self.inner.delete_value_ops(victim).await?);
             ops.push(lru::delete_op(id, victim));
         }
-        ops.push(self.inner.counters.ticks.counter_op()?);
+        ops.push(self.inner.shared.ticks.counter_op()?);
 
         Ok(Budget {
             updates,
@@ -570,7 +578,84 @@ struct Budget {
     pending: Vec<Vec<u8>>,
 }
 
+/// Applies another tab's news to one open lazy locker.
+///
+/// Holds the index directly rather than the locker, so a `LazyLocker<T>` for
+/// any `T` at all is served by one non-generic sink — the index is keys, and
+/// keys have no type.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) struct LazySink {
+    inner: Arc<Inner>,
+    index: Arc<Mutex<BTreeSet<Vec<u8>>>>,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+impl crate::coherence::Sink for LazySink {
+    fn locker_id(&self) -> LockerId {
+        self.inner.id
+    }
+
+    fn apply(&self, announcement: &crate::coherence::Announcement) {
+        if self.inner.is_closed() {
+            return;
+        }
+        if announcement.cleared {
+            if let Ok(mut index) = self.index.lock() {
+                index.clear();
+            }
+            self.inner.announce(Event::Cleared);
+        }
+        for change in &announcement.changes {
+            if let Ok(mut index) = self.index.lock() {
+                if change.deleted {
+                    index.remove(change.key.as_slice());
+                } else {
+                    index.insert(change.key.clone());
+                }
+            }
+            // A lazy locker never holds values, so a write it could not carry
+            // inline costs it nothing: the next `get` reads the new bytes.
+            if change.deleted {
+                self.inner.announce(Event::Deleted {
+                    key: change.key.clone(),
+                });
+            } else {
+                self.inner.announce(Event::Put {
+                    key: change.key.clone(),
+                });
+            }
+        }
+    }
+}
+
 impl<T> LazyLocker<T> {
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn sink(&self) -> LazySink {
+        LazySink {
+            inner: self.inner.clone(),
+            index: self.index.clone(),
+        }
+    }
+
+    /// Start receiving other tabs' news, where there are other tabs.
+    ///
+    /// Native has no second process to hear from — `redb`'s exclusive file
+    /// lock sees to that — so this is a no-op there rather than a `cfg` in the
+    /// caller.
+    pub(crate) fn join_coherence(&self) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if !self.inner.shared.coherence.is_enabled() {
+                return;
+            }
+            let handle = crate::coherence::handle(self.sink());
+            self.inner.shared.coherence.register(&handle);
+            if let Ok(mut slot) = self.sink.lock() {
+                *slot = Some(handle);
+            }
+        }
+    }
+
     fn lru_lock(&self) -> Option<std::sync::MutexGuard<'_, LruState>> {
         self.lru.as_ref()?.lock().ok()
     }
@@ -842,6 +927,24 @@ fn utf8_entries<T>(entries: Vec<(Vec<u8>, T)>) -> Vec<(String, T)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coherence::{Announcement, Sink};
+
+    fn news(id: LockerId, cleared: bool, changes: Vec<(&[u8], bool)>) -> Announcement {
+        Announcement {
+            instance: 1,
+            locker_id: id,
+            epoch: 1,
+            cleared,
+            changes: changes
+                .into_iter()
+                .map(|(key, deleted)| crate::coherence::api::Change {
+                    key: key.to_vec(),
+                    value: None,
+                    deleted,
+                })
+                .collect(),
+        }
+    }
     use crate::backend::MemoryBackend;
     use crate::codec::default_chain;
     use crate::watch::Event;
@@ -866,6 +969,42 @@ mod tests {
             block_on(l.put(k, &v.to_string())).unwrap();
         }
         l
+    }
+
+    /// Another tab's write appears in this tab's index, and is announced.
+    ///
+    /// A lazy locker holds no values, so it does not care whether the message
+    /// carried the bytes: the key is there and the next `get` reads it.
+    #[test]
+    fn a_sink_folds_another_tabs_news_into_the_index() {
+        let l = seeded(&[("a", "alpha")]);
+        let mut events = l.watch();
+        let sink = l.sink();
+
+        sink.apply(&news(l.inner.id, false, vec![(b"b", false), (b"a", true)]));
+
+        assert!(l.contains_key("b"), "another tab's write must be visible");
+        assert!(!l.contains_key("a"), "another tab's delete must be visible");
+        assert_eq!(events.try_recv(), Some(Event::Put { key: b"b".to_vec() }));
+        assert_eq!(
+            events.try_recv(),
+            Some(Event::Deleted { key: b"a".to_vec() })
+        );
+
+        sink.apply(&news(l.inner.id, true, Vec::new()));
+        assert_eq!(l.len(), 0);
+        assert_eq!(events.try_recv(), Some(Event::Cleared));
+    }
+
+    /// A closed locker absorbs nothing. Its index is deliberately empty, and
+    /// repopulating it from a message would make `is_closed` a lie.
+    #[test]
+    fn a_closed_locker_ignores_the_channel() {
+        let l = seeded(&[("a", "alpha")]);
+        let sink = l.sink();
+        l.close();
+        sink.apply(&news(l.inner.id, false, vec![(b"b", false)]));
+        assert_eq!(l.len(), 0);
     }
 
     #[test]

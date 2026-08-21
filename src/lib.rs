@@ -52,6 +52,7 @@
 pub mod backend;
 pub mod bank;
 pub mod codec;
+pub(crate) mod coherence;
 pub mod error;
 pub mod key;
 pub mod locker;

@@ -79,25 +79,53 @@ pub enum Location {
 #[derive(Debug, Clone)]
 pub struct BankConfig {
     pub location: Location,
+
+    /// Keep other tabs of this web application in step with this one.
+    ///
+    /// Off by default. When on, a bank posts what each commit changed on a
+    /// `BroadcastChannel` named `crossbank::{database name}`, and applies what
+    /// other tabs post to its own resident state — a lazy locker's key index,
+    /// an eager locker's values — raising the same [`crate::Event`]s a local
+    /// write would.
+    ///
+    /// **It changes what an eager `get()` can return.** A value another tab
+    /// wrote that is too large to carry in a message cannot be decoded here
+    /// without an await, and an eager `get()` cannot await, so the resident
+    /// copy is dropped and [`crate::Event::Stale`] is raised. `get()` answers
+    /// `None` for that key until the locker is reopened. Lazy lockers have no
+    /// such limit: their index is updated either way.
+    ///
+    /// Native accepts the flag and does nothing — `redb` takes an exclusive
+    /// file lock, so there is no second process to stay coherent with.
+    pub coherence: bool,
 }
 
 impl BankConfig {
     pub fn memory() -> Self {
         Self {
             location: Location::Memory,
+            coherence: false,
         }
     }
 
     pub fn at(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             location: Location::Path(path.into()),
+            coherence: false,
         }
     }
 
     pub fn web(name: impl Into<String>) -> Self {
         Self {
             location: Location::Web(name.into()),
+            coherence: false,
         }
+    }
+
+    /// See [`BankConfig::coherence`]. Never on by default.
+    pub fn with_coherence(mut self, on: bool) -> Self {
+        self.coherence = on;
+        self
     }
 }
 
@@ -122,9 +150,9 @@ pub struct Bank {
     /// made the name read as closed while the first was still live, which let
     /// `delete_locker` and `quarantine` run under a working locker.
     open_lockers: Mutex<HashMap<String, Vec<Weak<Inner>>>>,
-    /// Bank-wide counters (chunk value ids, LRU ticks), cloned into every
+    /// Bank-wide facilities (chunk value ids, LRU ticks, coherence), cloned into every
     /// locker so two handles on one name cannot collide.
-    counters: Arc<crate::locker::inner::Counters>,
+    shared: Arc<crate::locker::inner::Shared>,
     closed: AtomicBool,
 }
 
@@ -242,14 +270,24 @@ impl Bank {
     /// `Location::Web` is wasm-only. The other combination is
     /// [`Error::InvalidConfig`].
     pub async fn open(config: BankConfig) -> Result<Self> {
+        // Coherence is a web facility: it needs a channel name, and the name
+        // is the database name. Nothing else has one.
+        let coherence = match (&config.location, config.coherence) {
+            (Location::Web(name), true) => crate::coherence::Coherence::open(name),
+            _ => crate::coherence::Coherence::disabled(),
+        };
         match config.location {
             Location::Memory => {
-                Self::with_backend(Arc::new(crate::backend::MemoryBackend::new())).await
+                Self::assembled(Arc::new(crate::backend::MemoryBackend::new()), coherence).await
             }
             Location::Path(path) => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    Self::with_backend(Arc::new(crate::backend::RedbBackend::open(path)?)).await
+                    Self::assembled(
+                        Arc::new(crate::backend::RedbBackend::open(path)?),
+                        coherence,
+                    )
+                    .await
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
@@ -262,8 +300,8 @@ impl Bank {
             Location::Web(name) => {
                 #[cfg(target_arch = "wasm32")]
                 {
-                    let backend = crate::backend::IndexedDbBackend::open(name).await?;
-                    Self::with_backend(Arc::new(backend)).await
+                    let backend = crate::backend::IndexedDbBackend::open(&name).await?;
+                    Self::assembled(Arc::new(backend), coherence).await
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -286,6 +324,25 @@ impl Bank {
         backend: Arc<dyn Backend>,
         chain: FilterChain,
     ) -> Result<Self> {
+        Self::assembled_with_chain(backend, chain, crate::coherence::Coherence::disabled()).await
+    }
+
+    async fn assembled(
+        backend: Arc<dyn Backend>,
+        coherence: crate::coherence::Coherence,
+    ) -> Result<Self> {
+        Self::assembled_with_chain(backend, default_chain(), coherence).await
+    }
+
+    async fn assembled_with_chain(
+        backend: Arc<dyn Backend>,
+        chain: FilterChain,
+        coherence: crate::coherence::Coherence,
+    ) -> Result<Self> {
+        let shared = Arc::new(crate::locker::inner::Shared {
+            coherence,
+            ..Default::default()
+        });
         let (job_sender, job_receiver) = mpsc::channel(JOB_QUEUE);
         let bank = Self {
             backend,
@@ -294,7 +351,7 @@ impl Bank {
             job_sender,
             job_receiver: Mutex::new(Some(job_receiver)),
             open_lockers: Mutex::new(HashMap::new()),
-            counters: Arc::new(crate::locker::inner::Counters::default()),
+            shared: shared.clone(),
             closed: AtomicBool::new(false),
         };
         bank.check_or_write_format_version().await?;
@@ -387,7 +444,10 @@ impl Bank {
     /// meant.
     pub async fn locker<T>(&self, name: &str) -> Result<Locker<T>>
     where
-        T: Serialize + DeserializeOwned,
+        // `'static` because an eager locker's resident values are what a
+        // coherence callback replaces, and a callback outlives the call that
+        // installed it.
+        T: Serialize + DeserializeOwned + 'static,
     {
         self.locker_with(name, LockerConfig::default()).await
     }
@@ -395,7 +455,7 @@ impl Bank {
     /// As [`Bank::locker`], with explicit limits.
     pub async fn locker_with<T>(&self, name: &str, config: LockerConfig) -> Result<Locker<T>>
     where
-        T: Serialize + DeserializeOwned,
+        T: Serialize + DeserializeOwned + 'static,
     {
         let id = self.prepare::<T>(name).await?;
         let locker = Locker::open(
@@ -404,10 +464,11 @@ impl Bank {
             id,
             name.to_string(),
             config,
-            self.counters.clone(),
+            self.shared.clone(),
         )
         .await?;
         self.register_open(name, locker.inner());
+        locker.join_coherence();
         Ok(locker)
     }
 
@@ -438,10 +499,11 @@ impl Bank {
             id,
             name.to_string(),
             config,
-            self.counters.clone(),
+            self.shared.clone(),
         )
         .await?;
         self.register_open(name, locker.inner());
+        locker.join_coherence();
         Ok(locker)
     }
 
@@ -620,7 +682,7 @@ impl Bank {
             id,
             name: name.to_string(),
             config: LockerConfig::default(),
-            counters: self.counters.clone(),
+            shared: self.shared.clone(),
             watchers: Default::default(),
             closed: std::sync::atomic::AtomicBool::new(false),
         })
@@ -899,6 +961,9 @@ impl Bank {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        // Drop the message closure before the backend goes: a channel still
+        // listening would call into a bank that no longer works.
+        self.shared.coherence.close();
         self.backend.close().await
     }
 
@@ -1021,6 +1086,24 @@ pub async fn delete_bank(config: &BankConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The coherence flag is accepted everywhere and refuses nothing.
+    ///
+    /// Natively it does nothing at all — `redb` takes an exclusive file lock,
+    /// so there is no second process to stay in step with — but a consumer
+    /// must be able to set it once and compile for both targets.
+    #[test]
+    fn the_coherence_flag_is_accepted_and_native_ignores_it() {
+        let config = BankConfig::memory().with_coherence(true);
+        assert!(config.coherence);
+        assert!(!BankConfig::memory().coherence, "never on by default");
+
+        let bank = block_on(Bank::open(config)).unwrap();
+        let locker = block_on(bank.lazy_locker::<String>("l")).unwrap();
+        block_on(locker.put("k", &"v".to_string())).unwrap();
+        assert_eq!(block_on(locker.get("k")).unwrap(), Some("v".to_string()));
+        block_on(bank.close()).unwrap();
+    }
     use crate::backend::MemoryBackend;
     use futures::executor::block_on;
 

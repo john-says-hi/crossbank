@@ -41,6 +41,15 @@ pub enum Event {
     Deleted { key: Vec<u8> },
     /// Every key was removed at once.
     Cleared,
+    /// This locker's resident copy of a key was dropped because another tab
+    /// wrote a value too large to carry in a coherence message.
+    ///
+    /// Only ever raised on an **eager** locker, and only with
+    /// [`crate::BankConfig::with_coherence`] on. The stored data is fine; it
+    /// is this tab's in-memory copy that is gone, and `get()` answers `None`
+    /// for that key until the locker is reopened. A lazy locker has no such
+    /// limit — it fetches on demand — so it raises [`Event::Put`] instead.
+    Stale { key: Vec<u8> },
     /// A key was shed to keep an [`crate::Policy::Evictable`] locker inside
     /// its byte budget.
     ///
@@ -60,7 +69,10 @@ impl Event {
     /// events that concern no single key.
     pub fn key_bytes(&self) -> &[u8] {
         match self {
-            Self::Put { key } | Self::Deleted { key } | Self::Evicted { key } => key,
+            Self::Put { key }
+            | Self::Deleted { key }
+            | Self::Evicted { key }
+            | Self::Stale { key } => key,
             Self::Cleared | Self::Lagged { .. } => &[],
         }
     }
@@ -73,9 +85,10 @@ impl Event {
     /// [`Event::key_bytes`] and branch on the variant instead.
     pub fn key(&self) -> Option<&str> {
         match self {
-            Self::Put { key } | Self::Deleted { key } | Self::Evicted { key } => {
-                std::str::from_utf8(key).ok()
-            }
+            Self::Put { key }
+            | Self::Deleted { key }
+            | Self::Evicted { key }
+            | Self::Stale { key } => std::str::from_utf8(key).ok(),
             Self::Cleared | Self::Lagged { .. } => None,
         }
     }

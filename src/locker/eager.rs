@@ -37,10 +37,16 @@ use crate::watch::Event;
 /// A locker whose values live in memory.
 pub struct Locker<T> {
     inner: Arc<Inner>,
-    values: Mutex<BTreeMap<Vec<u8>, Arc<T>>>,
+    /// Shared with the coherence sink, which replaces resident values from
+    /// another tab's news without going through the locker handle.
+    values: Arc<Mutex<BTreeMap<Vec<u8>, Arc<T>>>>,
     /// Keys whose stored bytes would not decode at open, under
     /// [`OnCorrupt::Skip`]. Fixed once open returns.
     corrupt: Vec<Vec<u8>>,
+    /// Keeps this locker's coherence registration alive; the channel holds
+    /// only a `Weak`, so dropping the locker unregisters it.
+    #[cfg(target_arch = "wasm32")]
+    sink: Mutex<Option<crate::coherence::SinkHandle>>,
 }
 
 impl<T> std::fmt::Debug for Locker<T> {
@@ -62,7 +68,7 @@ where
         id: LockerId,
         name: String,
         config: LockerConfig,
-        counters: Arc<super::inner::Counters>,
+        shared: Arc<super::inner::Shared>,
     ) -> Result<Self> {
         // Eviction and residency contradict each other: shedding a value from
         // storage while RAM still holds it leaves a replica that outlives the
@@ -81,7 +87,7 @@ where
             id,
             name,
             config,
-            counters,
+            shared,
             watchers: Default::default(),
             closed: AtomicBool::new(false),
         });
@@ -137,8 +143,10 @@ where
 
         Ok(Self {
             inner,
-            values: Mutex::new(values),
+            values: Arc::new(Mutex::new(values)),
             corrupt,
+            #[cfg(target_arch = "wasm32")]
+            sink: Mutex::new(None),
         })
     }
 
@@ -296,8 +304,101 @@ where
     }
 }
 
+/// Applies another tab's news to one open eager locker.
+///
+/// Generic over `T` because an eager locker holds decoded values: replacing
+/// one means decoding the bytes the message carried.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) struct EagerSink<T> {
+    inner: Arc<Inner>,
+    values: Arc<Mutex<BTreeMap<Vec<u8>, Arc<T>>>>,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+impl<T: DeserializeOwned> crate::coherence::Sink for EagerSink<T> {
+    fn locker_id(&self) -> LockerId {
+        self.inner.id
+    }
+
+    fn apply(&self, announcement: &crate::coherence::Announcement) {
+        if self.inner.is_closed() {
+            return;
+        }
+        if announcement.cleared {
+            if let Ok(mut values) = self.values.lock() {
+                values.clear();
+            }
+            self.inner.announce(Event::Cleared);
+        }
+        for change in &announcement.changes {
+            // Decoded here, in a plain callback, so `get()` stays synchronous
+            // and infallible. What cannot be decoded here cannot be held.
+            let decoded = match (change.deleted, &change.value) {
+                (true, _) => None,
+                (false, Some(sealed)) => self.inner.open::<T>(sealed).ok().map(Arc::new),
+                (false, None) => None,
+            };
+
+            let event = match (&decoded, change.deleted) {
+                (Some(_), _) => Event::Put {
+                    key: change.key.clone(),
+                },
+                (None, true) => Event::Deleted {
+                    key: change.key.clone(),
+                },
+                // The key was written, but with a value this tab cannot hold:
+                // too large to carry, or bytes it cannot decode. Dropping the
+                // resident copy is the honest answer — a stale value would be
+                // a lie an infallible getter could not take back.
+                (None, false) => Event::Stale {
+                    key: change.key.clone(),
+                },
+            };
+
+            if let Ok(mut values) = self.values.lock() {
+                match decoded {
+                    Some(value) => {
+                        values.insert(change.key.clone(), value);
+                    }
+                    None => {
+                        values.remove(change.key.as_slice());
+                    }
+                }
+            }
+            self.inner.announce(event);
+        }
+    }
+}
+
 /// Bounds-free accessors. Split out so `Debug` — and any caller holding a
 /// `Locker<T>` for a `T` that is not itself serialisable — can still read.
+impl<T> Locker<T> {
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn sink(&self) -> EagerSink<T> {
+        EagerSink {
+            inner: self.inner.clone(),
+            values: self.values.clone(),
+        }
+    }
+}
+
+impl<T: DeserializeOwned + 'static> Locker<T> {
+    /// Start receiving other tabs' news. See [`LazyLocker::join_coherence`].
+    pub(crate) fn join_coherence(&self) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if !self.inner.shared.coherence.is_enabled() {
+                return;
+            }
+            let handle = crate::coherence::handle(self.sink());
+            self.inner.shared.coherence.register(&handle);
+            if let Ok(mut slot) = self.sink.lock() {
+                *slot = Some(handle);
+            }
+        }
+    }
+}
+
 impl<T> Locker<T> {
     pub fn name(&self) -> &str {
         &self.inner.name
@@ -548,6 +649,7 @@ mod tests {
     use super::*;
     use crate::backend::MemoryBackend;
     use crate::codec::default_chain;
+    use crate::coherence::{api::Change, Announcement, Sink};
     use futures::executor::block_on;
     use futures::StreamExt;
 
@@ -564,6 +666,57 @@ mod tests {
 
     fn locker() -> Locker<String> {
         open_with(LockerConfig::default()).unwrap()
+    }
+
+    /// An eager locker takes another tab's small write straight into RAM.
+    #[test]
+    fn a_sink_replaces_a_resident_value_from_an_inline_write() {
+        let l = locker();
+        block_on(l.put("k", "mine".into())).unwrap();
+        let mut events = l.watch();
+
+        let sealed = l.inner.seal(&"theirs".to_string()).unwrap();
+        l.sink().apply(&Announcement {
+            instance: 2,
+            locker_id: l.inner.id,
+            epoch: 1,
+            cleared: false,
+            changes: vec![Change {
+                key: b"k".to_vec(),
+                value: Some(sealed),
+                deleted: false,
+            }],
+        });
+
+        assert_eq!(l.get("k").as_deref(), Some(&"theirs".to_string()));
+        assert_eq!(events.try_recv(), Some(Event::Put { key: b"k".to_vec() }));
+    }
+
+    /// A write too large to carry drops the resident copy and says so.
+    ///
+    /// The alternative — keeping the old value — would make an infallible
+    /// getter hand back something the store no longer holds, with nothing to
+    /// tell the caller. `None` plus [`Event::Stale`] is the honest answer.
+    #[test]
+    fn a_write_it_cannot_hold_goes_stale_rather_than_lying() {
+        let l = locker();
+        block_on(l.put("k", "mine".into())).unwrap();
+        let mut events = l.watch();
+
+        l.sink().apply(&Announcement {
+            instance: 2,
+            locker_id: l.inner.id,
+            epoch: 1,
+            cleared: false,
+            changes: vec![Change {
+                key: b"k".to_vec(),
+                value: None,
+                deleted: false,
+            }],
+        });
+
+        assert_eq!(l.get("k"), None, "a value we cannot decode is not held");
+        assert_eq!(events.try_recv(), Some(Event::Stale { key: b"k".to_vec() }));
     }
 
     #[test]

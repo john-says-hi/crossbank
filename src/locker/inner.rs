@@ -20,22 +20,26 @@ use super::chunk::{
 };
 use super::lru::Ticks;
 use super::policy::LockerConfig;
+use crate::coherence::Coherence;
 use crate::watch::{Event, Watchers};
 
 /// How many records a single scan page pulls. Bounded because an IndexedDB
 /// cursor cannot outlive its transaction, so every scan pages regardless.
 pub(crate) const SCAN_PAGE: usize = 256;
 
-/// The bank-wide counters every locker shares.
+/// What every locker a bank opens shares with it.
 ///
 /// Bundled into one handle rather than passed separately so that adding a
-/// counter does not ripple through every `open` signature in the crate.
+/// bank-wide facility does not ripple through every `open` signature in the
+/// crate.
 #[derive(Debug, Default)]
-pub(crate) struct Counters {
+pub(crate) struct Shared {
     /// Allocates chunk value ids. See [`ValueIds`].
     pub(crate) values: ValueIds,
     /// The logical clock the LRU orders by. See [`Ticks`].
     pub(crate) ticks: Ticks,
+    /// The cross-tab channel, or an inert stand-in. See [`crate::coherence`].
+    pub(crate) coherence: Coherence,
 }
 
 pub(crate) struct Inner {
@@ -50,7 +54,7 @@ pub(crate) struct Inner {
     pub(crate) config: LockerConfig,
     /// Shared with the bank and with every other locker it opened, so chunk
     /// value ids and LRU ticks are unique bank-wide rather than per handle.
-    pub(crate) counters: Arc<Counters>,
+    pub(crate) shared: Arc<Shared>,
     pub(crate) watchers: Watchers,
     /// Set by `Locker::close` / `LazyLocker::close`.
     ///
@@ -121,8 +125,18 @@ impl Inner {
         self.backend.get(Table::Records, &encoded).await
     }
 
+    /// Commit, then tell the other tabs.
+    ///
+    /// The news is worked out **before** the commit (the op list is moved into
+    /// it) and posted **after** it lands, so no tab is ever told about a write
+    /// that failed, and no op list is cloned to make that possible.
     pub(crate) async fn commit(&self, ops: Vec<Op>) -> Result<()> {
-        self.backend.commit(ops).await
+        let news = self.shared.coherence.prepare(self.id, &ops);
+        self.backend.commit(ops).await?;
+        if let Some(news) = news {
+            self.shared.coherence.post(news);
+        }
+        Ok(())
     }
 
     /// Decode a stored record into postcard (or raw) payload bytes.
@@ -186,7 +200,7 @@ impl Inner {
     }
 
     pub(crate) async fn next_value_id(&self) -> Result<(u64, Op)> {
-        self.counters.values.allocate(self.backend.as_ref()).await
+        self.shared.values.allocate(self.backend.as_ref()).await
     }
 
     /// Ops to store `postcard` bytes at `key`, chunking when needed, and to

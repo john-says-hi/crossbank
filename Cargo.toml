@@ -57,6 +57,8 @@ web-sys = { version = "0.3", features = [
     "Navigator",
     "StorageManager",
     "StorageEstimate",
+    "BroadcastChannel",
+    "MessageEvent",
     "console",
 ] }
 # Chosen over `indexed_db_futures` because that crate pulls tokio in for one

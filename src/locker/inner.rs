@@ -296,17 +296,27 @@ impl Inner {
         }
     }
 
+    /// Reassemble a chunked value.
+    ///
+    /// One `get_many` rather than one `get` per chunk. Two reasons, and the
+    /// second is the one that matters: it is a single backend round trip
+    /// instead of `n_chunks` of them — on IndexedDB, one transaction instead
+    /// of one per chunk — and it is a single *snapshot*, so a value cannot be
+    /// reassembled from halves written either side of a concurrent overwrite.
+    ///
+    /// This is the whole-value path. The streaming [`super::io::Reader`]
+    /// deliberately keeps fetching a chunk at a time, because holding the
+    /// value's worth of pieces at once is precisely what it exists to avoid.
     pub(crate) async fn read_chunks(&self, pointer: &ChunkPointer) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(pointer.total_len as usize);
-        for seq in 0..pointer.n_chunks {
-            let key = chunk_key(pointer.value_id, seq);
-            let sealed = self
-                .backend
-                .get(Table::Chunks, &key)
-                .await?
-                .ok_or_else(|| {
-                    Error::Corrupt(format!("missing chunk {seq} of {}", pointer.value_id))
-                })?;
+        let keys: Vec<Vec<u8>> = (0..pointer.n_chunks)
+            .map(|seq| chunk_key(pointer.value_id, seq))
+            .collect();
+        let sealed_pieces = self.backend.get_many(Table::Chunks, keys).await?;
+        for (seq, sealed) in sealed_pieces.into_iter().enumerate() {
+            let sealed = sealed.ok_or_else(|| {
+                Error::Corrupt(format!("missing chunk {seq} of {}", pointer.value_id))
+            })?;
             let piece = self.chain.open(&sealed)?;
             out.extend_from_slice(&piece);
         }

@@ -11,10 +11,10 @@
 # WHEN YOU ADD TEST CASES YOU MUST BUMP THESE NUMBERS. Run the lane, take the
 # "OK: N test(s) actually ran and passed." number, and write N here.
 #
-# Last verified: 2026-08-21, Phase 3 item 1 (durability knob): 47 conformance cases.
-plain-firefox    110
-plain-chrome     110
-atomics-chrome   110
-atomics-firefox  110
+# Last verified: 2026-08-21, Phase 3 item 4 (get_many chunk reads): 48 conformance cases.
+plain-firefox    112
+plain-chrome     112
+atomics-chrome   112
+atomics-firefox  112
 # Safari runs the same plain suite; the lane is new and non-blocking.
-plain-safari     110
+plain-safari     112

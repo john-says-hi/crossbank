@@ -1613,3 +1613,73 @@ pub async fn eventual_durability_survives_flush_then_reopen<H: Harness>(h: &H) -
     }
     Ok(())
 }
+
+/// A multi-chunk value comes back whole, through both read paths.
+///
+/// `read_chunks` fetches every piece in one `get_many` — one backend round
+/// trip and one snapshot — rather than a `get` per chunk. The failure mode a
+/// batched read invites is an off-by-one in reassembly: a dropped, duplicated
+/// or reordered piece still yields a plausible-looking `Vec<u8>`, so this pins
+/// the exact bytes rather than just the length.
+///
+/// The streaming `Reader` is asserted alongside it on purpose. It deliberately
+/// did **not** move to `get_many` — holding every piece at once is exactly
+/// what it exists to avoid — so the two paths can now drift, and this is what
+/// would catch it.
+pub async fn chunked_reads_are_whole_after_get_many<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let locker = bank
+        .lazy_locker_with::<Vec<u8>>("chunked", tiny_chunks())
+        .await?;
+
+    // 32-byte chunks, so 96 bytes spans several. Every byte is distinct
+    // enough that a swapped or repeated chunk cannot pass unnoticed.
+    let value: Vec<u8> = (0..96u8)
+        .map(|i| i.wrapping_mul(7).wrapping_add(3))
+        .collect();
+
+    // The batched path, through an ordinary put.
+    locker.put("put", &value).await?;
+    assert_eq!(
+        locker.get("put").await?,
+        Some(value.clone()),
+        "a chunked value must reassemble byte for byte"
+    );
+
+    // The streaming path. A `Writer` stores the bytes raw rather than
+    // postcard-framed, which is what lets the reader's pieces be compared to
+    // the value directly — a `put` would have the postcard length prefix in
+    // front of them.
+    let mut writer = locker.writer("streamed").await?;
+    for piece in value.chunks(32) {
+        writer.write_chunk(piece).await?;
+    }
+    writer.finish().await?;
+
+    let mut reader = locker
+        .reader("streamed")
+        .await?
+        .expect("a stored value must have a reader");
+    let mut streamed = Vec::new();
+    let mut pieces = 0usize;
+    while let Some(piece) = reader.next_chunk().await? {
+        pieces += 1;
+        streamed.extend_from_slice(&piece);
+    }
+    assert!(
+        pieces > 1,
+        "the value must actually be chunked, or this case proves nothing"
+    );
+    assert_eq!(
+        streamed, value,
+        "the streaming reader must yield the value byte for byte"
+    );
+
+    // And the batched path over the very same record must agree with it.
+    assert_eq!(
+        locker.get("streamed").await?,
+        Some(value),
+        "get_many reassembly and the streaming reader must not disagree"
+    );
+    Ok(())
+}

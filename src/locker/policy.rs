@@ -42,6 +42,57 @@ pub enum OnCorrupt {
     Skip,
 }
 
+/// When a write reaches storage.
+///
+/// The default is [`Commit::Immediate`] and it is never chosen for you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Commit {
+    /// Every write is its own commit, and `put` returns once it has landed.
+    ///
+    /// The safe answer, and the default: when `put` returns, the data is
+    /// stored.
+    #[default]
+    Immediate,
+
+    /// Stage writes in memory and commit them in batches of `after`.
+    ///
+    /// # You must call `flush` yourself
+    ///
+    /// **crossbank spawns nothing.** There is no timer, no background task and
+    /// no destructor that will flush for you — a `Drop` implementation cannot
+    /// await, and on the web a closing tab does not run one anyway. Staged
+    /// writes that are never flushed are lost, and that is the whole cost of
+    /// this mode.
+    ///
+    /// So a consumer choosing `Deferred` **must** call
+    /// [`crate::LazyLocker::flush`], [`crate::Locker::flush`] or
+    /// [`crate::Bank::flush_all`]:
+    ///
+    /// * on the web, from `pagehide` and from `visibilitychange` when the
+    ///   document becomes hidden — **not** `beforeunload`, which mobile
+    ///   browsers frequently never fire;
+    /// * natively, from whatever the application uses as its stop hook.
+    ///
+    /// `examples/flush_on_pagehide.rs` shows both.
+    ///
+    /// # What is visible before a flush
+    ///
+    /// Everything, to this handle: an eager locker updates its resident value
+    /// immediately, and a lazy locker sees staged writes through `get`,
+    /// `contains_key`, `len` and the key listings. Change events are raised
+    /// when the write is staged, because that is when it becomes visible —
+    /// which does mean an event can precede a commit that later fails.
+    ///
+    /// Nothing is visible to another handle, another tab or another process
+    /// until it is committed.
+    Deferred {
+        /// Commit once this many writes are staged. Zero and one both mean
+        /// "commit on the next write", which is [`Commit::Immediate`] with
+        /// extra steps.
+        after: usize,
+    },
+}
+
 /// Limits applied to one locker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LockerConfig {
@@ -60,6 +111,9 @@ pub struct LockerConfig {
 
     pub policy: Policy,
 
+    /// When writes reach storage. See [`Commit`].
+    pub commit: Commit,
+
     /// What to do about a record that will not decode. See [`OnCorrupt`].
     pub on_corrupt: OnCorrupt,
 
@@ -76,6 +130,7 @@ impl Default for LockerConfig {
             max_inline: 256 * 1024,
             eager_budget: 32 * 1024 * 1024,
             policy: Policy::Precious,
+            commit: Commit::Immediate,
             on_corrupt: OnCorrupt::Fail,
             chunk_size: 256 * 1024,
         }
@@ -95,6 +150,13 @@ impl LockerConfig {
 
     pub fn with_policy(mut self, policy: Policy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// See [`Commit`]. Deferred writes are never the default, and the caller
+    /// takes on the duty of flushing them.
+    pub fn with_commit(mut self, commit: Commit) -> Self {
+        self.commit = commit;
         self
     }
 
@@ -120,6 +182,16 @@ mod tests {
         assert_eq!(c.eager_budget, 32 * 1024 * 1024);
         assert_eq!(c.policy, Policy::Precious);
         assert_eq!(c.chunk_size, 256 * 1024);
+        assert_eq!(c.commit, Commit::Immediate);
+    }
+
+    #[test]
+    fn writes_are_immediate_unless_asked_otherwise() {
+        // Deferring by default would mean data silently lost for anyone who
+        // never learned they had to flush. Opt in to the risk, never out.
+        assert_eq!(Commit::default(), Commit::Immediate);
+        let c = LockerConfig::default().with_commit(Commit::Deferred { after: 8 });
+        assert_eq!(c.commit, Commit::Deferred { after: 8 });
     }
 
     #[test]

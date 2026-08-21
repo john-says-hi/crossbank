@@ -12,7 +12,7 @@
 //!   "panics" is not.
 //! * Never rely on `Drop` for cleanup. With abort there is no unwinding.
 
-use crossbank::{Bank, Error, Event, LockerConfig, OnCorrupt, Policy, Result};
+use crossbank::{Bank, Commit, Error, Event, LockerConfig, OnCorrupt, Policy, Result};
 use futures::StreamExt;
 
 use crate::Harness;
@@ -449,8 +449,8 @@ pub async fn operations_after_close_report_closed<H: Harness>(h: &H) -> Result<(
     assert!(bank.is_locker_open("lazy"));
     assert!(bank.is_locker_open("eager"));
 
-    lazy.close();
-    eager.close();
+    lazy.close().await?;
+    eager.close().await?;
 
     // A closed locker reads as empty; `is_closed` is what tells the two apart.
     assert!(lazy.is_closed());
@@ -484,7 +484,7 @@ pub async fn operations_after_close_report_closed<H: Harness>(h: &H) -> Result<(
     // closed locker must not be able to open one.
     let bytes = bank.lazy_locker::<Vec<u8>>("bytes").await?;
     bytes.put("k", &vec![1u8, 2, 3]).await?;
-    bytes.close();
+    bytes.close().await?;
     assert!(matches!(bytes.writer("k").await, Err(Error::Closed)));
     assert!(matches!(bytes.reader("k").await, Err(Error::Closed)));
 
@@ -512,8 +512,8 @@ pub async fn close_is_idempotent<H: Harness>(h: &H) -> Result<()> {
     let locker = first.lazy_locker::<V>("l").await?;
     locker.put("k", &v("x")).await?;
 
-    locker.close();
-    locker.close();
+    locker.close().await?;
+    locker.close().await?;
     assert!(locker.is_closed());
 
     first.close().await?;
@@ -579,7 +579,7 @@ pub async fn delete_locker_removes_records_and_chunks<H: Harness>(h: &H) -> Resu
         Err(Error::InvalidConfig(_))
     ));
 
-    locker.close();
+    locker.close().await?;
     assert!(bank.delete_locker("doomed").await?);
 
     assert_eq!(
@@ -610,7 +610,7 @@ pub async fn delete_locker_leaves_other_lockers_intact<H: Harness>(h: &H) -> Res
     keeper.put("k", &"y".repeat(200)).await?;
     keeper.put("inline", &v("kept")).await?;
 
-    doomed.close();
+    doomed.close().await?;
     assert!(bank.delete_locker("doomed").await?);
 
     assert_eq!(keeper.get("k").await?, Some("y".repeat(200)));
@@ -631,7 +631,7 @@ pub async fn a_deleted_locker_name_gets_a_fresh_id<H: Harness>(h: &H) -> Result<
     let locker = bank.lazy_locker::<V>("recycled").await?;
     let first = bank.locker_id("recycled").await?;
     locker.put("k", &v("old")).await?;
-    locker.close();
+    locker.close().await?;
 
     assert!(bank.delete_locker("recycled").await?);
 
@@ -741,7 +741,7 @@ pub async fn put_all_is_atomic<H: Harness>(h: &H) -> Result<()> {
     assert!(eager.get("ok").is_none());
 
     // And storage agrees with RAM: reopening finds nothing either.
-    eager.close();
+    eager.close().await?;
     let reopened = bank
         .locker_with::<V>("strict", LockerConfig::default().with_max_inline(64))
         .await?;
@@ -810,7 +810,7 @@ pub async fn a_corrupt_record_is_skipped_when_configured<H: Harness>(h: &H) -> R
     locker.put("good", v("keep")).await?;
     locker.put("bad", v("lose")).await?;
     let id = bank.locker_id("l").await?;
-    locker.close();
+    locker.close().await?;
 
     // Overwrite the stored bytes with something that is neither a CBNK
     // envelope nor a CCHK pointer.
@@ -847,7 +847,7 @@ pub async fn a_corrupt_record_is_skipped_when_configured<H: Harness>(h: &H) -> R
         bank.quarantine("l", &[b"bad"]).await,
         Err(Error::InvalidConfig(_))
     ));
-    skipping.close();
+    skipping.close().await?;
 
     assert_eq!(bank.quarantine("l", &[b"bad"]).await?, 1);
     assert!(
@@ -1008,7 +1008,7 @@ pub async fn a_corrupt_chunk_pointer_does_not_block_delete<H: Harness>(h: &H) ->
             value: b"CCHK truncated".to_vec(),
         }])
         .await?;
-    locker.close();
+    locker.close().await?;
     assert!(bank.delete_locker("l").await?);
     assert_eq!(count_rows(&bank, Table::Records).await?, 0);
     Ok(())
@@ -1027,7 +1027,7 @@ pub async fn a_name_is_open_until_every_handle_closes<H: Harness>(h: &H) -> Resu
     first.put("k", &v("x")).await?;
 
     assert!(bank.is_locker_open("l"));
-    second.close();
+    second.close().await?;
     assert!(
         bank.is_locker_open("l"),
         "the first handle is still live, so the name is still open"
@@ -1041,7 +1041,7 @@ pub async fn a_name_is_open_until_every_handle_closes<H: Harness>(h: &H) -> Resu
     // The surviving handle still works, which is the point.
     assert_eq!(first.get("k").await?, Some(v("x")));
 
-    first.close();
+    first.close().await?;
     assert!(!bank.is_locker_open("l"));
     assert!(bank.open_locker_names().is_empty());
     assert!(bank.delete_locker("l").await?);
@@ -1279,5 +1279,90 @@ pub async fn eviction_accounting_survives_a_reopen<H: Harness>(h: &H) -> Result<
     locker.put("d", &vec![7u8; 1_000]).await?;
     assert_eq!(locker.len(), 3);
     assert!(locker.budget_used() <= 3_100);
+    Ok(())
+}
+
+/// Deferred writes are visible to their own handle at once, and durable once
+/// flushed.
+///
+/// There is no "close without flushing" half to this case, because `close`
+/// flushes — deliberately. The durable half therefore flushes, closes, and
+/// reopens through the harness.
+pub async fn deferred_writes_are_visible_before_flush_and_durable_after<H: Harness>(
+    h: &H,
+) -> Result<()> {
+    let deferred = LockerConfig::default().with_commit(Commit::Deferred { after: 4 });
+    {
+        let bank = bank(h).await?;
+        let locker = bank.lazy_locker_with::<V>("deferred", deferred).await?;
+
+        locker.put("a", &v("alpha")).await?;
+        locker.put("b", &v("beta")).await?;
+
+        assert_eq!(locker.pending(), 2, "two writes staged, none committed");
+        assert!(locker.pending_bytes() > 0);
+
+        // Visible to this handle immediately — that is the whole bargain.
+        assert_eq!(locker.get("a").await?, Some(v("alpha")));
+        assert!(locker.contains_key("b"));
+        assert_eq!(locker.len(), 2);
+        assert_eq!(locker.keys(), vec!["a".to_string(), "b".to_string()]);
+
+        // And invisible to storage until a flush.
+        assert_eq!(
+            bank.locker_bytes("deferred").await?,
+            0,
+            "nothing may reach storage before the batch is flushed"
+        );
+
+        locker.flush().await?;
+        assert_eq!(locker.pending(), 0);
+        assert_eq!(locker.pending_bytes(), 0);
+        assert!(bank.locker_bytes("deferred").await? > 0);
+
+        // A full batch commits itself.
+        for key in ["c", "d", "e", "f"] {
+            locker.put(key, &v(key)).await?;
+        }
+        assert_eq!(locker.pending(), 0, "a full batch must flush itself");
+
+        // A staged delete hides the key from its own handle too.
+        locker.delete("a").await?;
+        assert_eq!(locker.pending(), 1);
+        assert_eq!(locker.get("a").await?, None);
+        assert!(!locker.contains_key("a"));
+
+        // `close` flushes, so the delete lands rather than being dropped.
+        locker.close().await?;
+        bank.close().await?;
+    }
+
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker_with::<V>("deferred", deferred).await?;
+
+    if h.caps().persists_across_open {
+        assert_eq!(locker.get("b").await?, Some(v("beta")));
+        assert_eq!(locker.get("f").await?, Some(v("f")));
+        assert_eq!(
+            locker.get("a").await?,
+            None,
+            "the delete `close` flushed must have landed too"
+        );
+    } else {
+        assert_eq!(locker.get("b").await?, None);
+    }
+
+    // The same bargain on an eager locker, whose resident value is updated
+    // when the write is staged.
+    let eager = bank.locker_with::<V>("deferred_eager", deferred).await?;
+    eager.put("k", v("resident")).await?;
+    assert_eq!(eager.pending(), 1);
+    assert_eq!(eager.get("k").as_deref(), Some(&v("resident")));
+    assert_eq!(bank.locker_bytes("deferred_eager").await?, 0);
+
+    // `flush_all` reaches every open locker from one call.
+    bank.flush_all().await?;
+    assert_eq!(eager.pending(), 0);
+    assert!(bank.locker_bytes("deferred_eager").await? > 0);
     Ok(())
 }

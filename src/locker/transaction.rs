@@ -118,75 +118,15 @@ where
         staged: &[Staged<T>],
         mode: TxMode,
     ) -> Result<Vec<Op>> {
-        let mut ops = Vec::new();
-
-        let tail = match staged.iter().rposition(|e| matches!(e, Staged::Clear)) {
-            Some(i) => {
-                ops.extend(inner.clear_value_ops().await?);
-                &staged[i + 1..]
-            }
-            None => staged,
-        };
-
-        enum Action<'a> {
-            Put(&'a [u8]),
-            Delete,
-        }
-
-        let mut actions: BTreeMap<&[u8], Action<'_>> = BTreeMap::new();
-        for entry in tail {
-            match entry {
-                Staged::Put { key, payload, .. } => {
-                    actions.insert(key, Action::Put(payload));
-                }
-                Staged::Delete { key } => {
-                    actions.insert(key, Action::Delete);
-                }
-                // None can remain: `tail` starts after the last clear.
-                Staged::Clear => {}
-            }
-        }
-
-        for (key, action) in actions {
-            match action {
-                Action::Delete => ops.extend(inner.delete_value_ops(key).await?),
-                Action::Put(payload) => match mode {
-                    TxMode::Lazy => {
-                        ops.extend(
-                            inner
-                                .put_payload_ops(key, payload.to_vec(), FLAG_POSTCARD)
-                                .await?,
-                        );
-                    }
-                    TxMode::Eager => {
-                        let sealed = inner.chain.seal(payload)?;
-                        if sealed.len() > inner.config.max_inline {
-                            return Err(Error::ValueTooLarge {
-                                bytes: sealed.len(),
-                                max_inline: inner.config.max_inline,
-                            });
-                        }
-                        // An eager locker never writes a pointer itself, but
-                        // the same name may have been written through a lazy
-                        // handle, so still GC what is actually there.
-                        if let Some(existing) = inner.fetch(key).await? {
-                            if is_pointer(&existing) {
-                                if let Ok(pointer) = ChunkPointer::parse(&existing) {
-                                    ops.push(gc_ops(&pointer));
-                                }
-                            }
-                        }
-                        ops.push(Op::Put {
-                            table: Table::Records,
-                            key: inner.encode_key(key),
-                            value: sealed,
-                        });
-                    }
-                },
-            }
-        }
-
-        Ok(ops)
+        let items: Vec<Item<'_>> = staged
+            .iter()
+            .map(|entry| match entry {
+                Staged::Put { key, payload, .. } => Item::Put(key, payload),
+                Staged::Delete { key } => Item::Delete(key),
+                Staged::Clear => Item::Clear,
+            })
+            .collect();
+        ops_for_items(inner, &items, mode).await
     }
 
     /// Stage a write. Encoding happens now, on this thread, so no user code
@@ -278,4 +218,117 @@ where
             .push(entry);
         Ok(())
     }
+}
+
+/// One mutation, borrowed. The common shape of a staged transaction entry and
+/// a deferred write, so both build their ops through the same code.
+pub(crate) enum Item<'a> {
+    Put(&'a [u8], &'a [u8]),
+    Delete(&'a [u8]),
+    Clear,
+}
+
+/// Turn a write-set into backend ops.
+///
+/// Async because it is GC-aware: overwriting or deleting a key that holds a
+/// chunk pointer has to look the old pointer up so its chunks are dropped in
+/// the same commit. Staging bare `Op::Put`s instead is what orphaned chunks
+/// forever on the `put_all` / `transact` path.
+///
+/// The write-set is collapsed first — everything before the last `clear` is
+/// dropped, and only the last action per key survives — so one key written
+/// twice allocates one value id, not two (the first of which nothing would
+/// ever point at).
+pub(crate) async fn ops_for_items(
+    inner: &Inner,
+    staged: &[Item<'_>],
+    mode: TxMode,
+) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+
+    let tail = match staged.iter().rposition(|e| matches!(e, Item::Clear)) {
+        Some(i) => {
+            ops.extend(inner.clear_value_ops().await?);
+            &staged[i + 1..]
+        }
+        None => staged,
+    };
+
+    enum Action<'a> {
+        Put(&'a [u8]),
+        Delete,
+    }
+
+    let mut actions: BTreeMap<&[u8], Action<'_>> = BTreeMap::new();
+    for entry in tail {
+        match entry {
+            Item::Put(key, payload) => {
+                actions.insert(key, Action::Put(payload));
+            }
+            Item::Delete(key) => {
+                actions.insert(key, Action::Delete);
+            }
+            // None can remain: `tail` starts after the last clear.
+            Item::Clear => {}
+        }
+    }
+
+    for (key, action) in actions {
+        match action {
+            Action::Delete => ops.extend(inner.delete_value_ops(key).await?),
+            Action::Put(payload) => match mode {
+                TxMode::Lazy => {
+                    ops.extend(
+                        inner
+                            .put_payload_ops(key, payload.to_vec(), FLAG_POSTCARD)
+                            .await?,
+                    );
+                }
+                TxMode::Eager => {
+                    let sealed = inner.chain.seal(payload)?;
+                    if sealed.len() > inner.config.max_inline {
+                        return Err(Error::ValueTooLarge {
+                            bytes: sealed.len(),
+                            max_inline: inner.config.max_inline,
+                        });
+                    }
+                    // An eager locker never writes a pointer itself, but the
+                    // same name may have been written through a lazy handle,
+                    // so still GC what is actually there.
+                    if let Some(existing) = inner.fetch(key).await? {
+                        if is_pointer(&existing) {
+                            if let Ok(pointer) = ChunkPointer::parse(&existing) {
+                                ops.push(gc_ops(&pointer));
+                            }
+                        }
+                    }
+                    ops.push(Op::Put {
+                        table: Table::Records,
+                        key: inner.encode_key(key),
+                        value: sealed,
+                    });
+                }
+            },
+        }
+    }
+
+    Ok(ops)
+}
+
+/// The deferred-write twin of [`Transaction::ops_for`].
+pub(crate) async fn ops_for_pending(
+    inner: &Inner,
+    staged: &[super::resident::Pending],
+    mode: TxMode,
+) -> Result<Vec<Op>> {
+    use super::resident::Pending;
+    let items: Vec<Item<'_>> = staged
+        .iter()
+        .map(|entry| match entry {
+            Pending::Put { key, payload } => Item::Put(key, payload),
+            Pending::Delete { key } => Item::Delete(key),
+            Pending::Clear => Item::Clear,
+        })
+        .collect();
+    ops_for_items(inner, &items, mode).await
 }

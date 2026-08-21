@@ -31,6 +31,7 @@ use crate::key::LockerId;
 
 use super::inner::Inner;
 use super::policy::{LockerConfig, OnCorrupt, Policy};
+use super::resident::{Pending, Resident};
 use super::transaction::{Staged, Transaction, TxMode};
 use crate::watch::Event;
 
@@ -43,6 +44,10 @@ pub struct Locker<T> {
     /// Keys whose stored bytes would not decode at open, under
     /// [`OnCorrupt::Skip`]. Fixed once open returns.
     corrupt: Vec<Vec<u8>>,
+    /// Staged writes, shared with [`crate::Bank::flush_all`], which cannot
+    /// know `T`. An eager locker keeps no key index and takes no byte budget,
+    /// so staging is all this holds.
+    res: Arc<Resident>,
     /// Keeps this locker's coherence registration alive; the channel holds
     /// only a `Weak`, so dropping the locker unregisters it.
     #[cfg(target_arch = "wasm32")]
@@ -141,10 +146,12 @@ where
             });
         }
 
+        let res = Arc::new(Resident::new(inner.clone(), TxMode::Eager, None, None));
         Ok(Self {
             inner,
             values: Arc::new(Mutex::new(values)),
             corrupt,
+            res,
             #[cfg(target_arch = "wasm32")]
             sink: Mutex::new(None),
         })
@@ -166,6 +173,29 @@ where
             });
         }
 
+        if self.res.is_deferred() {
+            // The resident copy is updated at once: this handle's own writes
+            // are visible to it immediately, committed or not. The payload is
+            // re-encoded rather than reusing `sealed`, because the flush path
+            // seals every batch through one code path.
+            let payload = postcard::to_allocvec(&value)
+                .map_err(|e| Error::Filter(format!("postcard serialisation failed: {e}")))?;
+            let full = self.res.stage(Pending::Put {
+                key: key.to_vec(),
+                payload,
+            })?;
+            let shared = Arc::new(value);
+            if let Ok(mut guard) = self.values.lock() {
+                guard.insert(key.to_vec(), shared.clone());
+            }
+            self.inner.announce(Event::Put { key: key.to_vec() });
+            if full {
+                let _guard = self.inner.write_lock.lock().await;
+                self.res.flush_locked().await?;
+            }
+            return Ok(shared);
+        }
+
         let op = crate::backend::api::Op::Put {
             table: crate::backend::api::Table::Records,
             key: self.inner.encode_key(key),
@@ -181,6 +211,25 @@ where
         }
         self.inner.announce(Event::Put { key: key.to_vec() });
         Ok(shared)
+    }
+
+    /// Commit everything this locker has staged. See [`crate::Commit`].
+    ///
+    /// Always safe to call: an immediate-commit locker has nothing staged and
+    /// returns at once.
+    pub async fn flush(&self) -> Result<()> {
+        self.inner.ensure_open()?;
+        self.res.flush().await
+    }
+
+    /// How many writes are staged and not yet committed.
+    pub fn pending(&self) -> usize {
+        self.res.pending_len()
+    }
+
+    /// Payload bytes staged and not yet committed.
+    pub fn pending_bytes(&self) -> u64 {
+        self.res.pending_bytes()
     }
 
     /// Run a transaction: every staged write lands together, or none does.
@@ -247,6 +296,18 @@ where
     /// As [`Locker::delete`], under a binary key.
     pub async fn delete_by(&self, key: &[u8]) -> Result<()> {
         self.inner.ensure_open()?;
+        if self.res.is_deferred() {
+            let full = self.res.stage(Pending::Delete { key: key.to_vec() })?;
+            if let Ok(mut guard) = self.values.lock() {
+                guard.remove(key);
+            }
+            self.inner.announce(Event::Deleted { key: key.to_vec() });
+            if full {
+                let _guard = self.inner.write_lock.lock().await;
+                self.res.flush_locked().await?;
+            }
+            return Ok(());
+        }
         self.inner.commit(vec![self.inner.delete_op(key)]).await?;
         if let Ok(mut guard) = self.values.lock() {
             guard.remove(key);
@@ -295,6 +356,18 @@ where
     /// Remove everything in this locker, and nothing outside it.
     pub async fn clear(&self) -> Result<()> {
         self.inner.ensure_open()?;
+        if self.res.is_deferred() {
+            let full = self.res.stage(Pending::Clear)?;
+            if let Ok(mut guard) = self.values.lock() {
+                guard.clear();
+            }
+            self.inner.announce(Event::Cleared);
+            if full {
+                let _guard = self.inner.write_lock.lock().await;
+                self.res.flush_locked().await?;
+            }
+            return Ok(());
+        }
         self.inner.commit(vec![self.inner.clear_op()]).await?;
         if let Ok(mut guard) = self.values.lock() {
             guard.clear();
@@ -408,6 +481,10 @@ impl<T> Locker<T> {
         &self.inner
     }
 
+    pub(crate) fn resident(&self) -> &Arc<Resident> {
+        &self.res
+    }
+
     /// Keys whose stored bytes would not decode when this locker was opened.
     ///
     /// Always empty under [`OnCorrupt::Fail`], which refuses to open at all
@@ -432,11 +509,17 @@ impl<T> Locker<T> {
     ///
     /// Idempotent, and it does not delete anything — reopening the same name
     /// from the bank finds the data untouched.
-    pub fn close(&self) {
+    pub async fn close(&self) -> Result<()> {
+        // Flush before closing, and close even if the flush fails: a caller
+        // who is shutting down must not be left holding an open locker just
+        // because its last batch would not land.
+        let flushed = self.res.flush().await;
+        self.res.discard_staged();
         self.inner.mark_closed();
         if let Ok(mut guard) = self.values.lock() {
             guard.clear();
         }
+        flushed
     }
 
     /// Whether [`Locker::close`] has been called.

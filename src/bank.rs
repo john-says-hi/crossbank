@@ -150,6 +150,12 @@ pub struct Bank {
     /// made the name read as closed while the first was still live, which let
     /// `delete_locker` and `quarantine` run under a working locker.
     open_lockers: Mutex<HashMap<String, Vec<Weak<Inner>>>>,
+    /// The staged-write buffers of every open locker.
+    ///
+    /// `Weak`, and non-generic, so [`Bank::flush_all`] can commit them all
+    /// without knowing any locker's value type and without keeping a dropped
+    /// locker alive.
+    residents: Mutex<Vec<Weak<crate::locker::resident::Resident>>>,
     /// Bank-wide facilities (chunk value ids, LRU ticks, coherence), cloned into every
     /// locker so two handles on one name cannot collide.
     shared: Arc<crate::locker::inner::Shared>,
@@ -351,6 +357,7 @@ impl Bank {
             job_sender,
             job_receiver: Mutex::new(Some(job_receiver)),
             open_lockers: Mutex::new(HashMap::new()),
+            residents: Mutex::new(Vec::new()),
             shared: shared.clone(),
             closed: AtomicBool::new(false),
         };
@@ -468,6 +475,7 @@ impl Bank {
         )
         .await?;
         self.register_open(name, locker.inner());
+        self.register_resident(locker.resident());
         locker.join_coherence();
         Ok(locker)
     }
@@ -503,6 +511,7 @@ impl Bank {
         )
         .await?;
         self.register_open(name, locker.inner());
+        self.register_resident(locker.resident());
         locker.join_coherence();
         Ok(locker)
     }
@@ -958,18 +967,67 @@ impl Bank {
     /// Lockers opened from this bank are *not* individually closed — they keep
     /// whatever they already hold in RAM, and their writes start failing.
     pub async fn close(&self) -> Result<()> {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if self.is_closed() {
             return Ok(());
+        }
+        // Flush first, and close regardless of how that went: a caller who is
+        // shutting down must not be left with an open bank because one batch
+        // would not land. The flush error is still returned.
+        let flushed = self.flush_all().await;
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return flushed;
         }
         // Drop the message closure before the backend goes: a channel still
         // listening would call into a bank that no longer works.
         self.shared.coherence.close();
-        self.backend.close().await
+        let closed = self.backend.close().await;
+        flushed.and(closed)
     }
 
     /// Whether [`Bank::close`] has been called.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    fn register_resident(&self, resident: &Arc<crate::locker::resident::Resident>) {
+        if let Ok(mut guard) = self.residents.lock() {
+            guard.retain(|weak| weak.strong_count() > 0);
+            guard.push(Arc::downgrade(resident));
+        }
+    }
+
+    /// Commit every open locker's staged writes, then ask the backend to make
+    /// what it holds durable.
+    ///
+    /// The answer to [`crate::Commit::Deferred`] at the application level:
+    /// one call from a `pagehide` handler, or from a native stop hook,
+    /// regardless of how many lockers are open. **crossbank spawns nothing,
+    /// so nothing else will make this call for you.**
+    ///
+    /// A locker whose flush fails does not stop the others: every locker is
+    /// flushed and the first error is returned, because on a shutdown path
+    /// saving four lockers out of five beats saving none.
+    pub async fn flush_all(&self) -> Result<()> {
+        self.ensure_open()?;
+        let residents: Vec<Arc<crate::locker::resident::Resident>> = match self.residents.lock() {
+            Ok(mut guard) => {
+                guard.retain(|weak| weak.strong_count() > 0);
+                guard.iter().filter_map(|weak| weak.upgrade()).collect()
+            }
+            Err(_) => Vec::new(),
+        };
+
+        let mut first: Option<Error> = None;
+        for resident in residents {
+            if let Err(e) = resident.flush().await {
+                first.get_or_insert(e);
+            }
+        }
+        let flushed = self.backend.flush().await;
+        match first {
+            Some(e) => Err(e),
+            None => flushed,
+        }
     }
 
     fn register_open(&self, name: &str, inner: &Arc<Inner>) {
@@ -1130,7 +1188,7 @@ mod tests {
         block_on(l.put("good", "keep".into())).unwrap();
         block_on(l.put("bad", "lose".into())).unwrap();
         let id = block_on(b.locker_id("l")).unwrap();
-        l.close();
+        block_on(l.close()).unwrap();
 
         corrupt_record(&b, id, "bad");
 
@@ -1159,7 +1217,7 @@ mod tests {
             block_on(b.quarantine("l", &[b"bad"])),
             Err(Error::InvalidConfig(_))
         ));
-        skipping.close();
+        block_on(skipping.close()).unwrap();
 
         assert_eq!(block_on(b.quarantine("l", &[b"bad"])).unwrap(), 1);
         assert!(block_on(b.verify("l")).unwrap().is_empty());
@@ -1175,7 +1233,7 @@ mod tests {
         let b = bank();
         let l = block_on(b.lazy_locker::<String>("l")).unwrap();
         block_on(l.put("k", &"v".to_string())).unwrap();
-        l.close();
+        block_on(l.close()).unwrap();
 
         assert_eq!(block_on(b.quarantine("l", &[b"ghost"])).unwrap(), 0);
         assert_eq!(block_on(b.quarantine("l", &[])).unwrap(), 0);
@@ -1204,7 +1262,7 @@ mod tests {
         let l = block_on(b.lazy_locker::<String>("l")).unwrap();
         block_on(l.put("bad", &"v".to_string())).unwrap();
         let id = block_on(b.locker_id("l")).unwrap();
-        l.close();
+        block_on(l.close()).unwrap();
         corrupt_record(&b, id, "bad");
 
         let skipping = block_on(b.lazy_locker_with::<String>(

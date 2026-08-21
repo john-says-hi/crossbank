@@ -1,0 +1,498 @@
+//! A locker's resident state: its key index, its byte budget, and its staged
+//! writes.
+//!
+//! # Why this is not simply fields on the locker
+//!
+//! Two things need to reach it without knowing the locker's value type:
+//!
+//! * the **coherence callback**, which folds another tab's news into the key
+//!   index (see [`crate::coherence`]);
+//! * [`crate::Bank::flush_all`], which must commit every open locker's staged
+//!   writes and cannot be generic over each one's `T`.
+//!
+//! Everything here is therefore non-generic. It works in keys, payload bytes
+//! and ops — the value type only matters at the two edges, where a caller
+//! hands one in or takes one out.
+
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+
+use crate::backend::api::Op;
+use crate::error::{Error, Result};
+use crate::watch::Event;
+
+use super::inner::Inner;
+use super::lru::{self, Entry, LruState, Plan};
+use super::policy::{Commit, Policy};
+use super::transaction::TxMode;
+
+/// One write waiting for a commit.
+///
+/// Payload bytes rather than a value: encoding happens when the write is
+/// staged, on the caller's thread, so a flush is pure I/O and no user code can
+/// run inside it.
+#[derive(Debug, Clone)]
+pub(crate) enum Pending {
+    Put { key: Vec<u8>, payload: Vec<u8> },
+    Delete { key: Vec<u8> },
+    Clear,
+}
+
+/// What one commit does to an evictable locker's accounting.
+///
+/// Empty, and free, for a `Precious` locker.
+#[derive(Debug, Default)]
+pub(crate) struct Budget {
+    updates: Vec<(Vec<u8>, Entry)>,
+    removals: Vec<Vec<u8>>,
+    cleared: bool,
+    pub(crate) plan: Plan,
+    /// Deferred tick bumps this commit carried, to forget once it lands.
+    pending: Vec<Vec<u8>>,
+}
+
+pub(crate) struct Resident {
+    pub(crate) inner: Arc<Inner>,
+    mode: TxMode,
+    /// The resident key index. `None` on an eager locker, which holds whole
+    /// values instead and keeps them itself.
+    index: Option<Mutex<BTreeSet<Vec<u8>>>>,
+    /// Byte-budget accounting, present only under [`Policy::Evictable`].
+    lru: Option<Mutex<LruState>>,
+    staged: Mutex<Vec<Pending>>,
+}
+
+impl std::fmt::Debug for Resident {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resident")
+            .field("locker", &self.inner.name)
+            .field("pending", &self.pending_len())
+            .finish()
+    }
+}
+
+impl Resident {
+    pub(crate) fn new(
+        inner: Arc<Inner>,
+        mode: TxMode,
+        index: Option<BTreeSet<Vec<u8>>>,
+        lru: Option<LruState>,
+    ) -> Self {
+        Self {
+            inner,
+            mode,
+            index: index.map(Mutex::new),
+            lru: lru.map(Mutex::new),
+            staged: Mutex::new(Vec::new()),
+        }
+    }
+
+    // ---- the key index -------------------------------------------------
+
+    pub(crate) fn read_index<R>(&self, f: impl FnOnce(&BTreeSet<Vec<u8>>) -> R) -> Option<R> {
+        let guard = self.index.as_ref()?.lock().ok()?;
+        Some(f(&guard))
+    }
+
+    pub(crate) fn touch_index(&self, f: impl FnOnce(&mut BTreeSet<Vec<u8>>)) {
+        if let Some(Ok(mut guard)) = self.index.as_ref().map(|i| i.lock()) {
+            f(&mut guard);
+        }
+    }
+
+    // ---- the byte budget -----------------------------------------------
+
+    fn lru_lock(&self) -> Option<std::sync::MutexGuard<'_, LruState>> {
+        self.lru.as_ref()?.lock().ok()
+    }
+
+    pub(crate) fn budget_used(&self) -> u64 {
+        self.lru_lock().map(|s| s.total()).unwrap_or(0)
+    }
+
+    /// Note that `key` was read. RAM only; the bump rides along with the next
+    /// commit, because a read must not write.
+    pub(crate) async fn note_read(&self, key: &[u8]) -> Result<()> {
+        if self.lru.is_none() {
+            return Ok(());
+        }
+        let tick = self
+            .inner
+            .shared
+            .ticks
+            .allocate(self.inner.backend.as_ref())
+            .await?;
+        if let Some(mut state) = self.lru_lock() {
+            state.touch(key, tick);
+        }
+        Ok(())
+    }
+
+    /// Everything one commit is about to do to the byte budget.
+    ///
+    /// Computed before the commit, applied after it lands — so a commit that
+    /// fails leaves the accounting describing what is actually stored.
+    pub(crate) async fn budget_ops(
+        &self,
+        ops: &mut Vec<Op>,
+        updates: Vec<(Vec<u8>, u64)>,
+        removals: Vec<Vec<u8>>,
+        cleared: bool,
+        keep: Option<&[u8]>,
+    ) -> Result<Budget> {
+        if self.lru.is_none() {
+            return Ok(Budget::default());
+        }
+
+        let tick = self
+            .inner
+            .shared
+            .ticks
+            .allocate(self.inner.backend.as_ref())
+            .await?;
+        let updates: Vec<(Vec<u8>, Entry)> = updates
+            .into_iter()
+            .map(|(key, bytes)| (key, Entry { tick, bytes }))
+            .collect();
+
+        // The lock is taken, used, and dropped before any await below. A
+        // `std` mutex held across an await would deadlock the moment two
+        // futures on one thread interleaved.
+        let (plan, pending, mut pending_ops) = {
+            let Some(state) = self.lru_lock() else {
+                return Ok(Budget::default());
+            };
+            let plan = state.plan(&updates, &removals, cleared, state.max_bytes, keep);
+            let skip: Vec<Vec<u8>> = updates.iter().map(|(k, _)| k.clone()).collect();
+            let (pending, pending_ops) = if cleared {
+                (Vec::new(), Vec::new())
+            } else {
+                state.pending_ops(self.inner.id, &skip)
+            };
+            (plan, pending, pending_ops)
+        };
+
+        let id = self.inner.id;
+        if cleared {
+            ops.push(lru::clear_op(id));
+        }
+        for (key, entry) in &updates {
+            ops.push(lru::put_op(id, key, *entry));
+        }
+        ops.append(&mut pending_ops);
+        for key in &removals {
+            ops.push(lru::delete_op(id, key));
+        }
+        for victim in &plan.victims {
+            ops.extend(self.inner.delete_value_ops(victim).await?);
+            ops.push(lru::delete_op(id, victim));
+        }
+        ops.push(self.inner.shared.ticks.counter_op()?);
+
+        Ok(Budget {
+            updates,
+            removals,
+            cleared,
+            plan,
+            pending,
+        })
+    }
+
+    /// Apply the accounting, drop the evicted keys from the index, and say so.
+    pub(crate) fn apply_budget(&self, budget: &Budget) {
+        if let Some(mut state) = self.lru_lock() {
+            state.apply(
+                &budget.updates,
+                &budget.removals,
+                budget.cleared,
+                &budget.plan,
+            );
+            state.clear_pending(&budget.pending);
+        }
+        if !budget.plan.victims.is_empty() {
+            self.touch_index(|index| {
+                for victim in &budget.plan.victims {
+                    index.remove(victim.as_slice());
+                }
+            });
+        }
+        for key in &budget.plan.victims {
+            self.inner.announce(Event::Evicted { key: key.clone() });
+        }
+    }
+
+    /// Shed least-recently-used keys until at most `bytes` remain accounted.
+    pub(crate) async fn evict_to(&self, bytes: u64) -> Result<usize> {
+        if self.lru.is_none() {
+            return Ok(0);
+        }
+        let _guard = self.inner.write_lock.lock().await;
+
+        let plan = {
+            let Some(state) = self.lru_lock() else {
+                return Ok(0);
+            };
+            state.plan(&[], &[], false, bytes, None)
+        };
+        if plan.victims.is_empty() {
+            return Ok(0);
+        }
+
+        let mut ops = Vec::new();
+        for victim in &plan.victims {
+            ops.extend(self.inner.delete_value_ops(victim).await?);
+            ops.push(lru::delete_op(self.inner.id, victim));
+        }
+        self.inner.commit(ops).await?;
+
+        let shed = plan.victims.len();
+        self.apply_budget(&Budget {
+            plan,
+            ..Budget::default()
+        });
+        Ok(shed)
+    }
+
+    // ---- staged writes -------------------------------------------------
+
+    /// How many writes must pile up before this locker commits by itself, or
+    /// `None` when every write commits immediately.
+    fn deferred_after(&self) -> Option<usize> {
+        match self.inner.config.commit {
+            Commit::Immediate => None,
+            // 0 and 1 both mean "commit on the next write", which is
+            // `Immediate` with extra steps — so treat them as it.
+            Commit::Deferred { after } if after <= 1 => None,
+            Commit::Deferred { after } => Some(after),
+        }
+    }
+
+    pub(crate) fn is_deferred(&self) -> bool {
+        self.deferred_after().is_some()
+    }
+
+    pub(crate) fn pending_len(&self) -> usize {
+        self.staged.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
+    pub(crate) fn pending_bytes(&self) -> u64 {
+        self.staged
+            .lock()
+            .map(|s| {
+                s.iter()
+                    .map(|p| match p {
+                        Pending::Put { payload, .. } => payload.len() as u64,
+                        Pending::Delete { .. } | Pending::Clear => 0,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Queue a write. Returns whether the batch is now full.
+    pub(crate) fn stage(&self, entry: Pending) -> Result<bool> {
+        let after = self.deferred_after().unwrap_or(usize::MAX);
+        let mut guard = self
+            .staged
+            .lock()
+            .map_err(|_| Error::backend("staged write lock was poisoned"))?;
+        guard.push(entry);
+        Ok(guard.len() >= after)
+    }
+
+    /// The staged payload for a key: `None` when nothing staged has touched
+    /// it, `Some(None)` when the last thing staged removed it.
+    pub(crate) fn staged_view(&self, key: &[u8]) -> Result<Option<Option<Vec<u8>>>> {
+        let guard = self
+            .staged
+            .lock()
+            .map_err(|_| Error::backend("staged write lock was poisoned"))?;
+        for entry in guard.iter().rev() {
+            match entry {
+                Pending::Put { key: k, payload } if k == key => {
+                    return Ok(Some(Some(payload.clone())))
+                }
+                Pending::Delete { key: k } if k == key => return Ok(Some(None)),
+                Pending::Clear => return Ok(Some(None)),
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Commit everything staged, taking the locker's write lock.
+    pub(crate) async fn flush(&self) -> Result<()> {
+        if self.pending_len() == 0 {
+            return Ok(());
+        }
+        let _guard = self.inner.write_lock.lock().await;
+        self.flush_locked().await
+    }
+
+    /// As [`Resident::flush`], for a caller that already holds the write lock.
+    pub(crate) async fn flush_locked(&self) -> Result<()> {
+        let entries = {
+            let mut guard = self
+                .staged
+                .lock()
+                .map_err(|_| Error::backend("staged write lock was poisoned"))?;
+            std::mem::take(&mut *guard)
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut ops =
+            match super::transaction::ops_for_pending(&self.inner, &entries, self.mode).await {
+                Ok(ops) => ops,
+                Err(e) => {
+                    // Put the batch back rather than dropping it on the floor: a
+                    // flush that failed has not written anything, and the caller
+                    // may well fix the cause and try again.
+                    self.restage(entries);
+                    return Err(e);
+                }
+            };
+
+        let (updates, removals, cleared) = accounting(&entries);
+        let budget = match self
+            .budget_ops(&mut ops, updates, removals, cleared, None)
+            .await
+        {
+            Ok(budget) => budget,
+            Err(e) => {
+                self.restage(entries);
+                return Err(e);
+            }
+        };
+
+        if let Err(e) = self.inner.commit(ops).await {
+            self.restage(entries);
+            return Err(e);
+        }
+        self.apply_budget(&budget);
+        Ok(())
+    }
+
+    fn restage(&self, mut entries: Vec<Pending>) {
+        if let Ok(mut guard) = self.staged.lock() {
+            entries.append(&mut guard);
+            *guard = entries;
+        }
+    }
+
+    /// Drop everything staged. Used by `close`, after a flush has had its go.
+    pub(crate) fn discard_staged(&self) {
+        if let Ok(mut guard) = self.staged.lock() {
+            guard.clear();
+        }
+    }
+}
+
+/// Keys written with their payload sizes, keys removed, and whether the batch
+/// began with a clear.
+type Accounting = (Vec<(Vec<u8>, u64)>, Vec<Vec<u8>>, bool);
+
+/// What a batch of staged writes does to the byte budget, collapsed.
+fn accounting(entries: &[Pending]) -> Accounting {
+    let mut updates: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut removals: Vec<Vec<u8>> = Vec::new();
+    let mut cleared = false;
+    for entry in entries {
+        match entry {
+            Pending::Put { key, payload } => {
+                updates.retain(|(k, _)| k != key);
+                removals.retain(|k| k != key);
+                updates.push((key.clone(), payload.len() as u64));
+            }
+            Pending::Delete { key } => {
+                updates.retain(|(k, _)| k != key);
+                removals.push(key.clone());
+            }
+            Pending::Clear => {
+                updates.clear();
+                removals.clear();
+                cleared = true;
+            }
+        }
+    }
+    (updates, removals, cleared)
+}
+
+/// Build the LRU state a locker opens with, or `None` where it has no budget.
+pub(crate) async fn open_lru(inner: &Inner, index: &BTreeSet<Vec<u8>>) -> Result<Option<LruState>> {
+    let Policy::Evictable { max_bytes } = inner.config.policy else {
+        return Ok(None);
+    };
+    let mut state = lru::load(inner.backend.as_ref(), inner.id, max_bytes).await?;
+    // Reconcile with what storage actually holds. A locker first written as
+    // `Precious` and reopened as `Evictable` has keys with no accounting, and
+    // a crash between two commits could leave accounting with no key.
+    state.retain_keys(|k| index.contains(k));
+    for key in index {
+        state.adopt(key.clone());
+    }
+    Ok(Some(state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_batch_of_one_is_not_deferral() {
+        // Both degenerate settings must read as `Immediate` rather than
+        // staging a write nobody will ever flush.
+        for after in [0usize, 1] {
+            let config = super::super::policy::LockerConfig::default()
+                .with_commit(Commit::Deferred { after });
+            assert!(matches!(config.commit, Commit::Deferred { .. }));
+            assert_eq!(
+                match config.commit {
+                    Commit::Deferred { after } if after <= 1 => None,
+                    Commit::Deferred { after } => Some(after),
+                    Commit::Immediate => None,
+                },
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn accounting_collapses_a_batch() {
+        let entries = vec![
+            Pending::Put {
+                key: b"a".to_vec(),
+                payload: vec![0; 10],
+            },
+            Pending::Put {
+                key: b"a".to_vec(),
+                payload: vec![0; 20],
+            },
+            Pending::Delete { key: b"b".to_vec() },
+        ];
+        let (updates, removals, cleared) = accounting(&entries);
+        assert_eq!(updates, vec![(b"a".to_vec(), 20)]);
+        assert_eq!(removals, vec![b"b".to_vec()]);
+        assert!(!cleared);
+    }
+
+    #[test]
+    fn a_clear_wipes_the_batch_before_it() {
+        let entries = vec![
+            Pending::Put {
+                key: b"a".to_vec(),
+                payload: vec![0; 10],
+            },
+            Pending::Clear,
+            Pending::Put {
+                key: b"c".to_vec(),
+                payload: vec![0; 5],
+            },
+        ];
+        let (updates, removals, cleared) = accounting(&entries);
+        assert!(cleared);
+        assert!(removals.is_empty());
+        assert_eq!(updates, vec![(b"c".to_vec(), 5)]);
+    }
+}

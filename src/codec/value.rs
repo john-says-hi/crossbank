@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 pub fn encode<T: Serialize>(value: &T, chain: &FilterChain) -> Result<Vec<u8>> {
     let payload = postcard::to_allocvec(value)
         .map_err(|e| Error::Filter(format!("postcard serialisation failed: {e}")))?;
-    chain.seal(&payload)
+    chain.seal(payload)
 }
 
 /// Unwrap and deserialise a stored value.

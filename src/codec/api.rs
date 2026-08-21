@@ -43,6 +43,11 @@ pub const VERSION: u8 = 1;
 /// Bytes of fixed header preceding the payload.
 pub const HEADER_LEN: usize = 6;
 
+/// The fixed header for `chain_id`, as bytes.
+const fn header(chain_id: u8) -> [u8; HEADER_LEN] {
+    [MAGIC[0], MAGIC[1], MAGIC[2], MAGIC[3], VERSION, chain_id]
+}
+
 /// Refuse to allocate more than this when decoding, so a corrupt length field
 /// cannot be turned into an out-of-memory abort.
 pub const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
@@ -61,6 +66,25 @@ pub trait Filter: MaybeSend + MaybeSync + 'static {
 
     /// Applied on the way back. Must invert [`Filter::forward`] exactly.
     fn reverse(&self, input: &[u8]) -> Result<Vec<u8>>;
+
+    /// [`Filter::forward`], handed a buffer it may consume.
+    ///
+    /// The chain owns its intermediate buffers, so it can pass them in rather
+    /// than lend them. A filter whose output is its input plus or minus a few
+    /// bytes — a checksum, a length prefix, padding — can then work in place
+    /// instead of allocating and copying a whole second buffer per value.
+    ///
+    /// The default forwards to the borrowing version, so implementing this is
+    /// optional and never changes behaviour, only allocation.
+    fn forward_owned(&self, input: Vec<u8>) -> Result<Vec<u8>> {
+        self.forward(&input)
+    }
+
+    /// [`Filter::reverse`], handed a buffer it may consume. See
+    /// [`Filter::forward_owned`].
+    fn reverse_owned(&self, input: Vec<u8>) -> Result<Vec<u8>> {
+        self.reverse(&input)
+    }
 }
 
 impl std::fmt::Debug for dyn Filter {
@@ -127,18 +151,31 @@ impl FilterChain {
     }
 
     /// Wrap `payload` for storage.
-    pub fn seal(&self, payload: &[u8]) -> Result<Vec<u8>> {
-        let mut body = payload.to_vec();
+    ///
+    /// Takes the payload **by value** so it can be handed down the chain
+    /// rather than copied into it. An empty chain — [`FilterChain::raw`], the
+    /// right choice for already-compressed or already-encrypted bytes — then
+    /// costs no payload copy at all, where it used to cost two: one to clone
+    /// the borrowed slice and one to append it to the output buffer.
+    pub fn seal(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
+        let mut body = payload;
         for filter in &self.filters {
-            body = filter.forward(&body)?;
+            body = filter.forward_owned(body)?;
         }
 
-        let mut out = Vec::with_capacity(HEADER_LEN + body.len());
-        out.extend_from_slice(&MAGIC);
-        out.push(VERSION);
-        out.push(self.id);
-        out.extend_from_slice(&body);
-        Ok(out)
+        // Prepended in place. Building a second buffer and copying the body
+        // into it would cost an allocation the size of the whole value on top
+        // of the same byte movement.
+        body.splice(0..0, header(self.id));
+        Ok(body)
+    }
+
+    /// [`FilterChain::seal`] for a caller that only has a borrow.
+    ///
+    /// Exactly one copy, made once at the boundary, which is the least a
+    /// borrowed payload can cost.
+    pub fn seal_slice(&self, payload: &[u8]) -> Result<Vec<u8>> {
+        self.seal(payload.to_vec())
     }
 
     /// Unwrap a stored value.
@@ -173,9 +210,11 @@ impl FilterChain {
             });
         }
 
+        // One copy out of the stored slice, then every filter after that
+        // works on a buffer it owns and may consume.
         let mut body = stored[HEADER_LEN..].to_vec();
         for filter in self.filters.iter().rev() {
-            body = filter.reverse(&body)?;
+            body = filter.reverse_owned(body)?;
         }
         Ok(body)
     }
@@ -222,10 +261,33 @@ mod tests {
         }
     }
 
+    /// Sealing an owned payload and sealing a borrowed one are the same
+    /// operation. `seal` prepends the header in place while `seal_slice`
+    /// copies first, so the two could drift byte for byte.
+    #[test]
+    fn seal_owned_and_seal_slice_produce_identical_bytes() {
+        for chain in [FilterChain::raw(), crate::codec::default_chain()] {
+            for len in [0usize, 1, 6, 7, 1000] {
+                let payload: Vec<u8> = (0..len).map(|i| (i * 17 % 253) as u8).collect();
+                assert_eq!(
+                    chain.seal(payload.clone()).unwrap(),
+                    chain.seal_slice(&payload).unwrap(),
+                    "{} disagreed at {len} bytes",
+                    chain.describe()
+                );
+                let sealed = chain.seal(payload.clone()).unwrap();
+                assert_eq!(&sealed[0..4], &MAGIC, "the header must survive splicing");
+                assert_eq!(sealed[4], VERSION);
+                assert_eq!(sealed[5], chain.id());
+                assert_eq!(chain.open(&sealed).unwrap(), payload);
+            }
+        }
+    }
+
     #[test]
     fn raw_chain_round_trips() {
         let c = FilterChain::raw();
-        let sealed = c.seal(b"hello").unwrap();
+        let sealed = c.seal_slice(b"hello").unwrap();
         assert_eq!(&sealed[0..4], &MAGIC);
         assert_eq!(c.open(&sealed).unwrap(), b"hello");
     }
@@ -234,7 +296,7 @@ mod tests {
     fn an_empty_payload_round_trips() {
         // Must stay distinguishable from a missing value everywhere it travels.
         let c = FilterChain::raw();
-        let sealed = c.seal(b"").unwrap();
+        let sealed = c.seal_slice(b"").unwrap();
         assert_eq!(sealed.len(), HEADER_LEN);
         assert_eq!(c.open(&sealed).unwrap(), b"");
     }
@@ -243,7 +305,7 @@ mod tests {
     fn filters_reverse_in_the_opposite_order() {
         // Tag(1) then Tag(2) writes ...0102; reversing must strip 2 first.
         let c = FilterChain::new(1, vec![Box::new(Tag(1)), Box::new(Tag(2))]);
-        let sealed = c.seal(b"x").unwrap();
+        let sealed = c.seal_slice(b"x").unwrap();
         assert_eq!(&sealed[HEADER_LEN..], &[b'x', 1, 2]);
         assert_eq!(c.open(&sealed).unwrap(), b"x");
     }
@@ -266,7 +328,7 @@ mod tests {
     #[test]
     fn a_future_version_is_refused_by_version_not_misread() {
         let c = FilterChain::raw();
-        let mut sealed = c.seal(b"payload").unwrap();
+        let mut sealed = c.seal_slice(b"payload").unwrap();
         sealed[4] = VERSION + 1;
         assert!(matches!(
             c.open(&sealed),
@@ -281,7 +343,7 @@ mod tests {
         let writer = FilterChain::new(1, vec![Box::new(Xor(0xAA))]);
         let reader = FilterChain::new(2, vec![Box::new(Xor(0x55))]);
 
-        let sealed = writer.seal(b"secret").unwrap();
+        let sealed = writer.seal_slice(b"secret").unwrap();
         match reader.open(&sealed) {
             Err(Error::SchemaMismatch { .. }) => {}
             other => panic!("expected a schema mismatch, got {other:?}"),

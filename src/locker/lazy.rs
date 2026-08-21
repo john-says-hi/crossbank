@@ -1105,7 +1105,7 @@ mod tests {
         // An inlined value: the receiver has the bytes and can size it exactly
         // by opening them through its own filter chain.
         let payload = postcard::to_allocvec(&vec![9u8; 500]).expect("encode");
-        let sealed = l.inner.chain.seal(&payload).expect("seal");
+        let sealed = l.inner.chain.seal_slice(&payload).expect("seal");
         sink.apply(&Announcement {
             instance: 2,
             locker_id: id,
@@ -1557,9 +1557,17 @@ mod tests {
 
     #[test]
     fn opening_pages_past_a_single_scan_page() {
-        // SCAN_PAGE is 256; prove the paging loop in walk() actually continues
-        // rather than silently truncating the index.
+        // Prove the paging loop in walk() actually continues rather than
+        // silently truncating the index.
+        //
+        // The count is taken FROM the backend, never written as a literal. It
+        // was `600` against a hard-coded page of 256, and the moment a backend
+        // was allowed to advertise its own larger page this test quietly
+        // stopped crossing a page boundary at all — still green, testing
+        // nothing. That is trap 2 in miniature.
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let n = backend.scan_page_size() * 2 + 37;
+        assert!(n > backend.scan_page_size(), "the fixture must span pages");
         let chain = Arc::new(default_chain());
 
         let first: LazyLocker<String> = block_on(LazyLocker::open(
@@ -1571,8 +1579,8 @@ mod tests {
             Default::default(),
         ))
         .unwrap();
-        for i in 0..600 {
-            block_on(first.put(&format!("k{i:04}"), &"v".to_string())).unwrap();
+        for i in 0..n {
+            block_on(first.put(&format!("k{i:06}"), &"v".to_string())).unwrap();
         }
         drop(first);
 
@@ -1585,16 +1593,19 @@ mod tests {
             Default::default(),
         ))
         .unwrap();
-        assert_eq!(second.len(), 600);
+        assert_eq!(second.len(), n);
     }
 
     #[test]
     fn a_range_spanning_many_pages_returns_every_entry() {
         let l = locker();
-        for i in 0..600 {
-            block_on(l.put(&format!("k{i:04}"), &"v".to_string())).unwrap();
+        // Sized from the backend, for the reason spelled out in
+        // `opening_pages_past_a_single_scan_page`.
+        let n = l.inner.backend.scan_page_size() * 2 + 37;
+        for i in 0..n {
+            block_on(l.put(&format!("k{i:06}"), &"v".to_string())).unwrap();
         }
-        assert_eq!(block_on(l.range(..)).unwrap().len(), 600);
+        assert_eq!(block_on(l.range(..)).unwrap().len(), n);
     }
 
     #[test]

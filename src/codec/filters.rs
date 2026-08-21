@@ -69,25 +69,95 @@ impl Filter for Crc32 {
     }
 
     fn reverse(&self, input: &[u8]) -> Result<Vec<u8>> {
-        if input.len() < 4 {
-            return Err(Error::Corrupt("value is too short to carry a CRC32".into()));
-        }
-        let split = input.len() - 4;
-        let (body, tail) = input.split_at(split);
-        let expected = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]);
-        let actual = crc32fast::hash(body);
-        if expected != actual {
-            return Err(Error::Corrupt(format!(
-                "CRC32 mismatch: stored {expected:#010x}, computed {actual:#010x}"
-            )));
-        }
+        let body = verify(input)?;
         Ok(body.to_vec())
     }
+
+    /// Four bytes off the end, in place. No allocation and no copy — which for
+    /// a checksum over a large value is the difference between free and a
+    /// second copy of the whole thing.
+    fn forward_owned(&self, mut input: Vec<u8>) -> Result<Vec<u8>> {
+        let sum = crc32fast::hash(&input);
+        input.extend_from_slice(&sum.to_le_bytes());
+        Ok(input)
+    }
+
+    fn reverse_owned(&self, mut input: Vec<u8>) -> Result<Vec<u8>> {
+        let kept = verify(&input)?.len();
+        input.truncate(kept);
+        Ok(input)
+    }
+}
+
+/// Check the trailing CRC32 and hand back the body it covers.
+///
+/// Shared by both directions so the borrowing and owning paths can never
+/// disagree about what counts as valid.
+fn verify(input: &[u8]) -> Result<&[u8]> {
+    if input.len() < 4 {
+        return Err(Error::Corrupt("value is too short to carry a CRC32".into()));
+    }
+    let split = input.len() - 4;
+    let (body, tail) = input.split_at(split);
+    let expected = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]);
+    let actual = crc32fast::hash(body);
+    if expected != actual {
+        return Err(Error::Corrupt(format!(
+            "CRC32 mismatch: stored {expected:#010x}, computed {actual:#010x}"
+        )));
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The owning and borrowing halves of a filter must be the same function.
+    ///
+    /// `Crc32` overrides both owned methods to work in place — appending to
+    /// and truncating the caller's buffer instead of allocating a second one.
+    /// That is an optimisation with its own arithmetic, and arithmetic that
+    /// disagrees with `reverse` by one byte would corrupt every value while
+    /// still round-tripping through itself perfectly happily. So the two paths
+    /// are compared against each other rather than each against itself.
+    #[test]
+    fn crc32_owned_and_borrowed_paths_agree() {
+        for len in [0usize, 1, 4, 5, 63, 64, 65, 4096] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+
+            let borrowed = Crc32.forward(&payload).unwrap();
+            let owned = Crc32.forward_owned(payload.clone()).unwrap();
+            assert_eq!(borrowed, owned, "forward disagreed at {len} bytes");
+            assert_eq!(
+                owned.len(),
+                len + 4,
+                "a CRC32 adds exactly four bytes, at {len} bytes"
+            );
+
+            let back_borrowed = Crc32.reverse(&owned).unwrap();
+            let back_owned = Crc32.reverse_owned(owned).unwrap();
+            assert_eq!(back_borrowed, payload, "reverse lost bytes at {len}");
+            assert_eq!(back_owned, payload, "reverse_owned lost bytes at {len}");
+        }
+    }
+
+    /// A corrupt value must be refused on the owning path too.
+    ///
+    /// Truncating in place is the easy way to accidentally "repair" a value:
+    /// chop the checksum off and hand back a body nobody verified.
+    #[test]
+    fn crc32_reverse_owned_still_refuses_a_bad_checksum() {
+        let mut sealed = Crc32.forward(b"payload").unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xFF;
+
+        assert!(Crc32.reverse(&sealed).is_err());
+        assert!(
+            Crc32.reverse_owned(sealed).is_err(),
+            "the in-place path must verify before it truncates"
+        );
+    }
 
     #[test]
     fn lz4_round_trips_compressible_data() {

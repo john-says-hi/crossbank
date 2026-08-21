@@ -11,7 +11,7 @@ pub mod redb;
 
 pub use api::{
     BFut, Backend, CommitOptions, Durability, KeyRange, MaybeSend, MaybeSync, Op, ScanPage,
-    ScanRequest, Table, Usage,
+    ScanRequest, Table, Usage, DEFAULT_SCAN_PAGE,
 };
 #[cfg(target_arch = "wasm32")]
 pub use indexeddb::IndexedDbBackend;

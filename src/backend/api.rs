@@ -231,6 +231,11 @@ impl CommitOptions {
     }
 }
 
+/// Records a scan page holds when the backend has no opinion.
+///
+/// The conservative browser-shaped number. See [`Backend::scan_page_size`].
+pub const DEFAULT_SCAN_PAGE: usize = 256;
+
 /// A bounded scan. Bounded because an IndexedDB cursor cannot outlive its
 /// transaction, so the caller resumes rather than holding one open.
 #[derive(Debug, Clone)]
@@ -273,6 +278,17 @@ pub trait Backend: MaybeSend + MaybeSync + 'static {
     fn get_many<'a>(&'a self, table: Table, keys: Vec<Vec<u8>>) -> BFut<'a, Vec<Option<Vec<u8>>>>;
 
     fn scan(&self, request: ScanRequest) -> BFut<'_, ScanPage>;
+
+    /// How many records this backend would like a scan page to hold.
+    ///
+    /// A page is a round trip, so bigger is cheaper — but on IndexedDB a page
+    /// is also a whole transaction's worth of results materialised into JS
+    /// values and copied across the wasm boundary, and a cursor there cannot
+    /// outlive its transaction anyway. The default is the conservative
+    /// browser-shaped number; a backend that pages cheaply overrides it.
+    fn scan_page_size(&self) -> usize {
+        DEFAULT_SCAN_PAGE
+    }
 
     /// Apply every op, or none of them, durably.
     fn commit(&self, ops: Vec<Op>) -> BFut<'_, ()>;

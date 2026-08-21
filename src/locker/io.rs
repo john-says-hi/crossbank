@@ -79,7 +79,7 @@ impl Writer {
         let op = Op::Put {
             table: Table::Chunks,
             key: chunk_key(self.value_id, self.seq),
-            value: self.inner.chain.seal(piece)?,
+            value: self.inner.chain.seal_slice(piece)?,
         };
         self.inner.commit(vec![op]).await?;
         self.seq += 1;

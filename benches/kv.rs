@@ -276,6 +276,38 @@ fn reopen(c: &mut Criterion) {
     group.finish();
 }
 
+/// Opening a lazy locker over a locker that already holds a lot of keys.
+///
+/// The scan-page path: a keys-only walk of the whole locker, paged. This is
+/// what an application start actually pays for a big candle cache, and it is
+/// the only workload that can tell one page size from another.
+fn index_open(c: &mut Criterion) {
+    let mut group = c.benchmark_group("index_open");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(3));
+    group.throughput(Throughput::Elements(BULK_N as u64));
+
+    group.bench_function("redb", |b| {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bank.redb");
+        {
+            let bank = wait(Bank::open(BankConfig::at(&path))).unwrap();
+            let locker = wait(
+                bank.lazy_locker_with::<Vec<u8>>("bulk", cfg(Durability::Eventual)),
+            )
+            .unwrap();
+            fill_lazy(&locker, BULK_N, BULK_BYTES);
+            wait(locker.flush()).unwrap();
+        }
+        b.iter(|| {
+            let bank = wait(Bank::open(BankConfig::at(&path))).unwrap();
+            let locker = wait(bank.lazy_locker::<Vec<u8>>("bulk")).unwrap();
+            criterion::black_box(locker.len());
+        });
+    });
+    group.finish();
+}
+
 fn envelope_tax(c: &mut Criterion) {
     let mut group = c.benchmark_group("envelope_tax");
     group.throughput(Throughput::Bytes((SETTINGS_N * SETTINGS_BYTES) as u64));
@@ -439,6 +471,7 @@ criterion_group!(
     prefix_scan,
     txn_batch,
     reopen,
+    index_open,
     envelope_tax,
     backend_put,
     chunk_sweep,

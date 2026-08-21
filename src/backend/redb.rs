@@ -347,6 +347,13 @@ impl Backend for RedbBackend {
         })
     }
 
+    /// Larger than the default. There is no transaction to outlive and no
+    /// JS boundary to cross here — a B-tree range scan in a read transaction —
+    /// so a page is nearly free and paging is nearly pure overhead.
+    fn scan_page_size(&self) -> usize {
+        1024
+    }
+
     fn scan(&self, request: ScanRequest) -> BFut<'_, ScanPage> {
         Box::pin(async move { self.scan_page(&request) })
     }

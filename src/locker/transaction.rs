@@ -258,7 +258,7 @@ pub(crate) async fn ops_for_items(
                     );
                 }
                 TxMode::Eager => {
-                    let sealed = inner.chain.seal(payload)?;
+                    let sealed = inner.chain.seal_slice(payload)?;
                     if sealed.len() > inner.config.max_inline {
                         return Err(Error::ValueTooLarge {
                             bytes: sealed.len(),

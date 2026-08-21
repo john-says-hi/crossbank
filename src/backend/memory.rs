@@ -160,6 +160,13 @@ impl Backend for MemoryBackend {
         })
     }
 
+    /// Larger than the default. There is no transaction to outlive and no
+    /// JS boundary to cross here — a range over a BTreeMap already in memory —
+    /// so a page is nearly free and paging is nearly pure overhead.
+    fn scan_page_size(&self) -> usize {
+        1024
+    }
+
     fn scan(&self, request: ScanRequest) -> BFut<'_, ScanPage> {
         Box::pin(async move { self.with_tables(|t| scan_tree(t.get(request.table), &request)) })
     }

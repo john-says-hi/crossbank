@@ -24,9 +24,12 @@ use super::policy::LockerConfig;
 use crate::coherence::Coherence;
 use crate::watch::{Event, Watchers};
 
-/// How many records a single scan page pulls. Bounded because an IndexedDB
-/// cursor cannot outlive its transaction, so every scan pages regardless.
-pub(crate) const SCAN_PAGE: usize = 256;
+/// How many records a single scan page pulls when the backend has no opinion.
+///
+/// Bounded because an IndexedDB cursor cannot outlive its transaction, so
+/// every scan pages regardless. Backends that page more cheaply raise it —
+/// see [`crate::backend::api::Backend::scan_page_size`].
+pub(crate) use crate::backend::api::DEFAULT_SCAN_PAGE as SCAN_PAGE;
 
 /// What every locker a bank opens shares with it.
 ///
@@ -352,11 +355,14 @@ impl Inner {
             }
         }
 
-        if payload.len() <= self.config.chunk_size && flags == FLAG_POSTCARD {
+        if self.stores_inline(payload.len(), flags) {
+            let encoded = self.encode_key(key);
             ops.push(Op::Put {
                 table: Table::Records,
-                key: self.encode_key(key),
-                value: self.chain.seal(&payload)?,
+                key: encoded,
+                // Moved, not borrowed: this branch is the end of the payload's
+                // life, so the chain can consume it instead of copying it.
+                value: self.chain.seal(payload)?,
             });
             return Ok(ops);
         }
@@ -370,7 +376,7 @@ impl Inner {
             ops.push(Op::Put {
                 table: Table::Chunks,
                 key: chunk_key(value_id, seq),
-                value: self.chain.seal(piece)?,
+                value: self.chain.seal_slice(piece)?,
             });
             seq = seq
                 .checked_add(1)
@@ -477,17 +483,22 @@ impl Inner {
                     table: Table::Records,
                     range: range.clone(),
                     reverse,
-                    limit: SCAN_PAGE,
+                    limit: self.backend.scan_page_size(),
                     want_values,
                 })
                 .await?;
 
-            for (encoded, value) in &page.items {
-                let user_key = key::decode_bytes(self.id, encoded)?;
-                visit(user_key.to_vec(), value.clone())?;
+            // The page is ours; take its values rather than cloning every
+            // one of them out from under a borrow. On a keys-only walk the
+            // values are `None` anyway, but a value walk over a large locker
+            // was copying the whole locker an extra time.
+            let resume = page.resume;
+            for (encoded, value) in page.items {
+                let user_key = key::decode_bytes(self.id, &encoded)?;
+                visit(user_key.to_vec(), value)?;
             }
 
-            match page.resume {
+            match resume {
                 // Excluding the last key returned works identically in both
                 // directions, which is what keeps paging free of an
                 // off-by-one that would differ per backend.

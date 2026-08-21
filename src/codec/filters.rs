@@ -10,8 +10,8 @@ use crate::error::{Error, Result};
 /// LZ4 compression, length-prefixed.
 ///
 /// Whether this earns its CPU is workload-dependent — densely packed `f64`
-/// series compress close to 1.0x — which is why the chain is configurable per
-/// locker rather than mandatory.
+/// series compress close to 1.0x — which is why the filter chain is
+/// configurable per bank rather than mandatory.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Lz4;
 

@@ -1,6 +1,5 @@
 /target
 **/*.rs.bk
-Cargo.lock
 
 # Locally pinned browser drivers (version-matched to the dev machine's browser).
 # CI installs its own matched pair instead.

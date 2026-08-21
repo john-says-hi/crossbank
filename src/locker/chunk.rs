@@ -53,9 +53,9 @@ impl ChunkPointer {
         }
         Ok(Self {
             flags: raw[5],
-            value_id: u64::from_be_bytes(raw[6..14].try_into().unwrap()),
-            n_chunks: u32::from_be_bytes(raw[14..18].try_into().unwrap()),
-            total_len: u64::from_be_bytes(raw[18..26].try_into().unwrap()),
+            value_id: u64::from_be_bytes(raw[6..14].try_into().expect("length checked above")),
+            n_chunks: u32::from_be_bytes(raw[14..18].try_into().expect("length checked above")),
+            total_len: u64::from_be_bytes(raw[18..26].try_into().expect("length checked above")),
         })
     }
 }

@@ -315,14 +315,24 @@ impl Backend for IndexedDbBackend {
                 Ok(promise) => wasm_bindgen_futures::JsFuture::from(promise).await.ok(),
                 Err(_) => None,
             };
-            let estimate =
-                match estimate.and_then(|v| v.dyn_into::<web_sys::StorageEstimate>().ok()) {
-                    Some(estimate) => estimate,
-                    None => return Ok(None),
-                };
+            // Read the fields off the resolved object with `Reflect` rather
+            // than casting to `web_sys::StorageEstimate`. That type is a
+            // WebIDL *dictionary*: it has no JS constructor, so the
+            // `instanceof` check `dyn_into` performs can never succeed and
+            // the cast fails on every browser — which made this method report
+            // `None` everywhere until a browser test caught it.
+            let Some(estimate) = estimate else {
+                return Ok(None);
+            };
+            let number = |field: &str| -> Option<f64> {
+                js_sys::Reflect::get(&estimate, &JsValue::from_str(field))
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .filter(|n| n.is_finite())
+            };
 
-            let used = estimate.get_usage().unwrap_or(0.0).max(0.0) as u64;
-            let available = estimate.get_quota().map(|q| q.max(0.0) as u64);
+            let used = number("usage").unwrap_or(0.0).max(0.0) as u64;
+            let available = number("quota").map(|q| q.max(0.0) as u64);
 
             let persisted = match storage.persisted() {
                 Ok(promise) => wasm_bindgen_futures::JsFuture::from(promise)

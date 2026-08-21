@@ -74,7 +74,7 @@ pub trait Harness {
 }
 
 /// Number of cases in the spec. The arity guard compares against this.
-pub const CASE_COUNT: usize = 38;
+pub const CASE_COUNT: usize = 39;
 
 /// Run `block_on` without pulling in an async runtime.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -127,6 +127,7 @@ macro_rules! __for_each_case {
         $crate::__emit!(a_corrupt_chunk_pointer_does_not_block_delete, $make);
         $crate::__emit!(a_name_is_open_until_every_handle_closes, $make);
         $crate::__emit!(a_degenerate_range_is_empty_not_a_panic, $make);
+        $crate::__emit!(usage_is_reported_where_declared, $make);
     };
 }
 
@@ -254,5 +255,6 @@ macro_rules! __count_cases {
         $counter!(a_corrupt_chunk_pointer_does_not_block_delete, ());
         $counter!(a_name_is_open_until_every_handle_closes, ());
         $counter!(a_degenerate_range_is_empty_not_a_panic, ());
+        $counter!(usage_is_reported_where_declared, ());
     };
 }

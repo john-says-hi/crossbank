@@ -1080,3 +1080,57 @@ pub async fn a_degenerate_range_is_empty_not_a_panic<H: Harness>(h: &H) -> Resul
     assert_eq!(eager.range("a".."c").len(), 2);
     Ok(())
 }
+
+/// Usage is reported exactly where the harness declares it is.
+///
+/// The bound is deliberately loose. On the web `navigator.storage.estimate()`
+/// is origin-wide and browsers coarsen it on purpose; on `redb` the figure is
+/// a file size that includes free pages. So the spec pins the shape of the
+/// answer — reported or honestly absent — and that writing real bytes leaves a
+/// non-zero figure behind, not an exact byte count nobody can honour.
+pub async fn usage_is_reported_where_declared<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker::<Vec<u8>>("bulk").await?;
+
+    // 64 KiB of incompressible-enough bytes, so a filter chain with LZ4 in it
+    // cannot shrink the write down to nothing.
+    let payload: Vec<u8> = (0..65_536u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    locker.put("blob", &payload).await?;
+
+    let usage = bank.usage().await?;
+    if h.caps().reports_usage {
+        let usage = match usage {
+            Some(u) => u,
+            None => panic!("a backend declaring reports_usage must report usage"),
+        };
+        assert!(
+            usage.used > 0,
+            "after writing 64 KiB a reporting backend must show a non-zero figure"
+        );
+        if let Some(available) = usage.available {
+            assert!(
+                available > 0,
+                "a quota, when reported at all, must leave room for something"
+            );
+        }
+    } else {
+        assert!(
+            usage.is_none(),
+            "a backend that does not report usage must say so rather than guess"
+        );
+    }
+
+    // A read, never a prompt: safe to call on any path, on every platform.
+    let persisted = bank.is_persisted().await?;
+    #[cfg(not(target_arch = "wasm32"))]
+    assert!(persisted, "nothing evicts a native file behind our back");
+    #[cfg(target_arch = "wasm32")]
+    let _ = persisted;
+
+    // A closed bank answers Closed rather than reaching for the platform.
+    bank.close().await?;
+    assert!(matches!(bank.usage().await, Err(Error::Closed)));
+    Ok(())
+}

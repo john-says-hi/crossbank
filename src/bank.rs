@@ -168,6 +168,73 @@ impl Bank {
         }
     }
 
+    /// What the platform says this bank's storage is costing.
+    ///
+    /// `None` where the platform does not report it. Reporting a fabricated
+    /// number would be worse than reporting nothing.
+    ///
+    /// The figure is **not** comparable across backends, and that is
+    /// deliberate rather than an oversight:
+    ///
+    /// * On the web it is `navigator.storage.estimate()`, which is
+    ///   **origin-wide** — every IndexedDB database, Cache Storage entry and
+    ///   service worker on the origin, not just this bank. It is also
+    ///   deliberately coarsened by browsers to frustrate fingerprinting.
+    /// * On `redb` it is the size of the bank file, which includes free pages
+    ///   the database has not returned to the filesystem.
+    /// * In memory it is the sum of the key and value lengths held.
+    ///
+    /// For a number crossbank actually owns and can attribute to one locker,
+    /// use [`Bank::locker_bytes`] or
+    /// [`crate::LazyLocker::budget_used`].
+    pub async fn usage(&self) -> Result<Option<crate::backend::Usage>> {
+        self.ensure_open()?;
+        self.backend.usage().await
+    }
+
+    /// Whether the platform has granted this origin persistent storage.
+    ///
+    /// Always `true` natively — nothing evicts a file behind the
+    /// application's back. On the web this is `navigator.storage.persisted()`,
+    /// a **read**: unlike [`Bank::persist`] it never prompts and never
+    /// changes anything, so it is safe on a startup path.
+    ///
+    /// `false` on the web is not a fault. It means the browser may reclaim
+    /// this origin's storage under pressure — and, on Safari, after seven days
+    /// without user interaction regardless of pressure. See the "Web caveats"
+    /// section of the README.
+    pub async fn is_persisted(&self) -> Result<bool> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.ensure_open()?;
+            Ok(true)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.ensure_open()?;
+            let Some(window) = web_sys::window() else {
+                return Ok(false);
+            };
+            match window.navigator().storage().persisted() {
+                Ok(promise) => {
+                    let value = wasm_bindgen_futures::JsFuture::from(promise)
+                        .await
+                        .map_err(|e| Error::backend(format!("{e:?}")))?;
+                    Ok(value.as_bool().unwrap_or(false))
+                }
+                Err(_) => Ok(false),
+            }
+        }
+    }
+
+    /// Refuse an operation on a closed bank.
+    fn ensure_open(&self) -> Result<()> {
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
+        Ok(())
+    }
+
     /// Open a bank at the location named in `config`.
     ///
     /// The location is always explicit. `Location::Path` is native-only;

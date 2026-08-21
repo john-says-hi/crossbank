@@ -18,9 +18,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crossbank::backend::{
-    BFut, Backend, MemoryBackend, Op, ScanPage, ScanRequest, Table, Usage,
-};
+use crossbank::backend::{BFut, Backend, MemoryBackend, Op, ScanPage, ScanRequest, Table, Usage};
 use crossbank::{Bank, LockerConfig, Result};
 
 /// Suspends exactly once, so two futures joined over it take turns.

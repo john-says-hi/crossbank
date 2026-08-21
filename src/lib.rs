@@ -8,10 +8,19 @@
 //!
 //! # Status
 //!
-//! Pre-alpha. M0–M4 are complete: data persists natively (`redb`) and in
-//! real browsers (IndexedDB), and large lazy values are chunked with
-//! streaming [`Writer`]/[`Reader`] access. The public API is not yet stable
-//! and the crate is not published.
+//! Pre-alpha. M0–M5 are complete: data persists natively (`redb`) and in
+//! real browsers (IndexedDB), large lazy values are chunked with streaming
+//! [`Writer`]/[`Reader`] access, and storage pressure is answered by
+//! [`Bank::persist`] / [`Bank::is_persisted`] / [`Bank::usage`] plus a
+//! byte-budget LRU on [`Policy::Evictable`] lockers. Two facilities are
+//! opt-in and never chosen for you: cross-tab coherence
+//! ([`BankConfig::with_coherence`], web only) and write coalescing
+//! ([`Commit::Deferred`], whose flush you own — crossbank spawns nothing).
+//! The public API is not yet stable and the crate is not published.
+//!
+//! Web storage has rules a filesystem does not; the README's "Web caveats"
+//! section covers persistence, Safari's seven-day eviction, and what
+//! coherence changes about an eager `get()`.
 //!
 //! Keys are **bytes**. Every `&str` method has a `_by` twin taking `&[u8]`
 //! ([`Locker::get_by`], [`Locker::put_by`], [`LazyLocker::range_by`], …), a

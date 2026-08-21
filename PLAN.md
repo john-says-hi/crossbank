@@ -1,12 +1,12 @@
 # crossbank — build plan
 
-**Status: M4 complete.** 192 tests green natively — the full conformance suite against
+**Status: M5 complete.** 286 tests green natively — the full conformance suite against
 **both** the memory and `redb` backends, crash-and-reopen tests that kill a real process, and
-a peak-RSS test that streams 8 MiB through 64 KiB chunks. The same 22-case suite passes
-against **IndexedDB** in Chrome and Firefox on both wasm lanes (plain and atomics), including
-the four chunking cases. **Data persists on desktop, mobile, and the web, and large lazy
-values no longer have to fit in RAM.** M5 (quota, eviction, coherence) is next; `persist()`
-lands early as its first piece.
+a peak-RSS test that streams 8 MiB through 64 KiB chunks. The same 43-case suite passes
+against **IndexedDB** in Chrome and Firefox on both wasm lanes (plain and atomics), alongside
+a browser-only cross-tab coherence test. **Data persists on desktop, mobile, and the web,
+large lazy values no longer have to fit in RAM, and storage pressure now has an answer.**
+M6 (consumer readiness) is next.
 
 > Resuming this project? Start with **[RESUME_HERE.md](RESUME_HERE.md)** — purpose, working
 > agreements, current state, and the known traps. This file is the technical plan.
@@ -312,14 +312,49 @@ growth stays far below the value size. Four new conformance cases run on every b
 were negative-controlled (a broken `abort()` went red in Firefox before being restored).
 Eager lockers still refuse oversized values.
 
-**M5 — Quota, eviction, coherence.** `persist()` ✅ *landed early* — `Bank::persist()` asks
-`navigator.storage.persist()` on wasm and returns whether the origin is persistent; native
-returns `Ok(true)`; never called on open. Firefox shows a permission prompt and the future
-waits on the user; Chromium decides silently — so it must stay off the startup path. Remaining:
-quota API,
-byte-budget LRU on a logical counter, BroadcastChannel coherence carrying small values
-inline, and an opt-in write-coalescing policy for eager lockers (see Performance → Hive CE). Native coherence is in-process only — redb takes an exclusive file lock, so a second
-process cannot open the database at all.
+**M5 — Quota, eviction, coherence. ✅ COMPLETE.** Four pieces landed, each with its own
+conformance case, each negative-controlled.
+
+*Persistence and quota.* `Bank::persist()` asks `navigator.storage.persist()` on wasm and
+returns whether the origin is persistent; native returns `Ok(true)`; never called on open.
+Firefox shows a permission prompt and the future waits on the user; Chromium decides
+silently — so it must stay off the startup path. `Bank::is_persisted()` is the read-only
+twin, safe anywhere. `Bank::usage()` wraps `Backend::usage`; the figure is not comparable
+across backends and says so (origin-wide and deliberately coarsened on the web, file size on
+`redb`). Fixing the IndexedDB half found a real bug: it cast the resolved estimate to
+`web_sys::StorageEstimate`, a WebIDL dictionary with no JS constructor, so `dyn_into`'s
+`instanceof` check could never succeed and `usage()` returned `None` on every browser.
+
+*Byte-budget LRU.* `Policy::Evictable { max_bytes }` on a **lazy** locker (an eager one still
+refuses the combination). One `meta` record per key,
+`lru::{locker_id}::{key} -> [tick u64][bytes u32]`, written in the same commit as the put it
+describes, so accounting can never disagree with the data. Ordering is a bank-wide logical
+tick — `std::time` panics at runtime on wasm32 — persisted as a high-water mark by every
+allocating commit. A `get` bumps the tick in RAM only and the bump rides along with the next
+write, capped at 64 per commit. Budgets count payload bytes, not the on-disk footprint, which
+compression and chunk framing make backend-dependent. `Event::Evicted`,
+`LazyLocker::budget_used` and `evict_to` are the surface.
+
+*Cross-tab coherence.* Opt-in `BankConfig::with_coherence`, one `BroadcastChannel` per bank
+named `crossbank::{db name}`. Each commit's news is derived from its op list, so every write
+path is covered by construction, and posted only after the commit lands; sealed values ride
+along up to 4 KiB. A receiving lazy locker updates its index; an eager locker decodes an
+inline value or drops its resident copy with the new `Event::Stale`. The callback is a plain
+`Closure`, never inside an IDB transaction, kept alive by the bank and dropped on `close()`.
+Own posts are ignored via a `Math.random` instance id. Native accepts the flag and does
+nothing — redb's exclusive file lock means there is no second process to stay in step with.
+
+*Write coalescing.* `Commit::Deferred { after }` on `LockerConfig`. Writes stage in RAM and
+commit in batches; an eager locker updates its resident value at stage time, a lazy locker
+its index plus a staged overlay, so a handle always sees its own writes. `flush`, `pending`,
+`pending_bytes` on both locker types, `Bank::flush_all` across all of them, and `close`
+(locker and bank) flushes first and still closes if the flush fails. **The consumer owns the
+flush** — crossbank spawns nothing — which is why it is never the default and why
+`examples/flush_on_pagehide.rs` exists.
+
+*Safari.* Its ITP deletes script-writable storage after seven days without user interaction.
+Nothing in code can answer that, so it is answered in prose: see README → Web caveats.
+Safari still has zero CI coverage.
 
 **M6 — Consumer readiness.** Docs, worked example, publish. Shrinks to prose because the
 proxy landed in M1.
@@ -474,11 +509,22 @@ a cost we have chosen to carry. None of them loses data.
   doc already says to close the bank first. On Unix the file stays alive until
   the last handle closes, so an open `Bank` keeps working against a file that
   no longer has a name, and its later commits go nowhere visible. Close first.
+- **A deferred write is announced when it is staged, not when it commits.**
+  That is when it becomes visible to its own handle, which is what a watcher
+  on that handle is asking about — but it does mean an `Event::Put` can
+  precede a commit that later fails. `Commit::Immediate`, the default, has no
+  such window.
+- **The eager size limit moves to flush time under `Commit::Deferred`.** A
+  `put` still seals the value to check it, but a batch is re-sealed as one
+  write-set, so a `ValueTooLarge` from a staged write surfaces from `flush`.
 - **The value-id counter persists its high-water mark per commit.** If two
   chunk allocations commit out of order, the stored `next_value_id` can land
   one lower than the highest id actually handed out. Within a process the RAM
   cursor covers it; only a reopen immediately after such an interleaving could
-  re-hand an id in use. Making the counter durable-monotonic is an M5 item.
+  re-hand an id in use. The M5 tick counter is written the same way and
+  carries the same caveat; making both durable-monotonic against out-of-order
+  commits needs a compare-and-set the `Backend` trait does not have, so it is
+  still open.
 - **A key written twice in one transaction is collapsed.** Only the last write
   per key is committed (and everything before a `clear` is dropped), so the
   eager size check applies to what actually lands rather than to every

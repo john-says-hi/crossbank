@@ -9,7 +9,7 @@ you rediscover them the hard way.
 - **Local checkout:** `~/Documents/crossbank`
 - **Owner:** John (`john-says-hi`)
 - **Started:** 2026-08-15 · **Last worked:** 2026-08-20
-- **State:** M0–M4 complete. **M5 (quota, eviction, coherence) is next**; `persist()` is its first piece.
+- **State:** M0–M5 complete. **M6 (consumer readiness: docs, worked example, publish) is next.**
 
 ---
 
@@ -162,13 +162,17 @@ and big values win, Hive's non-fsync puts win, `transact` is the answer for bulk
 
 **192 tests native. 22-case suite × 3 backends in browsers on both wasm lanes.**
 
+**M5 — complete.** Quota (`Bank::usage`, `Bank::is_persisted` beside the existing
+`persist()`), a byte-budget LRU for `Policy::Evictable` lazy lockers on a bank-wide logical
+tick, opt-in `BroadcastChannel` cross-tab coherence with `Event::Stale`, and opt-in
+`Commit::Deferred` write coalescing with `flush` / `Bank::flush_all`. Safari's ITP 7-day rule
+is answered in prose (README → Web caveats), because nothing in code can answer it.
+**286 tests native. 43-case suite × 3 backends in browsers, plus a browser-only coherence
+test.**
+
 ### Remaining milestones
 
-- **M5 — Quota, eviction, coherence.** ← *next*. `persist()` is done (explicit, never
-  automatic — consumers storing precious data on the web must call it and handle `false`).
-  Remaining: quota API, byte-budget LRU on a logical counter, BroadcastChannel cross-tab invalidation,
-  Safari ITP 7-day policy.
-- **M6 — Consumer readiness.** Docs, worked example, publish to crates.io.
+- **M6 — Consumer readiness.** ← *next*. Docs, worked example, publish to crates.io.
 
 ## 6. How to run everything
 
@@ -223,6 +227,26 @@ Every one of these was hit and paid for already. Do not rediscover them.
 9. **`std::time` compiles on wasm32 and panics at runtime.** LRU uses a logical counter.
 10. **`cargo nextest` does not run doctests.** They need their own step.
 11. **futures' `LocalPool` refuses a nested `block_on`.**
+12. **`dyn_into::<web_sys::StorageEstimate>()` can never succeed.** WebIDL
+    *dictionaries* have no JS constructor, so the `instanceof` check behind
+    `dyn_into` always fails — `usage()` silently returned `None` on every
+    browser until a real browser test caught it. Read dictionary fields with
+    `js_sys::Reflect::get`. The same applies to any other web-sys dictionary
+    type.
+13. **A `Closure` must be unregistered, not merely dropped.** `Bank::close`
+    clears `onmessage` *and* drops the closure. Dropping it while the channel
+    still points at it leaves the browser calling into freed memory.
+14. **LZ4 will defeat a lazy "incompressible" test payload.** A cheap
+    multiply-shift pattern compressed under the 4 KiB coherence inline limit,
+    so the "too large to carry" case passed for the wrong reason. Use a full
+    32-bit LCG.
+15. **Nothing flushes `Commit::Deferred` for you.** No timer, no task, no
+    destructor — `Drop` cannot await, and a closing tab would not run one. The
+    consumer flushes from `pagehide` / `visibilitychange:hidden` on the web and
+    from the app's stop hook natively.
+16. **Locker `close()` is async now.** It flushes first and closes even when
+    the flush fails, returning the flush error. A bare `locker.close();` is a
+    dropped future that does nothing.
 
 ## 8. Where the detail lives
 

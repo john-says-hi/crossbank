@@ -10,8 +10,9 @@ Cross-platform persistent key/value storage for Rust. One API on native and in t
 > IndexedDB backend all work and are covered by a shared conformance suite that runs
 > natively and in real browsers (Chrome and Firefox, plain and atomics). Data persists
 > on desktop, mobile, and the web. Large lazy values are chunked and can be streamed
-> through `Writer`/`Reader` with bounded memory; `Bank::persist()` requests durable
-> storage on the web. Quota/eviction (M5) is not written yet.
+> through `Writer`/`Reader` with bounded memory. M5 has landed too: `Bank::persist()` /
+> `is_persisted()` / `usage()`, a byte-budget LRU for containers you mark evictable,
+> opt-in cross-tab coherence over `BroadcastChannel`, and opt-in write coalescing.
 > Do not depend on this.
 
 ## Why
@@ -43,8 +44,51 @@ key/value store — its architecture and ergonomics, not its file format.
 - **Transactions** scoped to a container: commit or roll back as a unit.
 - **Watch streams** at container and key level.
 - **Pluggable encryption** via a `Cipher` trait. No crypto is bundled.
-- **Quota-aware.** Requests persistent storage, exposes usage, and can shed least-recently-used
-  entries from containers you mark disposable.
+- **Quota-aware.** Requests persistent storage, reports usage, and sheds least-recently-used
+  entries from containers you mark evictable, against a byte budget crossbank itself enforces.
+- **Cross-tab coherent, when asked.** Opt-in `BroadcastChannel` invalidation on the web; a
+  no-op natively, where `redb`'s exclusive lock means there is no second writer.
+- **Write coalescing, when asked.** `Commit::Deferred` batches writes; you own the flush.
+
+### Web caveats
+
+Browser storage is not a filesystem, and three of its rules will bite an application that
+assumes otherwise.
+
+**Ask for persistence, and handle "no".** By default an origin's IndexedDB data is
+*best-effort*: the browser may reclaim it under storage pressure without asking. Call
+`Bank::persist()` — it maps to `navigator.storage.persist()` — and check what comes back.
+Chromium decides silently from site-engagement heuristics; **Firefox shows the user a
+permission prompt and the future does not resolve until they answer**, so never call it on a
+startup path or behind a UI that blocks. `Bank::is_persisted()` is the read-only twin: it
+never prompts, so it is safe anywhere.
+
+**Safari deletes everything after 7 days.** Safari's Intelligent Tracking Prevention
+removes all script-writable storage — IndexedDB included — for a site the user has not
+*interacted with* in seven days. Installed home-screen web apps are exempt, and so is
+storage the user has granted persistence to, but ordinary tabs are not. crossbank cannot
+work around it, and neither can anything else. What follows from it:
+
+- treat web storage as a **cache with a seven-day floor**, not as the only copy of anything
+  a user would miss;
+- anything precious belongs on a server, or in an export the user holds;
+- Safari has **no CI coverage here** — `safaridriver` on a macOS runner is still a
+  follow-up — so its behaviour is documented rather than proven.
+
+**Cross-tab coherence is opt-in.** `BankConfig::with_coherence(true)` puts a bank on a
+`BroadcastChannel` so other tabs' writes update this tab's resident state. It is off by
+default because it changes what an eager `Locker::get()` can return: a value another tab
+wrote that is too large to carry in a message (over 4 KiB sealed) cannot be decoded without
+an await, and an infallible getter cannot await — so the resident copy is dropped, an
+`Event::Stale` is raised, and `get()` answers `None` for that key until the locker is
+reopened. Lazy lockers have no such limit. Natively the flag is accepted and does nothing:
+`redb` takes an exclusive file lock, so there is no second process to stay in step with.
+
+**Nothing flushes for you.** With `Commit::Deferred`, staged writes are lost unless the
+application calls `flush()` / `Bank::flush_all()` from `pagehide` and from
+`visibilitychange` when the document becomes hidden — **not** `beforeunload`, which mobile
+browsers frequently never fire. crossbank spawns nothing, so there is no timer or
+background task that will do it. See `examples/flush_on_pagehide.rs`.
 
 ### Backends
 

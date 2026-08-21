@@ -519,3 +519,125 @@ pub async fn close_is_idempotent<H: Harness>(h: &H) -> Result<()> {
     second.close().await?;
     Ok(())
 }
+
+/// Count every row in one of the fixed tables, paging to the end.
+///
+/// Reaches past the locker API on purpose: "the value is gone" is a weaker
+/// claim than "the chunk rows that held it are gone", and only the second one
+/// proves the delete does not leak storage.
+async fn count_rows(bank: &Bank, table: crossbank::backend::Table) -> Result<usize> {
+    use crossbank::backend::{KeyRange, ScanRequest};
+
+    let mut range = KeyRange::all();
+    let mut seen = 0usize;
+    loop {
+        let page = bank
+            .backend()
+            .scan(ScanRequest {
+                table,
+                range: range.clone(),
+                reverse: false,
+                limit: 64,
+                want_values: false,
+            })
+            .await?;
+        seen += page.items.len();
+        match page.resume {
+            Some(last) => range.start = std::ops::Bound::Excluded(last),
+            None => break,
+        }
+    }
+    Ok(seen)
+}
+
+/// Deleting a locker takes its records and its chunk payloads with it.
+pub async fn delete_locker_removes_records_and_chunks<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker_with::<V>("doomed", tiny_chunks()).await?;
+
+    locker.put("small", &v("inline")).await?;
+    locker.put("big", &"x".repeat(200)).await?;
+
+    assert!(
+        count_rows(&bank, crossbank::backend::Table::Chunks).await? > 0,
+        "the setup must actually have chunked something"
+    );
+    assert!(bank.locker_exists("doomed").await?);
+    assert!(bank.locker_bytes("doomed").await? > 200);
+
+    // An open handle would be left serving data that no longer exists.
+    assert!(matches!(
+        bank.delete_locker("doomed").await,
+        Err(Error::InvalidConfig(_))
+    ));
+
+    locker.close();
+    assert!(bank.delete_locker("doomed").await?);
+
+    assert_eq!(
+        count_rows(&bank, crossbank::backend::Table::Records).await?,
+        0
+    );
+    assert_eq!(
+        count_rows(&bank, crossbank::backend::Table::Chunks).await?,
+        0,
+        "every chunk the deleted locker pointed at must be gone too"
+    );
+    assert!(!bank.locker_exists("doomed").await?);
+    assert_eq!(bank.locker_bytes("doomed").await?, 0);
+    assert!(
+        !bank.delete_locker("doomed").await?,
+        "deleting a name that is not there is not an error"
+    );
+    Ok(())
+}
+
+/// A delete stops at the locker boundary, exactly as `clear` does.
+pub async fn delete_locker_leaves_other_lockers_intact<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let doomed = bank.lazy_locker_with::<V>("doomed", tiny_chunks()).await?;
+    let keeper = bank.lazy_locker_with::<V>("keeper", tiny_chunks()).await?;
+
+    doomed.put("k", &"x".repeat(200)).await?;
+    keeper.put("k", &"y".repeat(200)).await?;
+    keeper.put("inline", &v("kept")).await?;
+
+    doomed.close();
+    assert!(bank.delete_locker("doomed").await?);
+
+    assert_eq!(keeper.get("k").await?, Some("y".repeat(200)));
+    assert_eq!(keeper.get("inline").await?, Some(v("kept")));
+    assert!(bank.locker_exists("keeper").await?);
+    assert!(
+        bank.locker_names().await?.contains(&"keeper".to_string()),
+        "the surviving locker must still be registered"
+    );
+    assert!(!bank.locker_names().await?.contains(&"doomed".to_string()));
+    Ok(())
+}
+
+/// Ids are never recycled, so a stale record can never be read as a new
+/// locker's. Recreating a deleted name gets a fresh id.
+pub async fn a_deleted_locker_name_gets_a_fresh_id<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker::<V>("recycled").await?;
+    let first = bank.locker_id("recycled").await?;
+    locker.put("k", &v("old")).await?;
+    locker.close();
+
+    assert!(bank.delete_locker("recycled").await?);
+
+    let reborn = bank.lazy_locker::<V>("recycled").await?;
+    let second = bank.locker_id("recycled").await?;
+
+    assert_ne!(
+        first, second,
+        "a deleted locker's id must never be handed out again"
+    );
+    assert_eq!(
+        reborn.get("k").await?,
+        None,
+        "the recreated locker must start empty"
+    );
+    Ok(())
+}

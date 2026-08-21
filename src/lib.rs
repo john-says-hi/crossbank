@@ -46,7 +46,7 @@ pub use backend::IndexedDbBackend;
 #[cfg(not(target_arch = "wasm32"))]
 pub use backend::RedbBackend;
 pub use backend::{Backend, MemoryBackend};
-pub use bank::{Bank, BankConfig, Location};
+pub use bank::{delete_bank, Bank, BankConfig, Location};
 pub use codec::{Filter, FilterChain};
 pub use error::{Error, Result};
 pub use locker::{LazyLocker, Locker, LockerConfig, Policy, Reader, Transaction, Writer};

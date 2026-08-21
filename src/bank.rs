@@ -529,6 +529,161 @@ impl Bank {
         Ok(names)
     }
 
+    /// Build a throwaway `Inner` over an existing locker id.
+    ///
+    /// Only for bank-level maintenance that needs the record/chunk walk the
+    /// lockers already own. It has its own watchers, so nothing it does is
+    /// announced to a live locker's subscribers — deleting a locker out from
+    /// under an open handle is refused instead.
+    fn maintenance_inner(&self, id: LockerId, name: &str) -> Arc<Inner> {
+        Arc::new(Inner {
+            write_lock: futures::lock::Mutex::new(()),
+            backend: self.backend.clone(),
+            chain: self.chain.clone(),
+            id,
+            name: name.to_string(),
+            config: LockerConfig::default(),
+            watchers: Default::default(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Whether a locker has ever been registered under `name`.
+    ///
+    /// Registration, not content: a locker that was opened and never written
+    /// to still exists. Hive's `boxExists`.
+    pub async fn locker_exists(&self, name: &str) -> Result<bool> {
+        if self.cached(name).is_some() {
+            return Ok(true);
+        }
+        Ok(self
+            .backend
+            .get(Table::Meta, &locker_key(name))
+            .await?
+            .is_some())
+    }
+
+    /// Bytes stored for one locker: its records plus the chunks they point at.
+    ///
+    /// Measured by scanning, so the cost is proportional to the locker. It is
+    /// the size of the *stored* — sealed, and compressed if the chain
+    /// compresses — payloads, not of the values a caller put in, and it
+    /// excludes key bytes and whatever the backend spends on its own
+    /// bookkeeping. An unknown name is 0 rather than an error.
+    pub async fn locker_bytes(&self, name: &str) -> Result<u64> {
+        if !self.locker_exists(name).await? {
+            return Ok(0);
+        }
+        let id = self.locker_id(name).await?;
+        let inner = self.maintenance_inner(id, name);
+
+        let mut total: u64 = 0;
+        let mut chunked: Vec<u64> = Vec::new();
+        inner
+            .walk(
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded,
+                false,
+                true,
+                |_, value| {
+                    if let Some(raw) = value {
+                        total = total.saturating_add(raw.len() as u64);
+                        if crate::locker::chunk::is_pointer(&raw) {
+                            chunked.push(crate::locker::chunk::ChunkPointer::parse(&raw)?.value_id);
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+
+        for value_id in chunked {
+            total = total.saturating_add(self.chunk_bytes(value_id).await?);
+        }
+        Ok(total)
+    }
+
+    /// Sum the stored chunk payloads for one chunked value.
+    async fn chunk_bytes(&self, value_id: u64) -> Result<u64> {
+        let mut range = crate::locker::chunk::chunk_range(value_id);
+        let mut total: u64 = 0;
+        loop {
+            let page = self
+                .backend
+                .scan(ScanRequest {
+                    table: Table::Chunks,
+                    range: range.clone(),
+                    reverse: false,
+                    limit: 256,
+                    want_values: true,
+                })
+                .await?;
+            for (_, value) in &page.items {
+                if let Some(bytes) = value {
+                    total = total.saturating_add(bytes.len() as u64);
+                }
+            }
+            match page.resume {
+                Some(last) => range.start = std::ops::Bound::Excluded(last),
+                None => break,
+            }
+        }
+        Ok(total)
+    }
+
+    /// Delete a locker and everything it stores, permanently.
+    ///
+    /// Returns `false` if no locker was ever registered under `name`, so
+    /// deleting a name twice is not an error. Hive's `deleteBoxFromDisk`.
+    ///
+    /// Refuses with [`Error::InvalidConfig`] while a handle to the locker is
+    /// open. An open eager locker holds its values in RAM and an open lazy
+    /// locker holds its key index, so deleting underneath either would leave a
+    /// handle confidently serving data that no longer exists. Close it first.
+    ///
+    /// Records, the chunks they point at, the name registration and the schema
+    /// tag all go in **one** commit, so a failure leaves the locker whole
+    /// rather than half-erased.
+    ///
+    /// The locker's id is *not* recycled — `next_locker_id` only ever moves
+    /// forward. Recreating the same name allocates a fresh id, which is what
+    /// stops any record the delete somehow missed from being read as part of
+    /// the new locker.
+    pub async fn delete_locker(&self, name: &str) -> Result<bool> {
+        if self.is_locker_open(name) {
+            return Err(Error::InvalidConfig(format!(
+                "locker {name:?} is still open; close it before deleting it"
+            )));
+        }
+        if !self.locker_exists(name).await? {
+            return Ok(false);
+        }
+
+        let id = self.locker_id(name).await?;
+        let inner = self.maintenance_inner(id, name);
+
+        // The chunk GC ops and the record range deletion, exactly as `clear`
+        // builds them, plus the two meta keys.
+        let mut ops = inner.clear_value_ops().await?;
+        ops.push(Op::Delete {
+            table: Table::Meta,
+            key: locker_key(name),
+        });
+        ops.push(Op::Delete {
+            table: Table::Meta,
+            key: schema_key(id),
+        });
+        self.backend.commit(ops).await?;
+
+        if let Ok(mut guard) = self.registry.lock() {
+            guard.remove(name);
+        }
+        if let Ok(mut guard) = self.open_lockers.lock() {
+            guard.remove(name);
+        }
+        Ok(true)
+    }
+
     /// Close the bank: release the backend handle.
     ///
     /// Idempotent. Every later operation — through this bank or through any
@@ -604,6 +759,55 @@ impl Bank {
     fn cache(&self, name: &str, id: LockerId) {
         if let Ok(mut guard) = self.registry.lock() {
             guard.insert(name.to_string(), id);
+        }
+    }
+}
+
+/// Delete a whole bank from the platform it lives on.
+///
+/// Idempotent: deleting a location that holds nothing succeeds. Every handle
+/// onto that location must be closed first — natively `redb` still holds an
+/// exclusive lock on an open file, and on the web an open IndexedDB connection
+/// blocks the delete until it goes away.
+///
+/// A free function rather than a method, because a `Bank` you are about to
+/// erase is not a good place to hang the erasing from.
+pub async fn delete_bank(config: &BankConfig) -> Result<()> {
+    match &config.location {
+        // Nothing outlives the handles; there is no location to erase.
+        Location::Memory => Ok(()),
+        Location::Path(path) => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                match std::fs::remove_file(path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(Error::backend(format!(
+                        "deleting the bank file {}: {e}",
+                        path.display()
+                    ))),
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = path;
+                Err(Error::InvalidConfig(
+                    "Location::Path is native-only; use Location::Web on wasm".into(),
+                ))
+            }
+        }
+        Location::Web(name) => {
+            #[cfg(target_arch = "wasm32")]
+            {
+                crate::backend::IndexedDbBackend::delete_database(name).await
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let _ = name;
+                Err(Error::InvalidConfig(
+                    "Location::Web is wasm-only; use Location::Path on native".into(),
+                ))
+            }
         }
     }
 }
@@ -827,5 +1031,43 @@ mod tests {
         let bank = block_on(Bank::open(BankConfig::at(&path))).unwrap();
         let locker = block_on(bank.locker::<String>("ui_settings")).unwrap();
         assert_eq!(locker.get("theme").as_deref(), Some(&"dark".to_string()));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn delete_bank_removes_the_file_and_tolerates_a_missing_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bank.redb");
+        let config = BankConfig::at(&path);
+
+        let bank = block_on(Bank::open(config.clone())).unwrap();
+        let locker = block_on(bank.locker::<String>("s")).unwrap();
+        block_on(locker.put("k", "v".into())).unwrap();
+        // redb still holds the file open until the bank is closed.
+        block_on(bank.close()).unwrap();
+
+        block_on(delete_bank(&config)).unwrap();
+        assert!(!path.exists());
+
+        // Idempotent: a location holding nothing is not an error.
+        block_on(delete_bank(&config)).unwrap();
+
+        let reborn = block_on(Bank::open(config)).unwrap();
+        let locker = block_on(reborn.locker::<String>("s")).unwrap();
+        assert_eq!(locker.get("k"), None, "the data went with the file");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn delete_bank_refuses_a_web_location_on_native() {
+        assert!(matches!(
+            block_on(delete_bank(&BankConfig::web("nope"))),
+            Err(Error::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn deleting_a_memory_bank_is_a_no_op() {
+        block_on(delete_bank(&BankConfig::memory())).unwrap();
     }
 }

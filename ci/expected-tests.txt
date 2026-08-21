@@ -1,0 +1,20 @@
+# Expected minimum passing test count per wasm lane.
+#
+#   <lane>-<browser>  <minimum-passed>
+#
+# These are the EXACT counts each lane runs at HEAD, not a floor with slack.
+# A lane that runs FEWER tests than this fails: that is the whole point, and
+# it is what catches a suite that silently stopped being compiled in (see
+# trap 2 in RESUME_HERE.md — a misconfigured wasm lane exits 0 having run
+# zero tests). Running MORE than this is fine and never fails.
+#
+# WHEN YOU ADD TEST CASES YOU MUST BUMP THESE NUMBERS. Run the lane, take the
+# "OK: N test(s) actually ran and passed." number, and write N here.
+#
+# Last verified: 2026-08-21 at a25ebfe.
+plain-firefox    108
+plain-chrome     108
+atomics-chrome   108
+atomics-firefox  108
+# Safari runs the same plain suite; the lane is new and non-blocking.
+plain-safari     108

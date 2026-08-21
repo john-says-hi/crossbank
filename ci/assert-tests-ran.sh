@@ -7,6 +7,10 @@
 # it prints "only configured to run in node.js ... skipping" and returns
 # success. A green check that proved nothing is worse than a red one.
 #
+# It doubles as a shrink detector: the caller passes the lane's expected count
+# from ci/expected-tests.txt, so a suite that stops being compiled in goes red
+# instead of quietly running fewer cases.
+#
 #   ci/assert-tests-ran.sh <output-file> [minimum-passed]
 set -euo pipefail
 
@@ -24,7 +28,9 @@ passed="$(grep -oE 'test result: ok\. [0-9]+ passed' "${OUT}" \
 
 if [ "${passed}" -lt "${MIN}" ]; then
     echo "FAIL: only ${passed} test(s) passed, expected at least ${MIN}." >&2
-    echo "      A lane that runs zero tests must never report success." >&2
+    echo "      A lane that runs zero or fewer-than-expected tests must never" >&2
+    echo "      report success. If cases were intentionally removed, lower the" >&2
+    echo "      lane's number in ci/expected-tests.txt in the same commit." >&2
     exit 1
 fi
 

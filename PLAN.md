@@ -266,9 +266,31 @@ every workflow is `workflow_dispatch`-only.
 | lint | fmt, clippy, shellcheck | per PR |
 | native | memory + redb, Linux/macOS/Windows, nextest + doctests | per PR |
 | wasm | plain and atomics × Chrome and Firefox | per PR |
+| wasm-safari | plain lane on `macos-latest` via `safaridriver` | per PR (non-blocking) |
 | mobile-check | Android ×3, iOS ×2 `cargo check` | per PR |
 | mobile persistence | write, kill, reopen on emulator/simulator | nightly |
 | torture, crash, proptest | multi-GB, quota, fault matrix | nightly |
+
+Edge is Chromium — same Blink, V8, and IndexedDB implementation — so the Chrome lane covers
+it and no `msedgedriver` lane is warranted. Safari/WebKit is the only other engine, hence its
+own macOS job. It is **plain lane only**: there is no headless Safari, and `SharedArrayBuffer`
+under a WebDriver-driven Safari is unreliable, so an atomics lane there would be flaky rather
+than informative.
+
+Every wasm lane asserts a per-lane expected passing test count from `ci/expected-tests.txt`.
+"At least one test ran" caught a lane that ran nothing; it does not catch a lane that quietly
+stopped compiling a suite in. Adding cases means bumping those numbers in the same commit.
+
+**Follow-up — flip the Safari lane to required.** It landed non-blocking so a first-run
+infrastructure surprise on macOS cannot wedge every PR. Once John has seen **one green
+`wasm-safari` run** on master, make both changes in a single commit to
+`.github/workflows/ci.yml`:
+
+1. delete `continue-on-error: true` from the `wasm-safari` job, and
+2. add `wasm-safari` to `ci-green`'s `needs:` list.
+
+Until both are done, a red Safari lane proves nothing about the merge — `ci-green` cannot
+see it.
 
 Lane rustflags live in `ci/wasm-atomics.toml`, selected with `cargo --config`. **Never** via
 a `RUSTFLAGS` env var, which *replaces* a cargo-config array instead of appending and

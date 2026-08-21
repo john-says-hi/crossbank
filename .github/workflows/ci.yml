@@ -145,15 +145,76 @@ jobs:
           "${CHROMEWEBDRIVER}/chromedriver" --version
           google-chrome --version
 
-      - uses: browser-actions/setup-firefox@v1
+      # Pinned, not floating. `@v1` is a moving major tag and
+      # `setup-geckodriver@latest` was a moving BRANCH — either could change
+      # under us between two runs of the same commit. setup-geckodriver
+      # publishes no version tags at all (its only tag is v0.0.0), so the SHA
+      # of its `latest` branch is the only thing there is to pin.
+      - uses: browser-actions/setup-firefox@0bc507ddf224827e3b1af68e014d5e42ab93e795 # v1.7.2
         if: matrix.browser == 'firefox'
-      - uses: browser-actions/setup-geckodriver@latest
+      - uses: browser-actions/setup-geckodriver@fac5b0424c584257f32cf12c5eb4ba86014c34f8 # latest @ 2026-04-29
         if: matrix.browser == 'firefox'
 
+      # Edge is Chromium: it shares Blink, V8, and the same IndexedDB
+      # implementation, so the chrome lane covers it. A separate msedgedriver
+      # lane would re-test the same engine.
+
       # ci/wasm-test.sh refuses to run if any RUSTFLAGS variable is exported,
-      # and asserts a nonzero passing test count so a skipped lane cannot
-      # report success.
+      # checks the runner against Cargo.lock's wasm-bindgen, and asserts the
+      # lane's expected test count from ci/expected-tests.txt so a skipped or
+      # shrunken lane cannot report success.
       - run: ci/wasm-test.sh --${{ matrix.lane }} --${{ matrix.browser }}
+
+  # Safari/WebKit. Separate job because it needs a macOS runner and there is
+  # no Linux WebKit that shares Safari's IndexedDB implementation — the one
+  # whose ITP evicts storage after 7 idle days.
+  #
+  # PLAIN LANE ONLY: there is no headless Safari, and SharedArrayBuffer under
+  # a WebDriver-driven Safari is unreliable, so an atomics lane here would be
+  # flaky rather than informative.
+  #
+  # Landing non-blocking (continue-on-error, and deliberately NOT in
+  # ci-green's needs) until John has seen one green run. See PLAN.md.
+  wasm-safari:
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm-plain-safari
+
+      # safaridriver ships with macOS but its WebDriver support is off by
+      # default; this is a one-liner on the runner and needs sudo.
+      - name: Enable safaridriver
+        run: sudo safaridriver --enable
+
+      # The runner must match the resolved wasm-bindgen version EXACTLY or it
+      # aborts with a schema-version error. Derive it, never hand-pin it.
+      - name: Resolve wasm-bindgen version
+        id: wbg
+        run: |
+          v=$(cargo metadata --format-version 1 \
+              | jq -r '.packages[] | select(.name=="wasm-bindgen") | .version' | head -1)
+          if [ -z "$v" ]; then
+            echo "FATAL: could not resolve a wasm-bindgen version" >&2
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "resolved wasm-bindgen $v"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ steps.wbg.outputs.version }}
+
+      # --safari unsets CHROMEDRIVER/GECKODRIVER (the runner probes
+      # geckodriver first) and asserts the same expected test count.
+      - run: ci/wasm-test.sh --plain --safari
 
   # Single required status check for branch protection.
   ci-green:

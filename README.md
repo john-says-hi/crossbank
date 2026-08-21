@@ -90,6 +90,24 @@ application calls `flush()` / `Bank::flush_all()` from `pagehide` and from
 browsers frequently never fire. crossbank spawns nothing, so there is no timer or
 background task that will do it. See `examples/flush_on_pagehide.rs`.
 
+### Browser & platform support
+
+| Browser | Engine | Coverage |
+|---|---|---|
+| Chrome | Blink | CI, plain + atomics lanes |
+| Firefox | Gecko | CI, plain + atomics lanes |
+| Safari / WebKit | WebKit | CI lane landing — plain lane only (no headless Safari; `SharedArrayBuffer` under WebDriver is unreliable) |
+| Edge | Chromium | Covered by the Chrome lane — same Blink/V8 and the same IndexedDB implementation |
+
+| Platform | Coverage |
+|---|---|
+| Linux, macOS, Windows | CI, full test suite (`cargo nextest` + doctests) |
+| Android (arm64, armv7, x86_64) | CI, `cargo check` only |
+| iOS (device + simulator) | CI, `cargo check` only |
+
+Safari's Intelligent Tracking Prevention deletes IndexedDB after 7 days without user
+interaction. See [Web caveats](#web-caveats).
+
 ### Backends
 
 | Backend | Target |

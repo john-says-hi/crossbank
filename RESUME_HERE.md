@@ -192,6 +192,7 @@ export CROSSBANK_WBG_RUNNER=<path to a wasm-bindgen-test-runner matching Cargo.l
 export GECKODRIVER=<path to geckodriver>
 ci/wasm-test.sh --plain   --firefox
 ci/wasm-test.sh --atomics --firefox
+ci/wasm-test.sh --plain   --safari     # macOS only; sudo safaridriver --enable first
 ```
 
 `ci/wasm-test.sh` is the same script CI runs, so local and CI cannot drift.
@@ -266,7 +267,19 @@ Every one of these was hit and paid for already. Do not rediscover them.
     later. The negative control for that lives natively, in
     `src/coherence/native.rs`, where the native half carries the same
     close-on-drop contract purely so it can be tested.
-20. **Locker `close()` is async now.** It flushes first and closes even when
+20. **A lane must assert its EXPECTED test count, not merely a nonzero one.**
+    `ci/expected-tests.txt` holds a per-lane number (108 for every lane at
+    a25ebfe) and `ci/wasm-test.sh` passes it to `ci/assert-tests-ran.sh`.
+    "At least 1" caught a lane that ran *nothing*, but not a lane that quietly
+    stopped compiling one suite in and ran 40 instead of 108. **Adding test
+    cases means bumping these numbers in the same commit** — run the lane and
+    copy the "OK: N test(s)" figure. More than expected always passes; fewer
+    always fails. The same file also documents the Safari lane's count.
+21. **`ci/wasm-test.sh` now refuses a mismatched runner up front.** It compares
+    `wasm-bindgen-test-runner --version` against the `wasm-bindgen` version in
+    `Cargo.lock` and prints the exact `cargo install --locked` line to fix it,
+    instead of letting the run die mid-way on a schema-version error.
+22. **Locker `close()` is async now.** It flushes first and closes even when
     the flush fails, returning the flush error. A bare `locker.close();` is a
     dropped future that does nothing.
 
@@ -290,6 +303,8 @@ Every one of these was hit and paid for already. Do not rediscover them.
    never call it implicitly on open.
 4. Trap 8 still applies to any IndexedDB work: every backend method must be **one**
    `db.transaction(...).run(...)` awaiting only IDB requests.
-5. Safari CI (`safaridriver` on macOS runners) is still a follow-up. Safari has **zero**
-   coverage today, and its ITP deletes IndexedDB after 7 days without user interaction,
-   which is a product-level risk M5 must handle deliberately.
+5. Safari CI now has a lane: `wasm-safari` on `macos-latest`, plain lane only, running
+   `ci/wasm-test.sh --plain --safari`. It is **non-blocking on purpose** —
+   `continue-on-error: true` and not in `ci-green`'s `needs` — until John has seen one
+   green run; see the follow-up in `PLAN.md`. Safari's ITP still deletes IndexedDB after
+   7 days without user interaction, which remains a product-level risk.

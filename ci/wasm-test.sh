@@ -3,6 +3,7 @@
 #
 #   ci/wasm-test.sh --plain   --firefox [-- <extra cargo args>]
 #   ci/wasm-test.sh --atomics --chrome  [-- <extra cargo args>]
+#   ci/wasm-test.sh --plain   --safari  [-- <extra cargo args>]   (macOS only)
 #
 # Two traps this script exists to prevent:
 #
@@ -12,7 +13,12 @@
 #     section, and combined with WASM_BINDGEN_TEST_ONLY_WEB it prints
 #     "only configured to run in node.js ... skipping" and returns success.
 #     That is how a browser suite can sit in a repo for months, green, having
-#     never executed. We assert a nonzero passing count instead.
+#     never executed. We assert a per-lane MINIMUM passing count instead, read
+#     from ci/expected-tests.txt.
+#
+#  3. A wasm-bindgen-test-runner whose version does not match the wasm-bindgen
+#     resolved in Cargo.lock. It aborts with a schema-version error, so we
+#     check up front and say exactly how to fix it.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -26,12 +32,21 @@ while [ $# -gt 0 ]; do
         --atomics) LANE=atomics; shift ;;
         --chrome)  BROWSER=chrome;  shift ;;
         --firefox) BROWSER=firefox; shift ;;
+        --safari)  BROWSER=safari;  shift ;;
         --) shift; break ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 [ -n "${LANE}" ]    || { echo "need --plain or --atomics" >&2; exit 2; }
-[ -n "${BROWSER}" ] || { echo "need --chrome or --firefox" >&2; exit 2; }
+[ -n "${BROWSER}" ] || { echo "need --chrome, --firefox or --safari" >&2; exit 2; }
+
+# Safari is the PLAIN lane only. There is no headless Safari, and
+# SharedArrayBuffer under WebDriver-driven Safari is unreliable, so the
+# atomics lane would be flaky rather than informative.
+if [ "${BROWSER}" = safari ] && [ "${LANE}" != plain ]; then
+    echo "safari supports the --plain lane only (no headless Safari; SAB under WebDriver is unreliable)" >&2
+    exit 2
+fi
 
 "${HERE}/guard-rustflags.sh"
 
@@ -44,16 +59,38 @@ RUNNER="${CROSSBANK_WBG_RUNNER:-$(command -v wasm-bindgen-test-runner || true)}"
 [ -n "${RUNNER}" ] || { echo "no wasm-bindgen-test-runner found" >&2; exit 2; }
 export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="${RUNNER}"
 
+# Fail fast on a mismatched runner rather than mid-run on a schema error.
+WANT_WBG="$(awk '/^name = "wasm-bindgen"$/{f=1;next} f&&/^version = /{gsub(/[",]/,"",$3);print $3;exit}' Cargo.lock)"
+HAVE_WBG="$("${RUNNER}" --version 2>/dev/null | awk '{print $NF}')"
+if [ -z "${WANT_WBG}" ]; then
+    echo "FAIL: could not read the wasm-bindgen version from Cargo.lock" >&2
+    exit 2
+fi
+if [ "${HAVE_WBG}" != "${WANT_WBG}" ]; then
+    echo "FAIL: wasm-bindgen-test-runner is ${HAVE_WBG:-unknown}, Cargo.lock resolves wasm-bindgen ${WANT_WBG}." >&2
+    echo "      The runner must match EXACTLY or it aborts with a schema-version error." >&2
+    echo "      Fix with:  cargo install --locked wasm-bindgen-cli --version ${WANT_WBG}" >&2
+    echo "      Or point CROSSBANK_WBG_RUNNER at a matching binary." >&2
+    exit 2
+fi
+
 export WASM_BINDGEN_USE_BROWSER=1
 # wasm-bindgen-test-runner prefers the first of GECKODRIVER / CHROMEDRIVER
 # that is set. Pin exactly one so `--chrome` cannot silently run Firefox.
 if [ "${BROWSER}" = chrome ]; then
-    unset GECKODRIVER GECKODRIVER_REMOTE || true
+    unset GECKODRIVER GECKODRIVER_REMOTE SAFARIDRIVER SAFARIDRIVER_REMOTE || true
     : "${CHROMEDRIVER:=$(command -v chromedriver || true)}"
     [ -n "${CHROMEDRIVER}" ] || { echo "no chromedriver found" >&2; exit 2; }
     export CHROMEDRIVER
+elif [ "${BROWSER}" = safari ]; then
+    # The runner probes geckodriver BEFORE safaridriver, so a stray
+    # GECKODRIVER (or a geckodriver on PATH) would silently run Firefox here.
+    unset GECKODRIVER GECKODRIVER_REMOTE CHROMEDRIVER CHROMEDRIVER_REMOTE || true
+    : "${SAFARIDRIVER:=$(command -v safaridriver || true)}"
+    [ -n "${SAFARIDRIVER}" ] || { echo "no safaridriver found (macOS only; run: sudo safaridriver --enable)" >&2; exit 2; }
+    export SAFARIDRIVER
 else
-    unset CHROMEDRIVER CHROMEDRIVER_REMOTE || true
+    unset CHROMEDRIVER CHROMEDRIVER_REMOTE SAFARIDRIVER SAFARIDRIVER_REMOTE || true
     : "${GECKODRIVER:=$(command -v geckodriver || true)}"
     [ -n "${GECKODRIVER}" ] || { echo "no geckodriver found" >&2; exit 2; }
     export GECKODRIVER
@@ -92,4 +129,12 @@ if [ "${status}" -ne 0 ]; then
     exit "${status}"
 fi
 
-"${HERE}/assert-tests-ran.sh" "${OUT}"
+# Per-lane expected minimum. Fewer than this is a failure; more is fine.
+EXPECTED_FILE="${HERE}/expected-tests.txt"
+MIN="$(awk -v k="${LANE}-${BROWSER}" '$1==k {print $2; exit}' "${EXPECTED_FILE}")"
+if [ -z "${MIN}" ]; then
+    echo "FAIL: no expected test count for lane '${LANE}-${BROWSER}' in ${EXPECTED_FILE}" >&2
+    exit 2
+fi
+
+"${HERE}/assert-tests-ran.sh" "${OUT}" "${MIN}"

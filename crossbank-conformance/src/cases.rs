@@ -12,7 +12,7 @@
 //!   "panics" is not.
 //! * Never rely on `Drop` for cleanup. With abort there is no unwinding.
 
-use crossbank::{Bank, Error, Event, LockerConfig, Result};
+use crossbank::{Bank, Error, Event, LockerConfig, OnCorrupt, Result};
 use futures::StreamExt;
 
 use crate::Harness;
@@ -784,5 +784,72 @@ pub async fn to_map_matches_key_by_key_reads<H: Harness>(h: &H) -> Result<()> {
             .collect::<Vec<_>>(),
         vec!["a".to_string()]
     );
+    Ok(())
+}
+
+/// One unreadable record does not have to cost you the locker.
+///
+/// Reaches past the locker API to write garbage through `Backend::commit`,
+/// because that is the only honest way to produce damage the layer above did
+/// not create. Everything after that is the documented recovery path:
+/// `Fail` refuses, `Skip` opens and names the casualty without touching its
+/// bytes, `verify` surveys, `quarantine` is the one thing that deletes.
+pub async fn a_corrupt_record_is_skipped_when_configured<H: Harness>(h: &H) -> Result<()> {
+    use crossbank::backend::{Op, Table};
+
+    let bank = bank(h).await?;
+    let locker = bank.locker::<V>("l").await?;
+    locker.put("good", v("keep")).await?;
+    locker.put("bad", v("lose")).await?;
+    let id = bank.locker_id("l").await?;
+    locker.close();
+
+    // Overwrite the stored bytes with something that is neither a CBNK
+    // envelope nor a CCHK pointer.
+    bank.backend()
+        .commit(vec![Op::Put {
+            table: Table::Records,
+            key: crossbank::key::encode(id, "bad"),
+            value: b"not a CBNK envelope".to_vec(),
+        }])
+        .await?;
+
+    // The default refuses rather than serving a locker that quietly lost a key.
+    assert!(
+        matches!(bank.locker::<V>("l").await, Err(Error::Corrupt(_))),
+        "OnCorrupt::Fail must refuse to open over an unreadable record"
+    );
+
+    let skipping = bank
+        .locker_with::<V>(
+            "l",
+            LockerConfig::default().with_on_corrupt(OnCorrupt::Skip),
+        )
+        .await?;
+    assert_eq!(skipping.corrupt_keys(), vec![b"bad".to_vec()]);
+    assert!(skipping.get("bad").is_none());
+    assert_eq!(skipping.get("good").as_deref(), Some(&v("keep")));
+    assert_eq!(skipping.len(), 1);
+
+    // verify sees the same thing, and may run while the locker is open.
+    assert_eq!(bank.verify("l").await?, vec![b"bad".to_vec()]);
+
+    // quarantine may not: it would invalidate the open handle's RAM index.
+    assert!(matches!(
+        bank.quarantine("l", &[b"bad"]).await,
+        Err(Error::InvalidConfig(_))
+    ));
+    skipping.close();
+
+    assert_eq!(bank.quarantine("l", &[b"bad"]).await?, 1);
+    assert!(
+        bank.verify("l").await?.is_empty(),
+        "quarantine must remove exactly the damage verify reported"
+    );
+
+    // And the strict open works again, with the untouched record intact.
+    let healed = bank.locker::<V>("l").await?;
+    assert_eq!(healed.len(), 1);
+    assert_eq!(healed.get("good").as_deref(), Some(&v("keep")));
     Ok(())
 }

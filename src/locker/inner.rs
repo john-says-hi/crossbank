@@ -146,7 +146,7 @@ impl Inner {
         }
     }
 
-    async fn read_chunks(&self, pointer: &ChunkPointer) -> Result<Vec<u8>> {
+    pub(crate) async fn read_chunks(&self, pointer: &ChunkPointer) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(pointer.total_len as usize);
         for seq in 0..pointer.n_chunks {
             let key = chunk_key(pointer.value_id, seq);

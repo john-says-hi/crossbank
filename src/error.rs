@@ -100,6 +100,19 @@ impl Error {
     pub fn backend(msg: impl fmt::Display) -> Self {
         Self::Backend(msg.to_string())
     }
+
+    /// Whether this error says "the stored bytes are unreadable" rather than
+    /// "the store failed" or "you asked for the wrong thing".
+    ///
+    /// This is the set [`crate::OnCorrupt::Skip`] acts on. A `Backend` or
+    /// `Closed` error is deliberately **not** in it: skipping a record because
+    /// the disk hiccuped would quietly drop data that is perfectly intact.
+    pub fn is_corruption(&self) -> bool {
+        matches!(
+            self,
+            Self::Corrupt(_) | Self::UnsupportedVersion { .. } | Self::Filter(_)
+        )
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +144,27 @@ mod tests {
             available: None,
         };
         assert_eq!(without.to_string(), "quota exceeded: needed 10 bytes");
+    }
+
+    #[test]
+    fn only_unreadable_bytes_count_as_corruption() {
+        // The distinction OnCorrupt::Skip depends on. A backend failure is a
+        // transient problem with intact data; skipping it would lose data.
+        assert!(Error::Corrupt("bad crc".into()).is_corruption());
+        assert!(Error::UnsupportedVersion {
+            found: 9,
+            supported: 1
+        }
+        .is_corruption());
+        assert!(Error::Filter("lz4 failed".into()).is_corruption());
+
+        assert!(!Error::backend("disk went away").is_corruption());
+        assert!(!Error::Closed.is_corruption());
+        assert!(!Error::SchemaMismatch {
+            stored: "a".into(),
+            requested: "b".into()
+        }
+        .is_corruption());
     }
 
     #[test]

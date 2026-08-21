@@ -30,7 +30,7 @@ use crate::error::{Error, Result};
 use crate::key::LockerId;
 
 use super::inner::Inner;
-use super::policy::{LockerConfig, Policy};
+use super::policy::{LockerConfig, OnCorrupt, Policy};
 use super::transaction::{Staged, Transaction};
 use crate::watch::Event;
 
@@ -38,6 +38,9 @@ use crate::watch::Event;
 pub struct Locker<T> {
     inner: Arc<Inner>,
     values: Mutex<BTreeMap<Vec<u8>, Arc<T>>>,
+    /// Keys whose stored bytes would not decode at open, under
+    /// [`OnCorrupt::Skip`]. Fixed once open returns.
+    corrupt: Vec<Vec<u8>>,
 }
 
 impl<T> std::fmt::Debug for Locker<T> {
@@ -82,6 +85,7 @@ where
         });
 
         let mut values = BTreeMap::new();
+        let mut corrupt: Vec<Vec<u8>> = Vec::new();
         let mut loaded: u64 = 0;
         let budget = config.eager_budget;
         let mut overflow: Option<u64> = None;
@@ -105,7 +109,18 @@ where
                         return Ok(());
                     }
 
-                    values.insert(key, Arc::new(inner.open::<T>(&bytes)?));
+                    match inner.open::<T>(&bytes) {
+                        Ok(value) => {
+                            values.insert(key, Arc::new(value));
+                        }
+                        // Skip records the decoder chokes on, when asked to.
+                        // The stored bytes are left untouched, so a later
+                        // build with a working decoder can still read them.
+                        Err(e) if config.on_corrupt == OnCorrupt::Skip && e.is_corruption() => {
+                            corrupt.push(key);
+                        }
+                        Err(e) => return Err(e),
+                    }
                     Ok(())
                 },
             )
@@ -121,6 +136,7 @@ where
         Ok(Self {
             inner,
             values: Mutex::new(values),
+            corrupt,
         })
     }
 
@@ -297,6 +313,17 @@ impl<T> Locker<T> {
 
     pub(crate) fn inner(&self) -> &Arc<Inner> {
         &self.inner
+    }
+
+    /// Keys whose stored bytes would not decode when this locker was opened.
+    ///
+    /// Always empty under [`OnCorrupt::Fail`], which refuses to open at all
+    /// rather than reporting a partial view. Under [`OnCorrupt::Skip`] these
+    /// are exactly the keys missing from [`Locker::keys`] and [`Locker::len`];
+    /// their bytes are still on disk, untouched. [`crate::Bank::quarantine`]
+    /// is the only thing that removes them.
+    pub fn corrupt_keys(&self) -> Vec<Vec<u8>> {
+        self.corrupt.clone()
     }
 
     /// Close this locker: drop its resident values and refuse further writes.

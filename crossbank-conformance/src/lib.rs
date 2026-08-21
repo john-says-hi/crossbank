@@ -74,7 +74,7 @@ pub trait Harness {
 }
 
 /// Number of cases in the spec. The arity guard compares against this.
-pub const CASE_COUNT: usize = 31;
+pub const CASE_COUNT: usize = 32;
 
 /// Run `block_on` without pulling in an async runtime.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -120,6 +120,7 @@ macro_rules! __for_each_case {
         $crate::__emit!(binary_keys_round_trip_and_sort_bytewise, $make);
         $crate::__emit!(put_all_is_atomic, $make);
         $crate::__emit!(to_map_matches_key_by_key_reads, $make);
+        $crate::__emit!(a_corrupt_record_is_skipped_when_configured, $make);
     };
 }
 
@@ -240,5 +241,6 @@ macro_rules! __count_cases {
         $counter!(binary_keys_round_trip_and_sort_bytewise, ());
         $counter!(put_all_is_atomic, ());
         $counter!(to_map_matches_key_by_key_reads, ());
+        $counter!(a_corrupt_record_is_skipped_when_configured, ());
     };
 }

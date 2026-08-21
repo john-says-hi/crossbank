@@ -13,6 +13,23 @@
 //! streaming [`Writer`]/[`Reader`] access. The public API is not yet stable
 //! and the crate is not published.
 //!
+//! Keys are **bytes**. Every `&str` method has a `_by` twin taking `&[u8]`
+//! ([`Locker::get_by`], [`Locker::put_by`], [`LazyLocker::range_by`], …), a
+//! `&str` key is stored as exactly its UTF-8 bytes, and the `&str` listings
+//! ([`Locker::keys`], [`LazyLocker::to_map`]) skip what they cannot spell
+//! rather than failing — [`Locker::has_non_utf8_keys`] and
+//! [`Locker::keys_bytes`] cover the rest.
+//!
+//! Bulk work goes through [`Locker::put_all`] / [`Locker::delete_all`], each
+//! one atomic commit, and change notification through [`Locker::watch`],
+//! [`Locker::watch_key`] and [`Locker::watch_keys`].
+//!
+//! Damaged data is survivable rather than fatal: [`OnCorrupt::Skip`] opens a
+//! locker without its unreadable records and lists them via
+//! [`Locker::corrupt_keys`], [`Bank::verify`] surveys a locker without
+//! changing it, and [`Bank::quarantine`] is the only thing that deletes a
+//! record for being corrupt.
+//!
 //! # Shape
 //!
 //! ```text
@@ -49,7 +66,9 @@ pub use backend::{Backend, MemoryBackend};
 pub use bank::{delete_bank, Bank, BankConfig, Location};
 pub use codec::{Filter, FilterChain};
 pub use error::{Error, Result};
-pub use locker::{LazyLocker, Locker, LockerConfig, Policy, Reader, Transaction, Writer};
+pub use locker::{
+    LazyLocker, Locker, LockerConfig, OnCorrupt, Policy, Reader, Transaction, Writer,
+};
 pub use remote::RemoteBank;
 pub use watch::{Event, EventStream};
 

@@ -21,6 +21,27 @@ pub enum Policy {
     Evictable { max_bytes: u64 },
 }
 
+/// What opening a locker does when a stored record will not decode.
+///
+/// Corruption is rare but not impossible: a truncated file, a filter chain
+/// swapped without changing its id, a bug in a consumer's own `Filter`. The
+/// question this settles is whether one bad record is allowed to make the
+/// whole locker unopenable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnCorrupt {
+    /// Refuse to open. The default, because silently hiding data loss is the
+    /// wrong way round: a caller has to *ask* to carry on without it.
+    #[default]
+    Fail,
+
+    /// Open anyway, skipping the bad records and listing their keys.
+    ///
+    /// Nothing is written and nothing is deleted — the stored bytes are left
+    /// exactly as they are, so a later build with a fixed decoder can still
+    /// read them. Use [`crate::Bank::quarantine`] to remove them deliberately.
+    Skip,
+}
+
 /// Limits applied to one locker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LockerConfig {
@@ -39,6 +60,9 @@ pub struct LockerConfig {
 
     pub policy: Policy,
 
+    /// What to do about a record that will not decode. See [`OnCorrupt`].
+    pub on_corrupt: OnCorrupt,
+
     /// Size of one chunk for a lazy value that does not fit inline.
     ///
     /// Peak memory on the streaming path is a small multiple of this, not of
@@ -52,6 +76,7 @@ impl Default for LockerConfig {
             max_inline: 256 * 1024,
             eager_budget: 32 * 1024 * 1024,
             policy: Policy::Precious,
+            on_corrupt: OnCorrupt::Fail,
             chunk_size: 256 * 1024,
         }
     }
@@ -70,6 +95,11 @@ impl LockerConfig {
 
     pub fn with_policy(mut self, policy: Policy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    pub fn with_on_corrupt(mut self, on_corrupt: OnCorrupt) -> Self {
+        self.on_corrupt = on_corrupt;
         self
     }
 
@@ -93,6 +123,14 @@ mod tests {
     }
 
     #[test]
+    fn failing_on_corruption_is_the_default() {
+        // Opening over data we cannot read must be loud. Skipping silently
+        // would turn data loss into a shrug.
+        assert_eq!(OnCorrupt::default(), OnCorrupt::Fail);
+        assert_eq!(LockerConfig::default().on_corrupt, OnCorrupt::Fail);
+    }
+
+    #[test]
     fn precious_is_the_default_policy() {
         // Defaulting to evictable would mean data silently disappearing for
         // anyone who did not think about it. Safe by default, opt in to loss.
@@ -105,7 +143,9 @@ mod tests {
             .with_max_inline(1024)
             .with_eager_budget(2048)
             .with_policy(Policy::Evictable { max_bytes: 4096 })
+            .with_on_corrupt(OnCorrupt::Skip)
             .with_chunk_size(64);
+        assert_eq!(c.on_corrupt, OnCorrupt::Skip);
         assert_eq!(c.max_inline, 1024);
         assert_eq!(c.eager_budget, 2048);
         assert_eq!(c.policy, Policy::Evictable { max_bytes: 4096 });

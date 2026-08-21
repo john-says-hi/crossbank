@@ -21,7 +21,7 @@ use crate::error::{Error, Result};
 use crate::key::LockerId;
 
 use super::inner::Inner;
-use super::policy::LockerConfig;
+use super::policy::{LockerConfig, OnCorrupt};
 use super::transaction::{Staged, Transaction};
 use crate::watch::Event;
 
@@ -29,6 +29,9 @@ use crate::watch::Event;
 pub struct LazyLocker<T> {
     pub(crate) inner: Arc<Inner>,
     index: Mutex<BTreeSet<Vec<u8>>>,
+    /// Keys whose stored bytes failed to decode on a `get`. See
+    /// [`LazyLocker::corrupt_keys`].
+    corrupt: Mutex<BTreeSet<Vec<u8>>>,
     _value: PhantomData<fn() -> T>,
 }
 
@@ -81,6 +84,7 @@ where
         Ok(Self {
             inner,
             index: Mutex::new(index),
+            corrupt: Mutex::new(BTreeSet::new()),
             _value: PhantomData,
         })
     }
@@ -91,9 +95,25 @@ where
     }
 
     /// As [`LazyLocker::get`], under a binary key.
+    ///
+    /// A record that will not decode is **always** an error here, even under
+    /// [`OnCorrupt::Skip`]. `Skip` governs *opening*: a lazy locker reads no
+    /// values at open, so there is nothing for it to skip, and answering a
+    /// direct `get` with `Ok(None)` would be indistinguishable from "that key
+    /// was never written" — a lie about data that is still on disk. What
+    /// `Skip` does add is bookkeeping: the failing key is recorded in
+    /// [`LazyLocker::corrupt_keys`] on the way out.
     pub async fn get_by(&self, key: &[u8]) -> Result<Option<T>> {
         self.inner.ensure_open()?;
-        self.inner.load_value(key).await
+        match self.inner.load_value(key).await {
+            Err(e) if self.inner.config.on_corrupt == OnCorrupt::Skip && e.is_corruption() => {
+                if let Ok(mut guard) = self.corrupt.lock() {
+                    guard.insert(key.to_vec());
+                }
+                Err(e)
+            }
+            other => other,
+        }
     }
 
     /// Store one value. Large payloads are split across the `chunks` table.
@@ -399,6 +419,20 @@ impl<T> LazyLocker<T> {
     /// locker reads as empty by design.
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
+    }
+
+    /// Keys this locker is known to hold unreadable bytes for.
+    ///
+    /// A lazy locker reads no values at open, so — unlike
+    /// [`crate::Locker::corrupt_keys`] — this starts empty and fills in as
+    /// reads discover damage, and only when the locker was configured with
+    /// [`OnCorrupt::Skip`]. It is therefore a record of what *has been hit*,
+    /// not a survey. [`crate::Bank::verify`] is the survey.
+    pub fn corrupt_keys(&self) -> Vec<Vec<u8>> {
+        self.corrupt
+            .lock()
+            .map(|c| c.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Number of keys. Synchronous — the index is already here.

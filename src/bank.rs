@@ -631,6 +631,120 @@ impl Bank {
         Ok(total)
     }
 
+    /// Read every record of a locker and report the keys that will not decode.
+    ///
+    /// The survey [`crate::Locker::corrupt_keys`] and
+    /// [`LazyLocker::corrupt_keys`] cannot give you: it reads each record and,
+    /// for a chunked value, every chunk behind it. Nothing is written and
+    /// nothing is deleted — this is purely a question.
+    ///
+    /// It stops at the stored *payload*: a record whose bytes reassemble
+    /// cleanly is reported as good even if the payload would then fail to
+    /// deserialise into some particular `T`, because a bank does not know
+    /// what type a locker holds. An unregistered name is an empty list rather
+    /// than an error.
+    ///
+    /// Safe to run while the locker is open. It takes no locks and changes
+    /// nothing, so the worst it can do is read a record a concurrent write is
+    /// about to replace.
+    ///
+    /// Memory is bounded by the largest single value, not by the locker:
+    /// inline records are checked in the walk, and only the chunk pointers are
+    /// held back for the second pass.
+    pub async fn verify(&self, name: &str) -> Result<Vec<Vec<u8>>> {
+        if !self.locker_exists(name).await? {
+            return Ok(Vec::new());
+        }
+        let id = self.locker_id(name).await?;
+        let inner = self.maintenance_inner(id, name);
+
+        let mut bad: Vec<Vec<u8>> = Vec::new();
+        let mut chunked: Vec<(Vec<u8>, crate::locker::chunk::ChunkPointer)> = Vec::new();
+
+        inner
+            .walk(
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded,
+                false,
+                true,
+                |key, value| {
+                    let Some(raw) = value else {
+                        bad.push(key);
+                        return Ok(());
+                    };
+                    if crate::locker::chunk::is_pointer(&raw) {
+                        match crate::locker::chunk::ChunkPointer::parse(&raw) {
+                            Ok(pointer) => chunked.push((key, pointer)),
+                            Err(_) => bad.push(key),
+                        }
+                    } else if self.chain.open(&raw).is_err() {
+                        bad.push(key);
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+
+        for (key, pointer) in chunked {
+            if inner.read_chunks(&pointer).await.is_err() {
+                bad.push(key);
+            }
+        }
+        bad.sort();
+        Ok(bad)
+    }
+
+    /// Delete exactly the named records of a locker, and their chunks.
+    ///
+    /// The **only** thing in crossbank that removes a record because it is
+    /// corrupt. [`crate::OnCorrupt::Skip`] and [`Bank::verify`] both leave the
+    /// stored bytes alone on purpose, so that a later build with a working
+    /// decoder can still recover them; deletion has to be asked for, by key,
+    /// after someone has looked.
+    ///
+    /// Returns how many of `keys` were actually present. Everything goes in
+    /// **one** commit, so a failure leaves the locker as it was.
+    ///
+    /// Refuses with [`Error::InvalidConfig`] while a handle to the locker is
+    /// open, exactly as [`Bank::delete_locker`] does and for the same reason:
+    /// an open handle holds a RAM index that this would silently invalidate.
+    /// [`Bank::verify`] has no such restriction — it changes nothing.
+    pub async fn quarantine(&self, name: &str, keys: &[&[u8]]) -> Result<usize> {
+        if self.is_locker_open(name) {
+            return Err(Error::InvalidConfig(format!(
+                "locker {name:?} is still open; close it before quarantining records"
+            )));
+        }
+        if keys.is_empty() || !self.locker_exists(name).await? {
+            return Ok(0);
+        }
+
+        let id = self.locker_id(name).await?;
+        let inner = self.maintenance_inner(id, name);
+
+        let mut ops = Vec::new();
+        let mut removed = 0usize;
+        for key in keys {
+            let Some(existing) = inner.fetch(key).await? else {
+                continue;
+            };
+            if crate::locker::chunk::is_pointer(&existing) {
+                // A pointer too broken to parse still has its record removed;
+                // its chunks are unreachable either way.
+                if let Ok(pointer) = crate::locker::chunk::ChunkPointer::parse(&existing) {
+                    ops.push(crate::locker::chunk::gc_ops(&pointer));
+                }
+            }
+            ops.push(inner.delete_op(key));
+            removed += 1;
+        }
+
+        if !ops.is_empty() {
+            self.backend.commit(ops).await?;
+        }
+        Ok(removed)
+    }
+
     /// Delete a locker and everything it stores, permanently.
     ///
     /// Returns `false` if no locker was ever registered under `name`, so
@@ -820,6 +934,115 @@ mod tests {
 
     fn bank() -> Bank {
         block_on(Bank::with_backend(Arc::new(MemoryBackend::new()))).unwrap()
+    }
+
+    /// Replace a stored record's bytes with something no decoder can read.
+    fn corrupt_record(bank: &Bank, id: LockerId, key: &str) {
+        block_on(bank.backend().commit(vec![Op::Put {
+            table: Table::Records,
+            key: crate::key::encode(id, key),
+            value: b"not a CBNK envelope".to_vec(),
+        }]))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_record_can_be_skipped_verified_and_quarantined() {
+        use crate::locker::OnCorrupt;
+
+        let b = bank();
+        let l = block_on(b.locker::<String>("l")).unwrap();
+        block_on(l.put("good", "keep".into())).unwrap();
+        block_on(l.put("bad", "lose".into())).unwrap();
+        let id = block_on(b.locker_id("l")).unwrap();
+        l.close();
+
+        corrupt_record(&b, id, "bad");
+
+        // The default refuses to open at all rather than serving a half view.
+        assert!(matches!(
+            block_on(b.locker::<String>("l")),
+            Err(Error::Corrupt(_))
+        ));
+
+        // Asked to skip, it opens, names the casualty, and leaves it on disk.
+        let skipping = block_on(b.locker_with::<String>(
+            "l",
+            LockerConfig::default().with_on_corrupt(OnCorrupt::Skip),
+        ))
+        .unwrap();
+        assert_eq!(skipping.corrupt_keys(), vec![b"bad".to_vec()]);
+        assert!(skipping.get("bad").is_none());
+        assert_eq!(skipping.get("good").as_deref(), Some(&"keep".to_string()));
+        assert_eq!(skipping.len(), 1);
+
+        // verify surveys the same damage, and runs happily while open.
+        assert_eq!(block_on(b.verify("l")).unwrap(), vec![b"bad".to_vec()]);
+
+        // quarantine will not act behind an open handle.
+        assert!(matches!(
+            block_on(b.quarantine("l", &[b"bad"])),
+            Err(Error::InvalidConfig(_))
+        ));
+        skipping.close();
+
+        assert_eq!(block_on(b.quarantine("l", &[b"bad"])).unwrap(), 1);
+        assert!(block_on(b.verify("l")).unwrap().is_empty());
+
+        // And now the strict open succeeds again, with the good record intact.
+        let healed = block_on(b.locker::<String>("l")).unwrap();
+        assert_eq!(healed.len(), 1);
+        assert_eq!(healed.get("good").as_deref(), Some(&"keep".to_string()));
+    }
+
+    #[test]
+    fn quarantining_an_absent_key_removes_nothing() {
+        let b = bank();
+        let l = block_on(b.lazy_locker::<String>("l")).unwrap();
+        block_on(l.put("k", &"v".to_string())).unwrap();
+        l.close();
+
+        assert_eq!(block_on(b.quarantine("l", &[b"ghost"])).unwrap(), 0);
+        assert_eq!(block_on(b.quarantine("l", &[])).unwrap(), 0);
+        assert_eq!(
+            block_on(b.quarantine("never_registered", &[b"k"])).unwrap(),
+            0
+        );
+
+        let reopened = block_on(b.lazy_locker::<String>("l")).unwrap();
+        assert_eq!(reopened.len(), 1);
+    }
+
+    #[test]
+    fn verifying_an_unknown_locker_is_empty_not_an_error() {
+        let b = bank();
+        assert!(block_on(b.verify("never_registered")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_lazy_get_reports_corruption_even_when_skipping() {
+        // Skip governs OPEN. Answering a direct read with `None` would claim
+        // the key was never written, which is a lie about bytes still on disk.
+        use crate::locker::OnCorrupt;
+
+        let b = bank();
+        let l = block_on(b.lazy_locker::<String>("l")).unwrap();
+        block_on(l.put("bad", &"v".to_string())).unwrap();
+        let id = block_on(b.locker_id("l")).unwrap();
+        l.close();
+        corrupt_record(&b, id, "bad");
+
+        let skipping = block_on(b.lazy_locker_with::<String>(
+            "l",
+            LockerConfig::default().with_on_corrupt(OnCorrupt::Skip),
+        ))
+        .unwrap();
+        assert!(skipping.corrupt_keys().is_empty(), "nothing read yet");
+
+        assert!(block_on(skipping.get("bad")).is_err());
+        assert_eq!(skipping.corrupt_keys(), vec![b"bad".to_vec()]);
+        // The key is still indexed: it exists, it just cannot be read.
+        assert!(skipping.contains_key("bad"));
     }
 
     #[test]

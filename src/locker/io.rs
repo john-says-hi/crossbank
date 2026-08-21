@@ -82,7 +82,7 @@ impl Writer {
             self.flush_piece(&leftover).await?;
         }
         let mut ops = Vec::new();
-        if let Some(existing) = self.inner.fetch(&self.key).await? {
+        if let Some(existing) = self.inner.fetch(self.key.as_bytes()).await? {
             if super::chunk::is_pointer(&existing) {
                 ops.push(gc_ops(&ChunkPointer::parse(&existing)?));
             }
@@ -95,12 +95,12 @@ impl Writer {
         };
         ops.push(Op::Put {
             table: Table::Records,
-            key: self.inner.encode_key(&self.key),
+            key: self.inner.encode_key(self.key.as_bytes()),
             value: pointer.encode(),
         });
         self.inner.commit(ops).await?;
         self.inner.announce(Event::Put {
-            key: self.key.clone(),
+            key: self.key.clone().into_bytes(),
         });
         self.finished = true;
         Ok(())
@@ -208,7 +208,7 @@ impl LazyLocker<Vec<u8>> {
 
     /// Stream a stored value out. `None` if the key is missing.
     pub async fn reader(&self, key: &str) -> Result<Option<Reader>> {
-        let Some(raw) = self.inner.fetch(key).await? else {
+        let Some(raw) = self.inner.fetch(key.as_bytes()).await? else {
             return Ok(None);
         };
         if super::chunk::is_pointer(&raw) {

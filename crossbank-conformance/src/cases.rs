@@ -641,3 +641,49 @@ pub async fn a_deleted_locker_name_gets_a_fresh_id<H: Harness>(h: &H) -> Result<
     );
     Ok(())
 }
+
+/// Keys are bytes, not strings — and they sort bytewise on every backend.
+///
+/// The property a Hive-shaped Dart shim needs: Hive allows integer keys, and
+/// the only deterministic way to carry one is to encode it to bytes. IndexedDB
+/// orders binary keys bytewise exactly as `redb` and `BTreeMap` do, so this
+/// must come out identical everywhere.
+pub async fn binary_keys_round_trip_and_sort_bytewise<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker::<V>("l").await?;
+
+    let binary: [&[u8]; 3] = [&[0xFF], &[0x00], &[0x80, 0x01]];
+    for (i, key) in binary.iter().enumerate() {
+        locker.put_by(key, &v(&format!("b{i}"))).await?;
+    }
+    locker.put("a", &v("text")).await?;
+
+    for (i, key) in binary.iter().enumerate() {
+        assert_eq!(
+            locker.get_by(key).await?,
+            Some(v(&format!("b{i}"))),
+            "a binary key must read back under the bytes it was written with"
+        );
+        assert!(locker.contains_key_by(key));
+    }
+    assert_eq!(locker.get("a").await?, Some(v("text")));
+    assert_eq!(locker.len(), 4);
+
+    assert_eq!(
+        locker.keys_bytes(),
+        vec![vec![0x00], b"a".to_vec(), vec![0x80, 0x01], vec![0xFF],],
+        "keys must come back in bytewise order"
+    );
+
+    // The `&str` listing skips what it cannot spell, and says so rather than
+    // failing or pretending the locker holds only what it can name. Note that
+    // 0x00 IS valid UTF-8 — a one-character NUL string — so it survives the
+    // filter while 0xFF and 0x80 0x01 do not.
+    assert_eq!(locker.keys(), vec!["\u{0}".to_string(), "a".to_string()]);
+    assert!(locker.has_non_utf8_keys());
+
+    locker.delete_by(&[0xFF]).await?;
+    assert_eq!(locker.get_by(&[0xFF]).await?, None);
+    assert_eq!(locker.len(), 3);
+    Ok(())
+}

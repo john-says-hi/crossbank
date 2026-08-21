@@ -37,7 +37,7 @@ use crate::watch::Event;
 /// A locker whose values live in memory.
 pub struct Locker<T> {
     inner: Arc<Inner>,
-    values: Mutex<BTreeMap<String, Arc<T>>>,
+    values: Mutex<BTreeMap<Vec<u8>, Arc<T>>>,
 }
 
 impl<T> std::fmt::Debug for Locker<T> {
@@ -126,6 +126,11 @@ where
 
     /// Store a value. Writes are asynchronous even though reads are not.
     pub async fn put(&self, key: &str, value: T) -> Result<Arc<T>> {
+        self.put_by(key.as_bytes(), value).await
+    }
+
+    /// As [`Locker::put`], under a binary key.
+    pub async fn put_by(&self, key: &[u8], value: T) -> Result<Arc<T>> {
         self.inner.ensure_open()?;
         let sealed = self.inner.seal(&value)?;
         if sealed.len() > self.inner.config.max_inline {
@@ -146,11 +151,9 @@ where
         // not leave the resident copy claiming something that is not stored.
         let shared = Arc::new(value);
         if let Ok(mut guard) = self.values.lock() {
-            guard.insert(key.to_string(), shared.clone());
+            guard.insert(key.to_vec(), shared.clone());
         }
-        self.inner.announce(Event::Put {
-            key: key.to_string(),
-        });
+        self.inner.announce(Event::Put { key: key.to_vec() });
         Ok(shared)
     }
 
@@ -222,14 +225,17 @@ where
 
     /// Remove a key. Removing an absent key is not an error.
     pub async fn delete(&self, key: &str) -> Result<()> {
+        self.delete_by(key.as_bytes()).await
+    }
+
+    /// As [`Locker::delete`], under a binary key.
+    pub async fn delete_by(&self, key: &[u8]) -> Result<()> {
         self.inner.ensure_open()?;
         self.inner.commit(vec![self.inner.delete_op(key)]).await?;
         if let Ok(mut guard) = self.values.lock() {
             guard.remove(key);
         }
-        self.inner.announce(Event::Deleted {
-            key: key.to_string(),
-        });
+        self.inner.announce(Event::Deleted { key: key.to_vec() });
         Ok(())
     }
 
@@ -286,10 +292,20 @@ impl<T> Locker<T> {
 
     /// Read a value. Synchronous and infallible — the whole point of the type.
     pub fn get(&self, key: &str) -> Option<Arc<T>> {
+        self.get_by(key.as_bytes())
+    }
+
+    /// As [`Locker::get`], under a binary key.
+    pub fn get_by(&self, key: &[u8]) -> Option<Arc<T>> {
         self.values.lock().ok()?.get(key).cloned()
     }
 
     pub fn contains_key(&self, key: &str) -> bool {
+        self.contains_key_by(key.as_bytes())
+    }
+
+    /// As [`Locker::contains_key`], under a binary key.
+    pub fn contains_key_by(&self, key: &[u8]) -> bool {
         self.values
             .lock()
             .map(|v| v.contains_key(key))
@@ -304,20 +320,50 @@ impl<T> Locker<T> {
         self.len() == 0
     }
 
-    /// Every key, in byte order.
+    /// Every UTF-8 key, in byte order.
+    ///
+    /// Keys that are not valid UTF-8 are **skipped**, not reported as an
+    /// error — a listing must never fail because of a key it cannot spell.
+    /// [`Locker::has_non_utf8_keys`] says whether any were skipped, and
+    /// [`Locker::keys_bytes`] returns every key regardless.
     pub fn keys(&self) -> Vec<String> {
+        self.values
+            .lock()
+            .map(|v| v.keys().filter_map(|k| super::lazy::utf8(k)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Every key as raw bytes, in byte order. Includes non-UTF-8 keys.
+    pub fn keys_bytes(&self) -> Vec<Vec<u8>> {
         self.values
             .lock()
             .map(|v| v.keys().cloned().collect())
             .unwrap_or_default()
     }
 
-    /// Keys beginning with `prefix`, in byte order.
+    /// Whether this locker holds any key that [`Locker::keys`] cannot return.
+    /// Never panics and never errors.
+    pub fn has_non_utf8_keys(&self) -> bool {
+        self.values
+            .lock()
+            .map(|v| v.keys().any(|k| std::str::from_utf8(k).is_err()))
+            .unwrap_or(false)
+    }
+
+    /// Keys beginning with `prefix`, in byte order. UTF-8 keys only.
     pub fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+        self.keys_with_prefix_by(prefix.as_bytes())
+            .iter()
+            .filter_map(|k| super::lazy::utf8(k))
+            .collect()
+    }
+
+    /// As [`Locker::keys_with_prefix`], over a binary prefix.
+    pub fn keys_with_prefix_by(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
         self.values
             .lock()
             .map(|v| {
-                v.range(prefix.to_string()..)
+                v.range(prefix.to_vec()..)
                     .take_while(|(k, _)| k.starts_with(prefix))
                     .map(|(k, _)| k.clone())
                     .collect()
@@ -336,13 +382,26 @@ impl<T> Locker<T> {
     ///
     /// `Cleared` still arrives, because a clear affects every key.
     pub fn watch_key(&self, key: &str) -> crate::watch::EventStream {
-        self.inner
-            .watchers
-            .subscribe(Some(key.to_string()), crate::watch::DEFAULT_CAPACITY)
+        self.inner.watchers.subscribe(
+            Some(vec![key.as_bytes().to_vec()]),
+            crate::watch::DEFAULT_CAPACITY,
+        )
     }
 
-    /// A snapshot of every entry, in byte order.
+    /// A snapshot of every entry, in byte order. UTF-8 keys only.
     pub fn entries(&self) -> Vec<(String, Arc<T>)> {
+        self.values
+            .lock()
+            .map(|v| {
+                v.iter()
+                    .filter_map(|(k, val)| super::lazy::utf8(k).map(|k| (k, val.clone())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A snapshot of every entry as raw key bytes, in byte order.
+    pub fn entries_bytes(&self) -> Vec<(Vec<u8>, Arc<T>)> {
         self.values
             .lock()
             .map(|v| v.iter().map(|(k, val)| (k.clone(), val.clone())).collect())
@@ -571,6 +630,38 @@ mod tests {
         block_on(l.clear()).unwrap();
         assert_eq!(l.len(), 0);
         assert!(l.get("a").is_none());
+    }
+
+    #[test]
+    fn binary_keys_live_alongside_text_ones() {
+        let l = locker();
+        block_on(l.put_by(&[0xFF], "high".into())).unwrap();
+        block_on(l.put_by(&[0x00], "low".into())).unwrap();
+        block_on(l.put("a", "text".into())).unwrap();
+
+        assert_eq!(l.get_by(&[0xFF]).as_deref(), Some(&"high".to_string()));
+        assert!(l.contains_key_by(&[0x00]));
+        assert_eq!(
+            l.keys_bytes(),
+            vec![vec![0x00], b"a".to_vec(), vec![0xFF]],
+            "keys must be ordered bytewise"
+        );
+        // The str listing skips what it cannot spell, and admits to it. Note
+        // 0x00 IS valid UTF-8 (a NUL string), so it survives the filter.
+        assert_eq!(l.keys(), vec!["\u{0}".to_string(), "a".to_string()]);
+        assert!(l.has_non_utf8_keys());
+
+        block_on(l.delete_by(&[0xFF])).unwrap();
+        assert!(l.get_by(&[0xFF]).is_none());
+        assert_eq!(l.len(), 2);
+    }
+
+    #[test]
+    fn a_locker_of_text_keys_reports_no_binary_ones() {
+        let l = locker();
+        block_on(l.put("a", "1".into())).unwrap();
+        assert!(!l.has_non_utf8_keys());
+        assert_eq!(l.keys_bytes(), vec![b"a".to_vec()]);
     }
 
     #[test]

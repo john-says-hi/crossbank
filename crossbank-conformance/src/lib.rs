@@ -74,7 +74,7 @@ pub trait Harness {
 }
 
 /// Number of cases in the spec. The arity guard compares against this.
-pub const CASE_COUNT: usize = 28;
+pub const CASE_COUNT: usize = 29;
 
 /// Run `block_on` without pulling in an async runtime.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -117,6 +117,7 @@ macro_rules! __for_each_case {
         $crate::__emit!(delete_locker_removes_records_and_chunks, $make);
         $crate::__emit!(delete_locker_leaves_other_lockers_intact, $make);
         $crate::__emit!(a_deleted_locker_name_gets_a_fresh_id, $make);
+        $crate::__emit!(binary_keys_round_trip_and_sort_bytewise, $make);
     };
 }
 
@@ -234,5 +235,6 @@ macro_rules! __count_cases {
         $counter!(delete_locker_removes_records_and_chunks, ());
         $counter!(delete_locker_leaves_other_lockers_intact, ());
         $counter!(a_deleted_locker_name_gets_a_fresh_id, ());
+        $counter!(binary_keys_round_trip_and_sort_bytewise, ());
     };
 }

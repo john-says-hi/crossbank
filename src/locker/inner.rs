@@ -75,8 +75,8 @@ impl Inner {
         Ok(())
     }
 
-    pub(crate) fn encode_key(&self, key: &str) -> Vec<u8> {
-        key::encode(self.id, key)
+    pub(crate) fn encode_key(&self, key: &[u8]) -> Vec<u8> {
+        key::encode_bytes(self.id, key)
     }
 
     pub(crate) fn seal<T: Serialize>(&self, value: &T) -> Result<Vec<u8>> {
@@ -87,7 +87,7 @@ impl Inner {
         codec::decode(stored, &self.chain)
     }
 
-    pub(crate) fn delete_op(&self, key: &str) -> Op {
+    pub(crate) fn delete_op(&self, key: &[u8]) -> Op {
         Op::Delete {
             table: Table::Records,
             key: self.encode_key(key),
@@ -101,7 +101,7 @@ impl Inner {
         }
     }
 
-    pub(crate) async fn fetch(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn fetch(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let encoded = self.encode_key(key);
         self.backend.get(Table::Records, &encoded).await
     }
@@ -138,7 +138,7 @@ impl Inner {
 
     pub(crate) async fn load_value<T: serde::de::DeserializeOwned>(
         &self,
-        key: &str,
+        key: &[u8],
     ) -> Result<Option<T>> {
         match self.fetch(key).await? {
             None => Ok(None),
@@ -183,7 +183,7 @@ impl Inner {
     /// drop any previous chunked value under that key.
     pub(crate) async fn put_payload_ops(
         &self,
-        key: &str,
+        key: &[u8],
         payload: Vec<u8>,
         flags: u8,
     ) -> Result<Vec<Op>> {
@@ -233,7 +233,7 @@ impl Inner {
         Ok(ops)
     }
 
-    pub(crate) async fn delete_value_ops(&self, key: &str) -> Result<Vec<Op>> {
+    pub(crate) async fn delete_value_ops(&self, key: &[u8]) -> Result<Vec<Op>> {
         let mut ops = Vec::new();
         if let Some(existing) = self.fetch(key).await? {
             if is_pointer(&existing) {
@@ -274,18 +274,21 @@ impl Inner {
 
     /// Walk every record in a range, paging until exhausted.
     ///
+    /// The visitor receives the **raw user key bytes**, not a `String`: a key
+    /// need not be UTF-8, and a walk must never fail because one is not.
+    ///
     /// `want_values` is passed through so a keys-only walk does not make the
     /// backend read payloads it would immediately discard — which matters a
     /// great deal for a lazy locker opening over a large candle cache.
     pub(crate) async fn walk(
         &self,
-        start: Bound<&str>,
-        end: Bound<&str>,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
         reverse: bool,
         want_values: bool,
-        mut visit: impl FnMut(String, Option<Vec<u8>>) -> Result<()>,
+        mut visit: impl FnMut(Vec<u8>, Option<Vec<u8>>) -> Result<()>,
     ) -> Result<()> {
-        let mut range = key::encode_range(self.id, start, end);
+        let mut range = key::encode_range_bytes(self.id, start, end);
 
         loop {
             let page = self
@@ -300,8 +303,8 @@ impl Inner {
                 .await?;
 
             for (encoded, value) in &page.items {
-                let user_key = key::decode(self.id, encoded)?;
-                visit(user_key.to_string(), value.clone())?;
+                let user_key = key::decode_bytes(self.id, encoded)?;
+                visit(user_key.to_vec(), value.clone())?;
             }
 
             match page.resume {

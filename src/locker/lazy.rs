@@ -28,7 +28,7 @@ use crate::watch::Event;
 /// A locker that keeps only its key index in memory.
 pub struct LazyLocker<T> {
     pub(crate) inner: Arc<Inner>,
-    index: Mutex<BTreeSet<String>>,
+    index: Mutex<BTreeSet<Vec<u8>>>,
     _value: PhantomData<fn() -> T>,
 }
 
@@ -87,12 +87,22 @@ where
 
     /// Fetch and decode one value.
     pub async fn get(&self, key: &str) -> Result<Option<T>> {
+        self.get_by(key.as_bytes()).await
+    }
+
+    /// As [`LazyLocker::get`], under a binary key.
+    pub async fn get_by(&self, key: &[u8]) -> Result<Option<T>> {
         self.inner.ensure_open()?;
         self.inner.load_value(key).await
     }
 
     /// Store one value. Large payloads are split across the `chunks` table.
     pub async fn put(&self, key: &str, value: &T) -> Result<()> {
+        self.put_by(key.as_bytes(), value).await
+    }
+
+    /// As [`LazyLocker::put`], under a binary key.
+    pub async fn put_by(&self, key: &[u8], value: &T) -> Result<()> {
         self.inner.ensure_open()?;
         let _guard = self.inner.write_lock.lock().await;
         let payload = postcard::to_allocvec(value)
@@ -103,16 +113,19 @@ where
             .await?;
         self.inner.commit(ops).await?;
         self.touch_index(|i| {
-            i.insert(key.to_string());
+            i.insert(key.to_vec());
         });
-        self.inner.announce(Event::Put {
-            key: key.to_string(),
-        });
+        self.inner.announce(Event::Put { key: key.to_vec() });
         Ok(())
     }
 
     /// Remove one key. Removing an absent key is not an error.
     pub async fn delete(&self, key: &str) -> Result<()> {
+        self.delete_by(key.as_bytes()).await
+    }
+
+    /// As [`LazyLocker::delete`], under a binary key.
+    pub async fn delete_by(&self, key: &[u8]) -> Result<()> {
         self.inner.ensure_open()?;
         let _guard = self.inner.write_lock.lock().await;
         let ops = self.inner.delete_value_ops(key).await?;
@@ -120,9 +133,7 @@ where
         self.touch_index(|i| {
             i.remove(key);
         });
-        self.inner.announce(Event::Deleted {
-            key: key.to_string(),
-        });
+        self.inner.announce(Event::Deleted { key: key.to_vec() });
         Ok(())
     }
 
@@ -197,10 +208,28 @@ where
     }
 
     /// Values over a key range, in byte order.
+    ///
+    /// UTF-8 keys only — see [`LazyLocker::range_by`] for the binary form.
     pub async fn range<'a, R: RangeBounds<&'a str>>(&self, range: R) -> Result<Vec<(String, T)>> {
+        Ok(utf8_entries(
+            self.collect(
+                crate::key::as_bytes(deref_bound(range.start_bound())),
+                crate::key::as_bytes(deref_bound(range.end_bound())),
+                false,
+                None,
+            )
+            .await?,
+        ))
+    }
+
+    /// As [`LazyLocker::range`], over binary bounds, yielding raw key bytes.
+    pub async fn range_by<'a, R: RangeBounds<&'a [u8]>>(
+        &self,
+        range: R,
+    ) -> Result<Vec<(Vec<u8>, T)>> {
         self.collect(
-            deref_bound(range.start_bound()),
-            deref_bound(range.end_bound()),
+            deref_bound_bytes(range.start_bound()),
+            deref_bound_bytes(range.end_bound()),
             false,
             None,
         )
@@ -212,9 +241,25 @@ where
         &self,
         range: R,
     ) -> Result<Vec<(String, T)>> {
+        Ok(utf8_entries(
+            self.collect(
+                crate::key::as_bytes(deref_bound(range.start_bound())),
+                crate::key::as_bytes(deref_bound(range.end_bound())),
+                true,
+                None,
+            )
+            .await?,
+        ))
+    }
+
+    /// As [`LazyLocker::range_by`], descending.
+    pub async fn range_rev_by<'a, R: RangeBounds<&'a [u8]>>(
+        &self,
+        range: R,
+    ) -> Result<Vec<(Vec<u8>, T)>> {
         self.collect(
-            deref_bound(range.start_bound()),
-            deref_bound(range.end_bound()),
+            deref_bound_bytes(range.start_bound()),
+            deref_bound_bytes(range.end_bound()),
             true,
             None,
         )
@@ -223,20 +268,22 @@ where
 
     /// The first `limit` entries of a descending scan — "the latest N".
     pub async fn latest(&self, limit: usize) -> Result<Vec<(String, T)>> {
-        self.collect(Bound::Unbounded, Bound::Unbounded, true, Some(limit))
-            .await
+        Ok(utf8_entries(
+            self.collect(Bound::Unbounded, Bound::Unbounded, true, Some(limit))
+                .await?,
+        ))
     }
 
     async fn collect(
         &self,
-        start: Bound<&str>,
-        end: Bound<&str>,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
         reverse: bool,
         limit: Option<usize>,
-    ) -> Result<Vec<(String, T)>> {
+    ) -> Result<Vec<(Vec<u8>, T)>> {
         // Decode outside the visitor so a decode failure surfaces as an error
         // rather than being swallowed mid-walk.
-        let mut raw: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut raw: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let cap = limit.unwrap_or(usize::MAX);
 
         self.inner
@@ -311,23 +358,58 @@ impl<T> LazyLocker<T> {
 
     /// Synchronous: answered from the index without touching storage.
     pub fn contains_key(&self, key: &str) -> bool {
+        self.contains_key_by(key.as_bytes())
+    }
+
+    /// As [`LazyLocker::contains_key`], under a binary key.
+    pub fn contains_key_by(&self, key: &[u8]) -> bool {
         self.index.lock().map(|i| i.contains(key)).unwrap_or(false)
     }
 
-    /// Every key, in byte order.
+    /// Every UTF-8 key, in byte order.
+    ///
+    /// Keys that are not valid UTF-8 are **skipped**, not reported as an
+    /// error — a listing must never fail because of a key it cannot spell.
+    /// [`LazyLocker::has_non_utf8_keys`] says whether any were skipped, and
+    /// [`LazyLocker::keys_bytes`] returns every key regardless.
     pub fn keys(&self) -> Vec<String> {
+        self.index
+            .lock()
+            .map(|i| i.iter().filter_map(|k| utf8(k)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Every key as raw bytes, in byte order. Includes non-UTF-8 keys.
+    pub fn keys_bytes(&self) -> Vec<Vec<u8>> {
         self.index
             .lock()
             .map(|i| i.iter().cloned().collect())
             .unwrap_or_default()
     }
 
-    /// Keys beginning with `prefix`, in byte order.
+    /// Whether this locker holds any key that [`LazyLocker::keys`] cannot
+    /// return. Never panics and never errors.
+    pub fn has_non_utf8_keys(&self) -> bool {
+        self.index
+            .lock()
+            .map(|i| i.iter().any(|k| std::str::from_utf8(k).is_err()))
+            .unwrap_or(false)
+    }
+
+    /// Keys beginning with `prefix`, in byte order. UTF-8 keys only.
     pub fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+        self.keys_with_prefix_by(prefix.as_bytes())
+            .iter()
+            .filter_map(|k| utf8(k))
+            .collect()
+    }
+
+    /// As [`LazyLocker::keys_with_prefix`], over a binary prefix.
+    pub fn keys_with_prefix_by(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
         self.index
             .lock()
             .map(|i| {
-                i.range(prefix.to_string()..)
+                i.range(prefix.to_vec()..)
                     .take_while(|k| k.starts_with(prefix))
                     .cloned()
                     .collect()
@@ -346,12 +428,13 @@ impl<T> LazyLocker<T> {
     ///
     /// `Cleared` still arrives, because a clear affects every key.
     pub fn watch_key(&self, key: &str) -> crate::watch::EventStream {
-        self.inner
-            .watchers
-            .subscribe(Some(key.to_string()), crate::watch::DEFAULT_CAPACITY)
+        self.inner.watchers.subscribe(
+            Some(vec![key.as_bytes().to_vec()]),
+            crate::watch::DEFAULT_CAPACITY,
+        )
     }
 
-    fn touch_index(&self, f: impl FnOnce(&mut BTreeSet<String>)) {
+    fn touch_index(&self, f: impl FnOnce(&mut BTreeSet<Vec<u8>>)) {
         if let Ok(mut guard) = self.index.lock() {
             f(&mut guard);
         }
@@ -366,6 +449,29 @@ fn deref_bound<'a>(bound: Bound<&&'a str>) -> Bound<&'a str> {
         Bound::Included(s) => Bound::Included(s),
         Bound::Excluded(s) => Bound::Excluded(s),
     }
+}
+
+/// The `&[u8]` twin of [`deref_bound`].
+fn deref_bound_bytes<'a>(bound: Bound<&&'a [u8]>) -> Bound<&'a [u8]> {
+    match bound {
+        Bound::Unbounded => Bound::Unbounded,
+        Bound::Included(s) => Bound::Included(s),
+        Bound::Excluded(s) => Bound::Excluded(s),
+    }
+}
+
+/// A key as a `String`, or `None` when it is not UTF-8.
+pub(crate) fn utf8(key: &[u8]) -> Option<String> {
+    std::str::from_utf8(key).ok().map(str::to_string)
+}
+
+/// Drop the entries whose keys are not UTF-8. Used by the `&str` listing
+/// methods, which cannot spell a binary key.
+fn utf8_entries<T>(entries: Vec<(Vec<u8>, T)>) -> Vec<(String, T)> {
+    entries
+        .into_iter()
+        .filter_map(|(k, v)| utf8(&k).map(|k| (k, v)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -786,6 +892,59 @@ mod tests {
             block_on(l.put(&format!("k{i:04}"), &"v".to_string())).unwrap();
         }
         assert_eq!(block_on(l.range(..)).unwrap().len(), 600);
+    }
+
+    #[test]
+    fn binary_keys_round_trip_and_are_listed_separately() {
+        let l = locker();
+        block_on(l.put_by(&[0xFF], &"high".to_string())).unwrap();
+        block_on(l.put_by(&[0x80, 0x01], &"mid".to_string())).unwrap();
+        block_on(l.put("a", &"text".to_string())).unwrap();
+
+        assert_eq!(block_on(l.get_by(&[0xFF])).unwrap(), Some("high".into()));
+        assert!(l.contains_key_by(&[0x80, 0x01]));
+        assert_eq!(
+            l.keys_bytes(),
+            vec![b"a".to_vec(), vec![0x80, 0x01], vec![0xFF]]
+        );
+        assert_eq!(l.keys(), vec!["a".to_string()]);
+        assert!(l.has_non_utf8_keys());
+
+        block_on(l.delete_by(&[0xFF])).unwrap();
+        assert!(!l.contains_key_by(&[0xFF]));
+    }
+
+    #[test]
+    fn a_binary_range_yields_raw_key_bytes() {
+        let l = locker();
+        for k in [&[0x00u8][..], &[0x80][..], &[0xFF][..]] {
+            block_on(l.put_by(k, &"v".to_string())).unwrap();
+        }
+        let low: &[u8] = &[0x00];
+        let high: &[u8] = &[0xFF];
+        let got = block_on(l.range_by(low..high)).unwrap();
+        let keys: Vec<Vec<u8>> = got.into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec![vec![0x00], vec![0x80]]);
+
+        // The str range refuses to invent names for binary keys. 0x00 is a
+        // legal UTF-8 NUL string, so it is the only one that survives.
+        let named: Vec<String> = block_on(l.range(..))
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(named, vec!["\u{0}".to_string()]);
+    }
+
+    #[test]
+    fn a_binary_key_watcher_sees_bytes_not_a_string() {
+        let l = locker();
+        let mut events = l.watch();
+        block_on(l.put_by(&[0xFF], &"v".to_string())).unwrap();
+
+        let event = block_on(events.next()).unwrap();
+        assert_eq!(event.key_bytes(), &[0xFF]);
+        assert_eq!(event.key(), None, "a binary key has no UTF-8 view");
     }
 
     #[test]

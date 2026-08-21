@@ -32,9 +32,13 @@ pub const DEFAULT_CAPACITY: usize = 64;
 #[non_exhaustive]
 pub enum Event {
     /// A key was written or overwritten.
-    Put { key: String },
+    ///
+    /// The key is raw bytes, because a crossbank key need not be UTF-8. Use
+    /// [`Event::key`] for the `&str` view and [`Event::key_bytes`] for the
+    /// key itself.
+    Put { key: Vec<u8> },
     /// A key was removed.
-    Deleted { key: String },
+    Deleted { key: Vec<u8> },
     /// Every key was removed at once.
     Cleared,
     /// The subscriber fell behind and `skipped` events were dropped.
@@ -45,23 +49,37 @@ pub enum Event {
 }
 
 impl Event {
-    /// The key this event concerns, if it concerns one.
+    /// The key this event concerns as raw bytes, or an empty slice for the
+    /// events that concern no single key.
+    pub fn key_bytes(&self) -> &[u8] {
+        match self {
+            Self::Put { key } | Self::Deleted { key } => key,
+            Self::Cleared | Self::Lagged { .. } => &[],
+        }
+    }
+
+    /// The key this event concerns, if it concerns one **and** that key is
+    /// valid UTF-8.
+    ///
+    /// `None` therefore means either "this event has no key" or "its key is
+    /// binary". A subscriber that stores binary keys should read
+    /// [`Event::key_bytes`] and branch on the variant instead.
     pub fn key(&self) -> Option<&str> {
         match self {
-            Self::Put { key } | Self::Deleted { key } => Some(key),
+            Self::Put { key } | Self::Deleted { key } => std::str::from_utf8(key).ok(),
             Self::Cleared | Self::Lagged { .. } => None,
         }
     }
 
-    /// Whether a subscriber filtered to `key` should receive this event.
+    /// Whether a subscriber filtered to `keys` should receive this event.
     ///
     /// `Cleared` and `Lagged` always pass: a clear affects every key, and a
     /// gap notice must never itself be dropped.
-    fn matches(&self, filter: Option<&str>) -> bool {
+    fn matches(&self, filter: Option<&[Vec<u8>]>) -> bool {
         match (filter, self) {
             (None, _) => true,
             (Some(_), Self::Cleared | Self::Lagged { .. }) => true,
-            (Some(f), other) => other.key() == Some(f),
+            (Some(keys), other) => keys.iter().any(|k| k.as_slice() == other.key_bytes()),
         }
     }
 }
@@ -93,7 +111,7 @@ impl Stream for EventStream {
 
 struct Subscriber {
     sender: mpsc::Sender<Event>,
-    filter: Option<String>,
+    filter: Option<Vec<Vec<u8>>>,
     skipped: u64,
 }
 
@@ -115,7 +133,7 @@ impl std::fmt::Debug for Watchers {
 }
 
 impl Watchers {
-    pub(crate) fn subscribe(&self, filter: Option<String>, capacity: usize) -> EventStream {
+    pub(crate) fn subscribe(&self, filter: Option<Vec<Vec<u8>>>, capacity: usize) -> EventStream {
         let (sender, receiver) = mpsc::channel(capacity);
         if let Ok(mut guard) = self.subscribers.lock() {
             guard.push(Subscriber {
@@ -180,8 +198,12 @@ mod tests {
 
     fn put(key: &str) -> Event {
         Event::Put {
-            key: key.to_string(),
+            key: key.as_bytes().to_vec(),
         }
+    }
+
+    fn filter(keys: &[&str]) -> Option<Vec<Vec<u8>>> {
+        Some(keys.iter().map(|k| k.as_bytes().to_vec()).collect())
     }
 
     #[test]
@@ -199,7 +221,7 @@ mod tests {
     #[test]
     fn a_key_filter_excludes_other_keys() {
         let w = Watchers::default();
-        let mut rx = w.subscribe(Some("wanted".into()), DEFAULT_CAPACITY);
+        let mut rx = w.subscribe(filter(&["wanted"]), DEFAULT_CAPACITY);
 
         w.broadcast(&put("ignored"));
         w.broadcast(&put("wanted"));
@@ -212,7 +234,7 @@ mod tests {
         // A clear affects every key, so a per-key subscriber must hear about it
         // or it will keep believing a value it no longer has.
         let w = Watchers::default();
-        let mut rx = w.subscribe(Some("k".into()), DEFAULT_CAPACITY);
+        let mut rx = w.subscribe(filter(&["k"]), DEFAULT_CAPACITY);
 
         w.broadcast(&Event::Cleared);
         assert_eq!(block_on(rx.next()), Some(Event::Cleared));
@@ -277,14 +299,32 @@ mod tests {
     #[test]
     fn event_key_reports_only_where_it_makes_sense() {
         assert_eq!(put("k").key(), Some("k"));
-        assert_eq!(
-            Event::Deleted {
-                key: "k".to_string()
-            }
-            .key(),
-            Some("k")
-        );
+        assert_eq!(Event::Deleted { key: b"k".to_vec() }.key(), Some("k"));
         assert_eq!(Event::Cleared.key(), None);
         assert_eq!(Event::Lagged { skipped: 3 }.key(), None);
+    }
+
+    #[test]
+    fn a_binary_key_has_bytes_but_no_utf8_view() {
+        // key() must not panic or lie about a key it cannot spell.
+        let e = Event::Put {
+            key: vec![0xFF, 0x00],
+        };
+        assert_eq!(e.key_bytes(), &[0xFF, 0x00]);
+        assert_eq!(e.key(), None);
+        assert_eq!(Event::Cleared.key_bytes(), b"");
+    }
+
+    #[test]
+    fn a_multi_key_filter_passes_any_of_its_keys() {
+        let w = Watchers::default();
+        let mut rx = w.subscribe(filter(&["a", "b"]), DEFAULT_CAPACITY);
+
+        w.broadcast(&put("c"));
+        w.broadcast(&put("b"));
+        w.broadcast(&put("a"));
+
+        assert_eq!(block_on(rx.next()), Some(put("b")));
+        assert_eq!(block_on(rx.next()), Some(put("a")));
     }
 }

@@ -43,12 +43,12 @@ use super::inner::Inner;
 /// One staged mutation.
 pub(crate) enum Staged<T> {
     Put {
-        key: String,
+        key: Vec<u8>,
         bytes: Vec<u8>,
         value: Arc<T>,
     },
     Delete {
-        key: String,
+        key: Vec<u8>,
     },
     Clear,
 }
@@ -106,9 +106,14 @@ where
     /// Stage a write. Encoding happens now, on this thread, so no user code
     /// ever runs while a backend transaction is open.
     pub fn put(&self, key: &str, value: T) -> Result<()> {
+        self.put_by(key.as_bytes(), value)
+    }
+
+    /// As [`Transaction::put`], under a binary key.
+    pub fn put_by(&self, key: &[u8], value: T) -> Result<()> {
         let bytes = self.inner.seal(&value)?;
         self.push(Staged::Put {
-            key: key.to_string(),
+            key: key.to_vec(),
             bytes,
             value: Arc::new(value),
         })
@@ -116,9 +121,12 @@ where
 
     /// Stage a delete. Deleting an absent key is not an error.
     pub fn delete(&self, key: &str) -> Result<()> {
-        self.push(Staged::Delete {
-            key: key.to_string(),
-        })
+        self.delete_by(key.as_bytes())
+    }
+
+    /// As [`Transaction::delete`], under a binary key.
+    pub fn delete_by(&self, key: &[u8]) -> Result<()> {
+        self.push(Staged::Delete { key: key.to_vec() })
     }
 
     /// Stage a clear of the whole locker.
@@ -128,6 +136,11 @@ where
 
     /// Read, seeing this transaction's own staged writes first.
     pub async fn get(&self, key: &str) -> Result<Option<T>> {
+        self.get_by(key.as_bytes()).await
+    }
+
+    /// As [`Transaction::get`], under a binary key.
+    pub async fn get_by(&self, key: &[u8]) -> Result<Option<T>> {
         if let Some(staged) = self.staged_view(key)? {
             return staged.map(|bytes| self.inner.open(&bytes)).transpose();
         }
@@ -145,7 +158,7 @@ where
 
     /// `None` when this transaction has not touched the key at all;
     /// `Some(None)` when it has deleted or cleared it.
-    fn staged_view(&self, key: &str) -> Result<Option<Option<Vec<u8>>>> {
+    fn staged_view(&self, key: &[u8]) -> Result<Option<Option<Vec<u8>>>> {
         let guard = self
             .staged
             .lock()

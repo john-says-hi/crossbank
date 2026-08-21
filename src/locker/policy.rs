@@ -38,6 +38,12 @@ pub struct LockerConfig {
     pub eager_budget: u64,
 
     pub policy: Policy,
+
+    /// Size of one chunk for a lazy value that does not fit inline.
+    ///
+    /// Peak memory on the streaming path is a small multiple of this, not of
+    /// the value. 256 KiB is the starting default; benches may move it.
+    pub chunk_size: usize,
 }
 
 impl Default for LockerConfig {
@@ -46,6 +52,7 @@ impl Default for LockerConfig {
             max_inline: 256 * 1024,
             eager_budget: 32 * 1024 * 1024,
             policy: Policy::Precious,
+            chunk_size: 256 * 1024,
         }
     }
 }
@@ -65,6 +72,11 @@ impl LockerConfig {
         self.policy = policy;
         self
     }
+
+    pub fn with_chunk_size(mut self, bytes: usize) -> Self {
+        self.chunk_size = bytes.max(1);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -77,6 +89,7 @@ mod tests {
         assert_eq!(c.max_inline, 256 * 1024);
         assert_eq!(c.eager_budget, 32 * 1024 * 1024);
         assert_eq!(c.policy, Policy::Precious);
+        assert_eq!(c.chunk_size, 256 * 1024);
     }
 
     #[test]
@@ -91,9 +104,11 @@ mod tests {
         let c = LockerConfig::default()
             .with_max_inline(1024)
             .with_eager_budget(2048)
-            .with_policy(Policy::Evictable { max_bytes: 4096 });
+            .with_policy(Policy::Evictable { max_bytes: 4096 })
+            .with_chunk_size(64);
         assert_eq!(c.max_inline, 1024);
         assert_eq!(c.eager_budget, 2048);
         assert_eq!(c.policy, Policy::Evictable { max_bytes: 4096 });
+        assert_eq!(c.chunk_size, 64);
     }
 }

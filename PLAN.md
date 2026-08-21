@@ -1,10 +1,12 @@
 # crossbank — build plan
 
-**Status: M3 complete.** 181 tests green natively — including the full conformance suite
-against **both** the memory and `redb` backends, plus crash-and-reopen tests that kill a real
-process. The same 18-case suite now also passes against **IndexedDB** in Chrome and Firefox
-on both wasm lanes (plain and atomics). **Data now persists on desktop, mobile, and the
-web.** M4 (chunking / streaming Writer/Reader) is next.
+**Status: M4 complete.** 192 tests green natively — the full conformance suite against
+**both** the memory and `redb` backends, crash-and-reopen tests that kill a real process, and
+a peak-RSS test that streams 8 MiB through 64 KiB chunks. The same 22-case suite passes
+against **IndexedDB** in Chrome and Firefox on both wasm lanes (plain and atomics), including
+the four chunking cases. **Data persists on desktop, mobile, and the web, and large lazy
+values no longer have to fit in RAM.** M5 (quota, eviction, coherence) is next; `persist()`
+lands early as its first piece.
 
 > Resuming this project? Start with **[RESUME_HERE.md](RESUME_HERE.md)** — purpose, working
 > agreements, current state, and the known traps. This file is the technical plan.
@@ -298,9 +300,17 @@ atomics. `Bank::open` wires `Location::{Memory, Path, Web}`. The persistence
 case was negative-controlled: a harness that lied about `persists_across_open`
 went red in Firefox before the honest cap was restored.
 
-**M4 — Big data.** Per-chunk framing, streaming Writer/Reader, orphan-chunk GC, peak-RSS
-assertions. *Exit criterion is bounded peak memory, not raw size — "multi-GB" is not testable
-on a 4 GiB target, "peak RSS under N × chunk_size" is.*
+**M4 — Big data. ✅ COMPLETE.** A lazy value whose postcard payload exceeds
+`LockerConfig::chunk_size` is split into the `chunks` table behind a 26-byte `CCHK` pointer
+in `records`; each chunk is sealed through the filter chain on its own. `put`, `get`, `delete`,
+`clear`, `transact` and range reads all see through the pointer. `LazyLocker<Vec<u8>>::writer`
+/ `reader` stream without materialising the value; `Writer` lives outside `transact()`, publishes
+the pointer only at `finish()`, and `abort()` GCs its orphans, so an unfinished write leaves
+the previous complete value readable. Overwrite and delete `DeleteRange` the old chunk prefix.
+Exit criterion met: `tests/peak_rss.rs` streams 8 MiB in 64 KiB chunks and asserts `VmHWM`
+growth stays far below the value size. Four new conformance cases run on every backend and
+were negative-controlled (a broken `abort()` went red in Firefox before being restored).
+Eager lockers still refuse oversized values.
 
 **M5 — Quota, eviction, coherence.** `persist()` (explicit, never automatic), quota API,
 byte-budget LRU on a logical counter, BroadcastChannel coherence carrying small values
@@ -349,17 +359,49 @@ ramp, not IEEE floats. Do not drop LZ4 from the default chain on this evidence.
 Web timings (`tests/bench_web.rs`, ignored) land the same named workloads
 against IndexedDB; they are not in this table yet.
 
+### M4 numbers (2026-08-20, same machine)
+
+**Chunk-size sweep** — one 8 MiB value, `LazyLocker::put` then `get`, redb, default chain:
+
+| `chunk_size` | time | throughput |
+|---|---|---|
+| **256 KiB** | 14.96 ms | **535 MiB/s** |
+| 1 MiB | 15.38 ms | 520 MiB/s |
+| 4 MiB | 16.27 ms | 492 MiB/s |
+| 8 MiB | 21.94 ms | 365 MiB/s |
+
+Smaller chunks win: per-chunk LZ4 + CRC over a bounded buffer beats one large seal, and
+256 KiB also keeps peak memory the smallest. **Default stays 256 KiB.** The 8 MiB guess is
+retired.
+
+**LZ4 on dense `f64`** — 1 MiB payload, one put + one get, redb:
+
+| payload | chain | time |
+|---|---|---|
+| f64 OHLCV candles (random-walk mantissas) | default (LZ4+CRC) | 7.24 ms |
+| f64 OHLCV candles | `FilterChain::raw()` | 7.21 ms |
+| compressible ramp | default (LZ4+CRC) | 4.02 ms |
+| compressible ramp | `FilterChain::raw()` | 7.41 ms |
+
+LZ4 is ~1.0× on candle-shaped bytes — it neither helps nor measurably hurts — and 1.8× faster
+end-to-end on compressible data (less to write). **LZ4 stays on by default.** A consumer with
+a known-incompressible workload can open its bank with `FilterChain::raw()`; making the chain
+selectable per locker rather than per bank is noted as an M6 ergonomics item, not a default
+change.
+
+Reproduce: `cargo bench --bench kv -- "chunk_sweep|lz4_f64"`.
+
 ---
 
 ## Open questions
 
-- Chunk size default — 8 MiB is a guess; M4 torture tests pick the real number.
-- Whether the streaming `Writer` should participate in transactions at all. Leaning no: it
-  spans minutes and many commits.
+- ~~Chunk size default~~ — **resolved in M4: 256 KiB**, measured (see Performance).
+- ~~Whether the streaming `Writer` should participate in transactions~~ — **resolved: no.**
+  It spans many commits; the pointer swap at `finish()` is the only atomic step.
 - Whether `indexed-db`'s age (latest stable Jan 2025, 0.5.0 yanked) forces hand-rolled
   `web-sys` bindings. Revisit if M3 hits a wall.
-- Whether LZ4 earns its CPU on f64 candle data. Probably not — make the filter chain
-  per-locker and ship a no-op codec as a first-class option.
+- ~~Whether LZ4 earns its CPU on f64 candle data~~ — **measured in M4: ~1.0×, free.** It
+  stays on. `FilterChain::raw()` is the opt-out; per-locker chain selection is an M6 nicety.
 
 ---
 

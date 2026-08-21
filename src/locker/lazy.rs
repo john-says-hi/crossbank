@@ -26,7 +26,7 @@ use crate::watch::Event;
 
 /// A locker that keeps only its key index in memory.
 pub struct LazyLocker<T> {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
     index: Mutex<BTreeSet<String>>,
     _value: PhantomData<fn() -> T>,
 }
@@ -85,16 +85,19 @@ where
 
     /// Fetch and decode one value.
     pub async fn get(&self, key: &str) -> Result<Option<T>> {
-        match self.inner.fetch(key).await? {
-            Some(raw) => Ok(Some(self.inner.open(&raw)?)),
-            None => Ok(None),
-        }
+        self.inner.load_value(key).await
     }
 
-    /// Store one value.
+    /// Store one value. Large payloads are split across the `chunks` table.
     pub async fn put(&self, key: &str, value: &T) -> Result<()> {
-        let op = self.inner.put_op(key, value)?;
-        self.inner.commit(vec![op]).await?;
+        let _guard = self.inner.write_lock.lock().await;
+        let payload = postcard::to_allocvec(value)
+            .map_err(|e| Error::Filter(format!("postcard serialisation failed: {e}")))?;
+        let ops = self
+            .inner
+            .put_payload_ops(key, payload, super::chunk::FLAG_POSTCARD)
+            .await?;
+        self.inner.commit(ops).await?;
         self.touch_index(|i| {
             i.insert(key.to_string());
         });
@@ -106,7 +109,9 @@ where
 
     /// Remove one key. Removing an absent key is not an error.
     pub async fn delete(&self, key: &str) -> Result<()> {
-        self.inner.commit(vec![self.inner.delete_op(key)]).await?;
+        let _guard = self.inner.write_lock.lock().await;
+        let ops = self.inner.delete_value_ops(key).await?;
+        self.inner.commit(ops).await?;
         self.touch_index(|i| {
             i.remove(key);
         });
@@ -118,7 +123,9 @@ where
 
     /// Remove everything in this locker, and nothing outside it.
     pub async fn clear(&self) -> Result<()> {
-        self.inner.commit(vec![self.inner.clear_op()]).await?;
+        let _guard = self.inner.write_lock.lock().await;
+        let ops = self.inner.clear_value_ops().await?;
+        self.inner.commit(ops).await?;
         self.touch_index(|i| i.clear());
         self.inner.announce(Event::Cleared);
         Ok(())
@@ -238,9 +245,11 @@ where
             })
             .await?;
 
-        raw.into_iter()
-            .map(|(k, bytes)| self.inner.open(&bytes).map(|v| (k, v)))
-            .collect()
+        let mut out = Vec::with_capacity(raw.len());
+        for (k, bytes) in raw {
+            out.push((k, self.inner.decode_record(&bytes).await?));
+        }
+        Ok(out)
     }
 }
 

@@ -11,9 +11,13 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::backend::api::{Backend, Op, ScanRequest, Table};
 use crate::codec::{self, FilterChain};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::key::{self, LockerId};
 
+use super::chunk::{
+    bump_counter_ops, chunk_key, gc_ops, is_pointer, parse_counter, ChunkPointer, FLAG_POSTCARD,
+    FLAG_RAW,
+};
 use super::policy::LockerConfig;
 use crate::watch::{Event, Watchers};
 
@@ -56,14 +60,6 @@ impl Inner {
         codec::decode(stored, &self.chain)
     }
 
-    pub(crate) fn put_op<T: Serialize>(&self, key: &str, value: &T) -> Result<Op> {
-        Ok(Op::Put {
-            table: Table::Records,
-            key: self.encode_key(key),
-            value: self.seal(value)?,
-        })
-    }
-
     pub(crate) fn delete_op(&self, key: &str) -> Op {
         Op::Delete {
             table: Table::Records,
@@ -85,6 +81,162 @@ impl Inner {
 
     pub(crate) async fn commit(&self, ops: Vec<Op>) -> Result<()> {
         self.backend.commit(ops).await
+    }
+
+    /// Decode a stored record into postcard (or raw) payload bytes.
+    pub(crate) async fn load_payload(&self, stored: &[u8]) -> Result<Vec<u8>> {
+        if is_pointer(stored) {
+            let pointer = ChunkPointer::parse(stored)?;
+            self.read_chunks(&pointer).await
+        } else {
+            self.chain.open(stored)
+        }
+    }
+
+    pub(crate) async fn decode_record<T: serde::de::DeserializeOwned>(
+        &self,
+        stored: &[u8],
+    ) -> Result<T> {
+        let payload = self.load_payload(stored).await?;
+        if is_pointer(stored) && ChunkPointer::parse(stored)?.flags == FLAG_RAW {
+            let wrapped = postcard::to_allocvec(&payload)
+                .map_err(|e| Error::Filter(format!("postcard wrap of raw chunks failed: {e}")))?;
+            postcard::from_bytes(&wrapped)
+                .map_err(|e| Error::Corrupt(format!("raw chunk reconstruct failed: {e}")))
+        } else {
+            postcard::from_bytes(&payload)
+                .map_err(|e| Error::Corrupt(format!("postcard deserialisation failed: {e}")))
+        }
+    }
+
+    pub(crate) async fn load_value<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>> {
+        match self.fetch(key).await? {
+            None => Ok(None),
+            Some(raw) => Ok(Some(self.decode_record(&raw).await?)),
+        }
+    }
+
+    async fn read_chunks(&self, pointer: &ChunkPointer) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(pointer.total_len as usize);
+        for seq in 0..pointer.n_chunks {
+            let key = chunk_key(pointer.value_id, seq);
+            let sealed = self
+                .backend
+                .get(Table::Chunks, &key)
+                .await?
+                .ok_or_else(|| {
+                    Error::Corrupt(format!("missing chunk {seq} of {}", pointer.value_id))
+                })?;
+            let piece = self.chain.open(&sealed)?;
+            out.extend_from_slice(&piece);
+        }
+        if out.len() as u64 != pointer.total_len {
+            return Err(Error::Corrupt(format!(
+                "chunked value declared {} bytes, reassembled {}",
+                pointer.total_len,
+                out.len()
+            )));
+        }
+        Ok(out)
+    }
+
+    pub(crate) async fn next_value_id(&self) -> Result<(u64, Op)> {
+        let raw = self
+            .backend
+            .get(Table::Meta, super::chunk::next_value_id_key())
+            .await?;
+        let current = parse_counter(raw.as_deref())?;
+        bump_counter_ops(current)
+    }
+
+    /// Ops to store `postcard` bytes at `key`, chunking when needed, and to
+    /// drop any previous chunked value under that key.
+    pub(crate) async fn put_payload_ops(
+        &self,
+        key: &str,
+        payload: Vec<u8>,
+        flags: u8,
+    ) -> Result<Vec<Op>> {
+        let mut ops = Vec::new();
+        if let Some(existing) = self.fetch(key).await? {
+            if is_pointer(&existing) {
+                ops.push(gc_ops(&ChunkPointer::parse(&existing)?));
+            }
+        }
+
+        if payload.len() <= self.config.chunk_size && flags == FLAG_POSTCARD {
+            ops.push(Op::Put {
+                table: Table::Records,
+                key: self.encode_key(key),
+                value: self.chain.seal(&payload)?,
+            });
+            return Ok(ops);
+        }
+
+        let (value_id, bump) = self.next_value_id().await?;
+        ops.push(bump);
+
+        let chunk_size = self.config.chunk_size;
+        let mut seq = 0u32;
+        for piece in payload.chunks(chunk_size) {
+            ops.push(Op::Put {
+                table: Table::Chunks,
+                key: chunk_key(value_id, seq),
+                value: self.chain.seal(piece)?,
+            });
+            seq = seq
+                .checked_add(1)
+                .ok_or_else(|| Error::backend("chunk sequence space is exhausted"))?;
+        }
+
+        let pointer = ChunkPointer {
+            value_id,
+            n_chunks: seq,
+            total_len: payload.len() as u64,
+            flags,
+        };
+        ops.push(Op::Put {
+            table: Table::Records,
+            key: self.encode_key(key),
+            value: pointer.encode(),
+        });
+        Ok(ops)
+    }
+
+    pub(crate) async fn delete_value_ops(&self, key: &str) -> Result<Vec<Op>> {
+        let mut ops = Vec::new();
+        if let Some(existing) = self.fetch(key).await? {
+            if is_pointer(&existing) {
+                ops.push(gc_ops(&ChunkPointer::parse(&existing)?));
+            }
+        }
+        ops.push(self.delete_op(key));
+        Ok(ops)
+    }
+
+    /// Clear this locker's records and every chunk those records pointed at.
+    pub(crate) async fn clear_value_ops(&self) -> Result<Vec<Op>> {
+        let mut ops = Vec::new();
+        self.walk(
+            Bound::Unbounded,
+            Bound::Unbounded,
+            false,
+            true,
+            |_, value| {
+                if let Some(raw) = value {
+                    if is_pointer(&raw) {
+                        ops.push(gc_ops(&ChunkPointer::parse(&raw)?));
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        ops.push(self.clear_op());
+        Ok(ops)
     }
 
     /// Announce a change. Called only AFTER a commit lands, so a subscriber is

@@ -74,7 +74,7 @@ pub trait Harness {
 }
 
 /// Number of cases in the spec. The arity guard compares against this.
-pub const CASE_COUNT: usize = 18;
+pub const CASE_COUNT: usize = 22;
 
 /// Run `block_on` without pulling in an async runtime.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -107,6 +107,10 @@ macro_rules! __for_each_case {
         $crate::__emit!(watch_reports_writes_and_deletes, $make);
         $crate::__emit!(reopen_matches_declared_persistence, $make);
         $crate::__emit!(schema_mismatch_is_refused, $make);
+        $crate::__emit!(a_value_larger_than_the_chunk_size_round_trips, $make);
+        $crate::__emit!(overwriting_a_chunked_value_replaces_it, $make);
+        $crate::__emit!(deleting_a_chunked_value_removes_it, $make);
+        $crate::__emit!(unfinished_writer_leaves_the_previous_value, $make);
     };
 }
 
@@ -214,5 +218,9 @@ macro_rules! __count_cases {
         $counter!(watch_reports_writes_and_deletes, ());
         $counter!(reopen_matches_declared_persistence, ());
         $counter!(schema_mismatch_is_refused, ());
+        $counter!(a_value_larger_than_the_chunk_size_round_trips, ());
+        $counter!(overwriting_a_chunked_value_replaces_it, ());
+        $counter!(deleting_a_chunked_value_removes_it, ());
+        $counter!(unfinished_writer_leaves_the_previous_value, ());
     };
 }

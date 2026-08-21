@@ -131,10 +131,7 @@ where
         if let Some(staged) = self.staged_view(key)? {
             return staged.map(|bytes| self.inner.open(&bytes)).transpose();
         }
-        match self.inner.fetch(key).await? {
-            Some(raw) => Ok(Some(self.inner.open(&raw)?)),
-            None => Ok(None),
-        }
+        self.inner.load_value(key).await
     }
 
     /// How many mutations are queued.

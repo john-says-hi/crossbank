@@ -9,7 +9,7 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use crossbank::backend::{Backend, MemoryBackend, Op, Table};
 use crossbank::codec::FilterChain;
-use crossbank::{Bank, BankConfig, Locker, LazyLocker};
+use crossbank::{Bank, BankConfig, LazyLocker, Locker, LockerConfig};
 use futures::executor::block_on;
 use redb::{Database, TableDefinition};
 use tempfile::TempDir;
@@ -303,6 +303,94 @@ fn backend_put(c: &mut Criterion) {
     group.finish();
 }
 
+const BIG_BYTES: usize = 8 * 1024 * 1024;
+
+/// Chunk-size sweep over one 8 MiB value: write + read back, redb, default
+/// chain. Answers PLAN.md's "what should the default chunk size be".
+fn chunk_sweep(c: &mut Criterion) {
+    let mut group = c.benchmark_group("chunk_sweep");
+    group.throughput(Throughput::Bytes(BIG_BYTES as u64));
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+
+    let value = payload(BIG_BYTES, 3);
+    for chunk_kib in [256usize, 1024, 4096, 8192] {
+        group.bench_function(
+            BenchmarkId::new("redb_put_get", format!("{chunk_kib}KiB")),
+            |b| {
+                b.iter_with_setup(redb_bank, |native| {
+                    let locker = wait(native.bank.lazy_locker_with::<Vec<u8>>(
+                        "big",
+                        LockerConfig::default().with_chunk_size(chunk_kib * 1024),
+                    ))
+                    .unwrap();
+                    wait(locker.put("k", &value)).unwrap();
+                    let got = wait(locker.get("k")).unwrap().unwrap();
+                    criterion::black_box(got.len());
+                    native
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Candle-shaped payload: dense IEEE-754 f64 OHLCV rows as little-endian
+/// bytes, prices random-walking so the mantissas are high-entropy.
+fn f64_candles(rows: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rows * 6 * 8);
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut price = 42_000.0f64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    for i in 0..rows {
+        let ts = 1_700_000_000.0 + i as f64 * 60.0;
+        let o = price;
+        let h = o * (1.0 + next() * 0.002);
+        let l = o * (1.0 - next() * 0.002);
+        price = l + (h - l) * next();
+        let v = next() * 1000.0;
+        for f in [ts, o, h, l, price, v] {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Does LZ4 earn its CPU on candle data? Same 1 MiB payload, f64 candles vs
+/// a compressible ramp, default chain vs raw, redb, one put + one get.
+fn lz4_f64(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lz4_f64");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(4));
+
+    let candles = f64_candles(1024 * 1024 / 48);
+    let ramp = payload(candles.len(), 5);
+    group.throughput(Throughput::Bytes(candles.len() as u64));
+
+    for (payload_label, data) in [("f64_candles", &candles), ("ramp", &ramp)] {
+        for (chain_label, factory) in [
+            ("default_lz4", redb_bank as fn() -> NativeBank),
+            ("raw", redb_raw_chain as fn() -> NativeBank),
+        ] {
+            group.bench_function(BenchmarkId::new(chain_label, payload_label), |b| {
+                b.iter_with_setup(factory, |native| {
+                    let locker = wait(native.bank.lazy_locker::<Vec<u8>>("c")).unwrap();
+                    wait(locker.put("k", data)).unwrap();
+                    let got = wait(locker.get("k")).unwrap().unwrap();
+                    criterion::black_box(got.len());
+                    native
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     settings_eager,
@@ -312,6 +400,8 @@ criterion_group!(
     txn_batch,
     reopen,
     envelope_tax,
-    backend_put
+    backend_put,
+    chunk_sweep,
+    lz4_f64
 );
 criterion_main!(benches);

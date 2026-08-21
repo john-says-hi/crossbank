@@ -9,7 +9,7 @@ you rediscover them the hard way.
 - **Local checkout:** `~/Documents/crossbank`
 - **Owner:** John (`john-says-hi`)
 - **Started:** 2026-08-15 · **Last worked:** 2026-08-20
-- **State:** M0, M1, M2 and M3 complete. **M4 (chunking / streaming Writer/Reader) is next.**
+- **State:** M0–M4 complete. **M5 (quota, eviction, coherence) is next**; `persist()` is its first piece.
 
 ---
 
@@ -149,17 +149,22 @@ backend cost one four-line test file. Plus crash-and-reopen tests that spawn a r
 process and `abort()` it, proving a returned commit survives process death and a transaction
 killed before commit leaves nothing behind. **Data persists on desktop and mobile.**
 
-**178 tests native. 28 in browsers on both wasm lanes. 11/11 CI jobs green.**
+**M3 — complete.** The IndexedDB backend. Same suite, Chrome and Firefox, plain and atomics;
+the persistence case was negative-controlled. **Data persists on the web.**
+
+**M4 — complete.** Chunked lazy values (`CCHK` pointer in `records`, pieces in `chunks`, each
+sealed on its own), streaming `Writer`/`Reader` for `LazyLocker<Vec<u8>>`, orphan-chunk GC on
+overwrite/delete/clear/abort, and a Linux `VmHWM` test proving peak RSS is bounded by the chunk
+size rather than the value. Four new conformance cases (22 total) run on every backend. Benches
+fixed the chunk-size default at **256 KiB** and showed LZ4 is free on f64 candle data.
+
+**192 tests native. 22-case suite × 3 backends in browsers on both wasm lanes.**
 
 ### Remaining milestones
 
-- **M3 — IndexedDB backend** ✅. Same suite, Chrome and Firefox, plain and atomics.
-  Data now persists on the web.
-- **M4 — Big data.** ← *next*. Per-chunk framing, streaming `Writer`/`Reader`, orphan-chunk
-  GC. Exit criterion is *bounded peak RSS*, not raw size — "multi-GB" is not testable on a
-  4 GiB target.
-- **M5 — Quota, eviction, coherence.** `persist()`, quota API, byte-budget LRU on a logical
-  counter, BroadcastChannel cross-tab invalidation.
+- **M5 — Quota, eviction, coherence.** ← *next*. `persist()` (explicit, never automatic),
+  quota API, byte-budget LRU on a logical counter, BroadcastChannel cross-tab invalidation,
+  Safari ITP 7-day policy.
 - **M6 — Consumer readiness.** Docs, worked example, publish to crates.io.
 
 ## 6. How to run everything
@@ -167,11 +172,12 @@ killed before commit leaves nothing behind. **Data persists on desktop and mobil
 ```sh
 cd ~/Documents/crossbank
 
-cargo nextest run                      # native, all backends (181 tests)
+cargo nextest run                      # native, all backends (192 tests)
 cargo +1.97.1 clippy --workspace --all-targets --all-features   # see §7
 cargo test --doc --workspace           # nextest does NOT run doctests
 cargo bench --bench kv                 # native Criterion; not a CI gate
 ci/bench.sh                            # same, plus optional --web --firefox
+cargo bench --bench kv -- "chunk_sweep|lz4_f64"   # the M4 sizing benches only
 
 # Real browsers. Both lanes must pass.
 export CROSSBANK_WBG_RUNNER=<path to a wasm-bindgen-test-runner matching Cargo.lock>
@@ -229,9 +235,9 @@ Every one of these was hit and paid for already. Do not rediscover them.
 
 1. Read `PLAN.md`.
 2. Run `cargo nextest run` and one browser lane, and confirm green before changing anything.
-3. Start M4: auto-chunk values above `max_inline` in `LazyLocker`, add streaming
-   `Writer`/`Reader`, and prove peak RSS is bounded by a small multiple of chunk size.
-   Eager lockers still refuse oversized values. Writer is not inside `transact()`.
+3. Start M5: byte-budget LRU on a logical counter for `Policy::Evictable` lockers, the
+   quota API, and BroadcastChannel cross-tab invalidation. `Bank::persist()` already exists —
+   never call it implicitly on open.
 4. Trap 8 still applies to any IndexedDB work: every backend method must be **one**
    `db.transaction(...).run(...)` awaiting only IDB requests.
 5. Safari CI (`safaridriver` on macOS runners) is still a follow-up. Safari has **zero**

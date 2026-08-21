@@ -12,7 +12,7 @@
 //!   "panics" is not.
 //! * Never rely on `Drop` for cleanup. With abort there is no unwinding.
 
-use crossbank::{Bank, Error, Event, Result};
+use crossbank::{Bank, Error, Event, LockerConfig, Result};
 use futures::StreamExt;
 
 use crate::Harness;
@@ -350,4 +350,55 @@ pub async fn schema_mismatch_is_refused<H: Harness>(h: &H) -> Result<()> {
         Err(other) => panic!("expected SchemaMismatch, got {other:?}"),
         Ok(_) => panic!("opening a locker as a different type should have been refused"),
     }
+}
+
+fn tiny_chunks() -> LockerConfig {
+    LockerConfig::default().with_chunk_size(32)
+}
+
+/// A value larger than the chunk size round-trips through `put`/`get`.
+pub async fn a_value_larger_than_the_chunk_size_round_trips<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker_with::<V>("l", tiny_chunks()).await?;
+    let big = "x".repeat(200);
+    locker.put("k", &big).await?;
+    assert_eq!(locker.get("k").await?, Some(big));
+    Ok(())
+}
+
+/// Overwriting a chunked value replaces it and does not blend old chunks.
+pub async fn overwriting_a_chunked_value_replaces_it<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker_with::<V>("l", tiny_chunks()).await?;
+    locker.put("k", &"a".repeat(200)).await?;
+    locker.put("k", &"b".repeat(180)).await?;
+    assert_eq!(locker.get("k").await?, Some("b".repeat(180)));
+    Ok(())
+}
+
+/// Deleting a chunked value makes it gone.
+pub async fn deleting_a_chunked_value_removes_it<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker_with::<V>("l", tiny_chunks()).await?;
+    locker.put("k", &"z".repeat(200)).await?;
+    locker.delete("k").await?;
+    assert_eq!(locker.get("k").await?, None);
+    assert!(!locker.contains_key("k"));
+    Ok(())
+}
+
+/// An unfinished writer leaves the previous complete value intact.
+pub async fn unfinished_writer_leaves_the_previous_value<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let locker = bank
+        .lazy_locker_with::<Vec<u8>>("bytes", tiny_chunks())
+        .await?;
+    locker.put("k", &vec![1u8; 80]).await?;
+
+    let mut writer = locker.writer("k").await?;
+    writer.write_chunk(&[9u8; 40]).await?;
+    writer.abort().await?;
+
+    assert_eq!(locker.get("k").await?, Some(vec![1u8; 80]));
+    Ok(())
 }

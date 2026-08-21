@@ -8,9 +8,10 @@
 //!
 //! # Status
 //!
-//! Pre-alpha. M0–M2 are complete. M3 (IndexedDB) is in this crate: data
-//! persists in real browsers. The public API is not yet stable and the crate
-//! is not published.
+//! Pre-alpha. M0–M4 are complete: data persists natively (`redb`) and in
+//! real browsers (IndexedDB), and large lazy values are chunked with
+//! streaming [`Writer`]/[`Reader`] access. The public API is not yet stable
+//! and the crate is not published.
 //!
 //! # Shape
 //!
@@ -48,7 +49,7 @@ pub use backend::{Backend, MemoryBackend};
 pub use bank::{Bank, BankConfig, Location};
 pub use codec::{Filter, FilterChain};
 pub use error::{Error, Result};
-pub use locker::{LazyLocker, Locker, LockerConfig, Policy, Transaction};
+pub use locker::{LazyLocker, Locker, LockerConfig, Policy, Reader, Transaction, Writer};
 pub use remote::RemoteBank;
 pub use watch::{Event, EventStream};
 

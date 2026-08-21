@@ -167,8 +167,8 @@ and big values win, Hive's non-fsync puts win, `transact` is the answer for bulk
 tick, opt-in `BroadcastChannel` cross-tab coherence with `Event::Stale`, and opt-in
 `Commit::Deferred` write coalescing with `flush` / `Bank::flush_all`. Safari's ITP 7-day rule
 is answered in prose (README → Web caveats), because nothing in code can answer it.
-**286 tests native. 43-case suite × 3 backends in browsers, plus a browser-only coherence
-test.**
+**306 tests native. 46-case suite × 3 backends in browsers, plus browser-only coherence
+tests.**
 
 ### Remaining milestones
 
@@ -179,7 +179,7 @@ test.**
 ```sh
 cd ~/Documents/crossbank
 
-cargo nextest run                      # native, all backends (192 tests)
+cargo nextest run                      # native, all backends (306 tests)
 cargo +1.97.1 clippy --workspace --all-targets --all-features   # see §7
 cargo test --doc --workspace           # nextest does NOT run doctests
 cargo bench --bench kv                 # native Criterion; not a CI gate
@@ -244,7 +244,29 @@ Every one of these was hit and paid for already. Do not rediscover them.
     destructor — `Drop` cannot await, and a closing tab would not run one. The
     consumer flushes from `pagehide` / `visibilitychange:hidden` on the web and
     from the app's stop hook natively.
-16. **Locker `close()` is async now.** It flushes first and closes even when
+16. **A `Commit::Deferred` locker may have exactly ONE live handle.** Two
+    handles on a name each keep their own staging buffer over the same stored
+    data, so whichever flushed last silently overwrote the other. `Bank`
+    refuses the second open with `Error::InvalidConfig` — including an
+    `Immediate` handle opened while a deferred one is live, which would not
+    see the staged batch either. Close the first handle to free the name.
+17. **A drained batch must be restaged on every failure path.** `transact`
+    absorbs the staged deferred batch so both ride in one commit; if anything
+    after the drain returns `Err`, the batch has to go back exactly where it
+    was or it is gone. Same rule in `flush_locked`. Every early return between
+    a `take_staged()` and a landed commit needs a `restage`.
+18. **Never plan an eviction without a `keep` set.** A commit that evicts a key
+    it is also writing GCs the old chunks while writing new ones, and the new
+    ones are then unreachable forever. `budget_ops` takes the batch's own keys;
+    `tests/deferred_batches.rs` asserts the `chunks` table holds nothing that
+    no record points at.
+19. **A wasm use-after-free does not go red.** Removing `Drop for Coherence`
+    and rerunning the browser lane passes, every time — freeing a `Closure` the
+    `BroadcastChannel` still points at breaks nothing observable until much
+    later. The negative control for that lives natively, in
+    `src/coherence/native.rs`, where the native half carries the same
+    close-on-drop contract purely so it can be tested.
+20. **Locker `close()` is async now.** It flushes first and closes even when
     the flush fails, returning the flush error. A bare `locker.close();` is a
     dropped future that does nothing.
 

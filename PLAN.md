@@ -1,8 +1,8 @@
 # crossbank — build plan
 
-**Status: M5 complete.** 286 tests green natively — the full conformance suite against
+**Status: M5 complete.** 306 tests green natively — the full conformance suite against
 **both** the memory and `redb` backends, crash-and-reopen tests that kill a real process, and
-a peak-RSS test that streams 8 MiB through 64 KiB chunks. The same 43-case suite passes
+a peak-RSS test that streams 8 MiB through 64 KiB chunks. The same 46-case suite passes
 against **IndexedDB** in Chrome and Firefox on both wasm lanes (plain and atomics), alongside
 a browser-only cross-tab coherence test. **Data persists on desktop, mobile, and the web,
 large lazy values no longer have to fit in RAM, and storage pressure now has an answer.**
@@ -525,6 +525,30 @@ a cost we have chosen to carry. None of them loses data.
   carries the same caveat; making both durable-monotonic against out-of-order
   commits needs a compare-and-set the `Backend` trait does not have, so it is
   still open.
+- **Corrupt bytes and an oversized value look the same at the eager sink.**
+  A coherence message either carries a value or does not. When it does not —
+  because the write was past the inline limit, or was chunked — and when it
+  does but this tab cannot decode it, the eager sink reaches the same place:
+  it cannot hold the value, so it drops the resident copy and raises
+  `Event::Stale`. A caller therefore cannot tell "another tab wrote something
+  too big to carry" from "another tab wrote something this build cannot
+  decode" from the event alone. Both are honest — the resident copy really is
+  gone in both cases, and the stored bytes really are intact in both — and
+  distinguishing them would mean either carrying a reason code the receiver
+  cannot verify, or attempting a decode the message has no bytes for. Reopen
+  the locker (or read the key through a lazy handle) to find out which it was.
+- **A deferred batch larger than the whole byte budget is kept whole.** When a
+  single commit's own writes exceed `Policy::Evictable`'s `max_bytes`, every
+  other key is shed and the batch stays, so the locker is briefly over budget.
+  The alternative is refusing to store what the caller just asked us to store,
+  or deleting values in the same commit that wrote them — which is the bug
+  this replaced. The next commit that does not overshoot brings it back down.
+- **Cross-tab epochs order one sender, not two.** See
+  `BankConfig::coherence`: each bank's epoch counter is its own, so two tabs
+  writing one key concurrently are not ordered against each other. Storage is
+  always consistent (the backend serialises the commits); it is the *resident*
+  copies that may disagree with it until a reopen. A key two tabs genuinely
+  contend for belongs in a lazy locker, which reads through.
 - **A key written twice in one transaction is collapsed.** Only the last write
   per key is committed (and everything before a `clear` is dropped), so the
   eager size check applies to what actually lands rather than to every

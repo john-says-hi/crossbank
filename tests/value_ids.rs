@@ -6,6 +6,12 @@
 //! suspends: the memory and `redb` backends complete every future on the first
 //! poll, so `join`ing two puts over them never interleaves and never
 //! reproduces the collision.
+//!
+//! Native only: the point is a decorated backend and a controlled executor,
+//! neither of which needs a browser. Gated rather than left to run zero
+//! tests in a wasm lane, which is how a suite sits green having never run.
+
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::future::Future;
 use std::pin::Pin;

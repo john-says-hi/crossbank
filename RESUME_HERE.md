@@ -164,8 +164,9 @@ and big values win, Hive's non-fsync puts win, `transact` is the answer for bulk
 
 ### Remaining milestones
 
-- **M5 — Quota, eviction, coherence.** ← *next*. `persist()` (explicit, never automatic),
-  quota API, byte-budget LRU on a logical counter, BroadcastChannel cross-tab invalidation,
+- **M5 — Quota, eviction, coherence.** ← *next*. `persist()` is done (explicit, never
+  automatic — consumers storing precious data on the web must call it and handle `false`).
+  Remaining: quota API, byte-budget LRU on a logical counter, BroadcastChannel cross-tab invalidation,
   Safari ITP 7-day policy.
 - **M6 — Consumer readiness.** Docs, worked example, publish to crates.io.
 

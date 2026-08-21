@@ -312,7 +312,11 @@ growth stays far below the value size. Four new conformance cases run on every b
 were negative-controlled (a broken `abort()` went red in Firefox before being restored).
 Eager lockers still refuse oversized values.
 
-**M5 — Quota, eviction, coherence.** `persist()` (explicit, never automatic), quota API,
+**M5 — Quota, eviction, coherence.** `persist()` ✅ *landed early* — `Bank::persist()` asks
+`navigator.storage.persist()` on wasm and returns whether the origin is persistent; native
+returns `Ok(true)`; never called on open. Firefox shows a permission prompt and the future
+waits on the user; Chromium decides silently — so it must stay off the startup path. Remaining:
+quota API,
 byte-budget LRU on a logical counter, BroadcastChannel coherence carrying small values
 inline, and an opt-in write-coalescing policy for eager lockers (see Performance → Hive CE). Native coherence is in-process only — redb takes an exclusive file lock, so a second
 process cannot open the database at all.

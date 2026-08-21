@@ -10,7 +10,8 @@ Cross-platform persistent key/value storage for Rust. One API on native and in t
 > IndexedDB backend all work and are covered by a shared conformance suite that runs
 > natively and in real browsers (Chrome and Firefox, plain and atomics). Data persists
 > on desktop, mobile, and the web. Large lazy values are chunked and can be streamed
-> through `Writer`/`Reader` with bounded memory. Quota/eviction (M5) is not written yet.
+> through `Writer`/`Reader` with bounded memory; `Bank::persist()` requests durable
+> storage on the web. Quota/eviction (M5) is not written yet.
 > Do not depend on this.
 
 ## Why

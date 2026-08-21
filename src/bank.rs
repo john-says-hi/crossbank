@@ -119,6 +119,40 @@ impl std::fmt::Debug for Bank {
 }
 
 impl Bank {
+    /// Ask the platform to keep this bank's data.
+    ///
+    /// On wasm this is `navigator.storage.persist()`. On native the file is
+    /// already durable, so this returns `Ok(true)`. Never called implicitly
+    /// on open — precious data on the web must opt in.
+    ///
+    /// Browsers differ: Chromium decides silently from site-engagement
+    /// heuristics, while Firefox shows the user a permission prompt and the
+    /// returned future does not resolve until they answer it. Call this off
+    /// the startup path and never block a UI on it.
+    pub async fn persist(&self) -> Result<bool> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self;
+            Ok(true)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = self;
+            let Some(window) = web_sys::window() else {
+                return Ok(false);
+            };
+            match window.navigator().storage().persist() {
+                Ok(promise) => {
+                    let value = wasm_bindgen_futures::JsFuture::from(promise)
+                        .await
+                        .map_err(|e| Error::backend(format!("{e:?}")))?;
+                    Ok(value.as_bool().unwrap_or(false))
+                }
+                Err(_) => Ok(false),
+            }
+        }
+    }
+
     /// Open a bank at the location named in `config`.
     ///
     /// The location is always explicit. `Location::Path` is native-only;

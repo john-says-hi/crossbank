@@ -30,21 +30,36 @@
 //! * The locker's write lock is held for the transaction's duration, so two
 //!   overlapping transactions cannot lose each other's updates.
 
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::backend::api::Op;
+use crate::backend::api::{Op, Table};
 use crate::error::{Error, Result};
 
+use super::chunk::{gc_ops, is_pointer, ChunkPointer, FLAG_POSTCARD};
 use super::inner::Inner;
+
+/// Which locker is committing a write-set.
+///
+/// An eager locker holds every value in RAM, so its writes stay inline and
+/// are size-checked; a lazy locker chunks exactly as `LazyLocker::put` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxMode {
+    Eager,
+    Lazy,
+}
 
 /// One staged mutation.
 pub(crate) enum Staged<T> {
     Put {
         key: Vec<u8>,
-        bytes: Vec<u8>,
+        /// The postcard payload, **not** the sealed envelope. The lazy path
+        /// needs the raw payload to chunk it, and the eager path seals it
+        /// once while building ops.
+        payload: Vec<u8>,
         value: Arc<T>,
     },
     Delete {
@@ -88,19 +103,90 @@ where
     }
 
     /// Turn a drained write-set into backend ops.
-    pub(crate) fn ops_for(inner: &Inner, staged: &[Staged<T>]) -> Vec<Op> {
-        staged
-            .iter()
-            .map(|entry| match entry {
-                Staged::Put { key, bytes, .. } => Op::Put {
-                    table: crate::backend::api::Table::Records,
-                    key: inner.encode_key(key),
-                    value: bytes.clone(),
+    ///
+    /// Async because it is GC-aware: overwriting or deleting a key that holds
+    /// a chunk pointer has to look the old pointer up so its chunks are
+    /// dropped in the same commit. Staging bare `Op::Put`s here is what
+    /// orphaned chunks forever on the `put_all` / `transact` path.
+    ///
+    /// The write-set is collapsed first — everything before the last `clear`
+    /// is dropped, and only the last action per key survives — so one key
+    /// written twice in a transaction allocates one value id, not two (the
+    /// first of which nothing would ever point at).
+    pub(crate) async fn ops_for(
+        inner: &Inner,
+        staged: &[Staged<T>],
+        mode: TxMode,
+    ) -> Result<Vec<Op>> {
+        let mut ops = Vec::new();
+
+        let tail = match staged.iter().rposition(|e| matches!(e, Staged::Clear)) {
+            Some(i) => {
+                ops.extend(inner.clear_value_ops().await?);
+                &staged[i + 1..]
+            }
+            None => staged,
+        };
+
+        enum Action<'a> {
+            Put(&'a [u8]),
+            Delete,
+        }
+
+        let mut actions: BTreeMap<&[u8], Action<'_>> = BTreeMap::new();
+        for entry in tail {
+            match entry {
+                Staged::Put { key, payload, .. } => {
+                    actions.insert(key, Action::Put(payload));
+                }
+                Staged::Delete { key } => {
+                    actions.insert(key, Action::Delete);
+                }
+                // None can remain: `tail` starts after the last clear.
+                Staged::Clear => {}
+            }
+        }
+
+        for (key, action) in actions {
+            match action {
+                Action::Delete => ops.extend(inner.delete_value_ops(key).await?),
+                Action::Put(payload) => match mode {
+                    TxMode::Lazy => {
+                        ops.extend(
+                            inner
+                                .put_payload_ops(key, payload.to_vec(), FLAG_POSTCARD)
+                                .await?,
+                        );
+                    }
+                    TxMode::Eager => {
+                        let sealed = inner.chain.seal(payload)?;
+                        if sealed.len() > inner.config.max_inline {
+                            return Err(Error::ValueTooLarge {
+                                bytes: sealed.len(),
+                                max_inline: inner.config.max_inline,
+                            });
+                        }
+                        // An eager locker never writes a pointer itself, but
+                        // the same name may have been written through a lazy
+                        // handle, so still GC what is actually there.
+                        if let Some(existing) = inner.fetch(key).await? {
+                            if is_pointer(&existing) {
+                                if let Ok(pointer) = ChunkPointer::parse(&existing) {
+                                    ops.push(gc_ops(&pointer));
+                                }
+                            }
+                        }
+                        ops.push(Op::Put {
+                            table: Table::Records,
+                            key: inner.encode_key(key),
+                            value: sealed,
+                        });
+                    }
                 },
-                Staged::Delete { key } => inner.delete_op(key),
-                Staged::Clear => inner.clear_op(),
-            })
-            .collect()
+            }
+        }
+
+        Ok(ops)
     }
 
     /// Stage a write. Encoding happens now, on this thread, so no user code
@@ -111,10 +197,11 @@ where
 
     /// As [`Transaction::put`], under a binary key.
     pub fn put_by(&self, key: &[u8], value: T) -> Result<()> {
-        let bytes = self.inner.seal(&value)?;
+        let payload = postcard::to_allocvec(&value)
+            .map_err(|e| Error::Filter(format!("postcard serialisation failed: {e}")))?;
         self.push(Staged::Put {
             key: key.to_vec(),
-            bytes,
+            payload,
             value: Arc::new(value),
         })
     }
@@ -142,7 +229,13 @@ where
     /// As [`Transaction::get`], under a binary key.
     pub async fn get_by(&self, key: &[u8]) -> Result<Option<T>> {
         if let Some(staged) = self.staged_view(key)? {
-            return staged.map(|bytes| self.inner.open(&bytes)).transpose();
+            return staged
+                .map(|payload| {
+                    postcard::from_bytes(&payload).map_err(|e| {
+                        Error::Corrupt(format!("postcard deserialisation failed: {e}"))
+                    })
+                })
+                .transpose();
         }
         self.inner.load_value(key).await
     }
@@ -156,8 +249,8 @@ where
         self.len() == 0
     }
 
-    /// `None` when this transaction has not touched the key at all;
-    /// `Some(None)` when it has deleted or cleared it.
+    /// The staged **payload** for a key: `None` when this transaction has not
+    /// touched it at all; `Some(None)` when it has deleted or cleared it.
     fn staged_view(&self, key: &[u8]) -> Result<Option<Option<Vec<u8>>>> {
         let guard = self
             .staged
@@ -167,9 +260,9 @@ where
         // Later entries win, so scan backwards and stop at the first hit.
         for entry in guard.iter().rev() {
             match entry {
-                Staged::Put { key: k, bytes, .. } if k == key => {
-                    return Ok(Some(Some(bytes.clone())))
-                }
+                Staged::Put {
+                    key: k, payload, ..
+                } if k == key => return Ok(Some(Some(payload.clone()))),
                 Staged::Delete { key: k } if k == key => return Ok(Some(None)),
                 Staged::Clear => return Ok(Some(None)),
                 _ => {}

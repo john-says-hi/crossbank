@@ -451,6 +451,39 @@ commit without giving up durability-on-return for callers that want it.
 - ~~Whether LZ4 earns its CPU on f64 candle data~~ — **measured in M4: ~1.0×, free.** It
   stays on. `FilterChain::raw()` is the opt-out; per-locker chain selection is an M6 nicety.
 
+## Known limitations / review notes
+
+Behaviours a review flagged and we deliberately left as they are. They are
+documented rather than fixed because each is either working as designed or
+a cost we have chosen to carry. None of them loses data.
+
+- **`Bank::verify` checks the envelope, not the type.** It validates the CBNK
+  header and the filter chain (so a CRC failure or a foreign blob is caught)
+  but does not attempt a `postcard` decode, because the typed decode lives on
+  the locker and `verify` is deliberately type-free. **A clean `verify` is
+  therefore not a promise that a strict (`OnCorrupt::Fail`) open will
+  succeed** — a record whose bytes are intact but no longer match the type it
+  is opened as passes verify and fails the open.
+- **`OnCorrupt::Skip` also skips schema drift.** Skip cannot tell "these bytes
+  are damaged" from "these bytes were written by an older shape of `T`" —
+  both surface as a decode failure. Both are skipped, and both are listed in
+  `corrupt_keys` / `verify`, which is where a caller sees what was dropped.
+  This is the documented behaviour, not an accident: the alternative is
+  refusing to open at all, which is what `OnCorrupt::Fail` is for.
+- **`delete_bank` on a still-open native bank unlinks under a live fd.** The
+  doc already says to close the bank first. On Unix the file stays alive until
+  the last handle closes, so an open `Bank` keeps working against a file that
+  no longer has a name, and its later commits go nowhere visible. Close first.
+- **The value-id counter persists its high-water mark per commit.** If two
+  chunk allocations commit out of order, the stored `next_value_id` can land
+  one lower than the highest id actually handed out. Within a process the RAM
+  cursor covers it; only a reopen immediately after such an interleaving could
+  re-hand an id in use. Making the counter durable-monotonic is an M5 item.
+- **A key written twice in one transaction is collapsed.** Only the last write
+  per key is committed (and everything before a `clear` is dropped), so the
+  eager size check applies to what actually lands rather than to every
+  intermediate value.
+
 ---
 
 ## Appendix — the eventual wise_apple drop-in (not this project)

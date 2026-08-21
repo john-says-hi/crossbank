@@ -5,7 +5,7 @@
 //! piece is sealed through the filter chain independently so peak memory is
 //! O(chunk_size) on the read path.
 
-use crate::backend::api::{KeyRange, Op, Table};
+use crate::backend::api::{Backend, KeyRange, Op, Table};
 use crate::error::{Error, Result};
 
 /// Magic for a chunk pointer stored in `records`. Distinct from the inline
@@ -100,6 +100,75 @@ pub fn parse_counter(raw: Option<&[u8]>) -> Result<u64> {
             .map(u64::from_be_bytes)
             .map_err(|_| Error::Corrupt("next_value_id is not an 8-byte integer".into())),
     }
+}
+
+/// The bank-wide allocator for chunk value ids.
+///
+/// One of these is owned by a [`crate::Bank`] and cloned into every locker it
+/// opens, so two lockers — or two handles on the same name — can never hand
+/// out the same id and collide in the `chunks` table. Reading the stored
+/// counter and bumping it used to be two separate awaits per locker, which is
+/// exactly the interleaving that produced duplicate ids.
+///
+/// The cursor is seeded from `meta` on first use and then lives in RAM. The
+/// lock is a `std` mutex and is **never** held across an await: allocation is
+/// pure arithmetic, and the returned `Op` persists the new high-water mark
+/// with whatever commit the caller is already building.
+#[derive(Debug, Default)]
+pub struct ValueIds {
+    /// The next id to hand out. `None` until seeded from `meta`.
+    next: std::sync::Mutex<Option<u64>>,
+}
+
+impl ValueIds {
+    /// Take the next id if the cursor is already seeded.
+    fn take(&self) -> Result<Option<u64>> {
+        let mut guard = self
+            .next
+            .lock()
+            .map_err(|_| Error::backend("value id cursor was poisoned"))?;
+        match *guard {
+            None => Ok(None),
+            Some(id) => {
+                *guard = Some(advance(id)?);
+                Ok(Some(id))
+            }
+        }
+    }
+
+    /// Seed from the stored counter and take one.
+    ///
+    /// `max` rather than a plain assignment because a concurrent allocation
+    /// may have seeded the cursor while this one was awaiting the read; the
+    /// cursor must only ever move forward.
+    fn seed_and_take(&self, stored: u64) -> Result<u64> {
+        let mut guard = self
+            .next
+            .lock()
+            .map_err(|_| Error::backend("value id cursor was poisoned"))?;
+        let id = match *guard {
+            Some(current) => current.max(stored),
+            None => stored,
+        };
+        *guard = Some(advance(id)?);
+        Ok(id)
+    }
+
+    /// Allocate one id, plus the op that persists the new counter.
+    pub async fn allocate(&self, backend: &dyn Backend) -> Result<(u64, Op)> {
+        if let Some(id) = self.take()? {
+            return bump_counter_ops(id);
+        }
+        let raw = backend.get(Table::Meta, META_NEXT_VALUE_ID).await?;
+        let stored = parse_counter(raw.as_deref())?;
+        let id = self.seed_and_take(stored)?;
+        bump_counter_ops(id)
+    }
+}
+
+fn advance(id: u64) -> Result<u64> {
+    id.checked_add(1)
+        .ok_or_else(|| Error::backend("value id space is exhausted"))
 }
 
 pub fn gc_ops(pointer: &ChunkPointer) -> Op {

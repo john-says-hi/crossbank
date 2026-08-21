@@ -117,7 +117,13 @@ pub struct Bank {
     /// `Weak`, so a locker the application dropped stops counting as open
     /// without needing a destructor to reach back into the bank. Entries are
     /// pruned lazily on every read.
-    open_lockers: Mutex<HashMap<String, Weak<Inner>>>,
+    /// Every live handle per name, not just the newest. Keeping one `Weak`
+    /// per name meant opening a name twice and dropping the *second* handle
+    /// made the name read as closed while the first was still live, which let
+    /// `delete_locker` and `quarantine` run under a working locker.
+    open_lockers: Mutex<HashMap<String, Vec<Weak<Inner>>>>,
+    /// Bank-wide allocator for chunk value ids, cloned into every locker.
+    value_ids: Arc<crate::locker::chunk::ValueIds>,
     closed: AtomicBool,
 }
 
@@ -220,6 +226,7 @@ impl Bank {
             job_sender,
             job_receiver: Mutex::new(Some(job_receiver)),
             open_lockers: Mutex::new(HashMap::new()),
+            value_ids: Arc::new(crate::locker::chunk::ValueIds::default()),
             closed: AtomicBool::new(false),
         };
         bank.check_or_write_format_version().await?;
@@ -329,6 +336,7 @@ impl Bank {
             id,
             name.to_string(),
             config,
+            self.value_ids.clone(),
         )
         .await?;
         self.register_open(name, locker.inner());
@@ -362,6 +370,7 @@ impl Bank {
             id,
             name.to_string(),
             config,
+            self.value_ids.clone(),
         )
         .await?;
         self.register_open(name, locker.inner());
@@ -543,6 +552,7 @@ impl Bank {
             id,
             name: name.to_string(),
             config: LockerConfig::default(),
+            value_ids: self.value_ids.clone(),
             watchers: Default::default(),
             closed: std::sync::atomic::AtomicBool::new(false),
         })
@@ -588,8 +598,14 @@ impl Bank {
                 |_, value| {
                     if let Some(raw) = value {
                         total = total.saturating_add(raw.len() as u64);
+                        // An unparseable pointer counts as the inline record
+                        // it is indistinguishable from here; its raw length is
+                        // already in `total`, and there are no chunks we can
+                        // locate to add.
                         if crate::locker::chunk::is_pointer(&raw) {
-                            chunked.push(crate::locker::chunk::ChunkPointer::parse(&raw)?.value_id);
+                            if let Ok(pointer) = crate::locker::chunk::ChunkPointer::parse(&raw) {
+                                chunked.push(pointer.value_id);
+                            }
                         }
                     }
                     Ok(())
@@ -825,7 +841,11 @@ impl Bank {
 
     fn register_open(&self, name: &str, inner: &Arc<Inner>) {
         if let Ok(mut guard) = self.open_lockers.lock() {
-            guard.insert(name.to_string(), Arc::downgrade(inner));
+            Self::prune(&mut guard);
+            guard
+                .entry(name.to_string())
+                .or_default()
+                .push(Arc::downgrade(inner));
         }
     }
 
@@ -837,8 +857,9 @@ impl Bank {
     ///
     /// Note that opening the same name twice is **allowed** and returns two
     /// independent handles over the same stored data — the eager form gives
-    /// each its own resident copy, which will diverge on write. The registry
-    /// records only the most recent handle per name.
+    /// each its own resident copy, which will diverge on write. The name
+    /// counts as open until *every* one of those handles is dropped or
+    /// closed.
     pub fn is_locker_open(&self, name: &str) -> bool {
         let Ok(mut guard) = self.open_lockers.lock() else {
             return false;
@@ -858,11 +879,14 @@ impl Bank {
         names
     }
 
-    /// Drop entries whose handle is gone or closed.
-    fn prune(map: &mut HashMap<String, Weak<Inner>>) {
-        map.retain(|_, weak| match weak.upgrade() {
-            Some(inner) => !inner.is_closed(),
-            None => false,
+    /// Drop handles that are gone or closed, and names left with none.
+    fn prune(map: &mut HashMap<String, Vec<Weak<Inner>>>) {
+        map.retain(|_, handles| {
+            handles.retain(|weak| match weak.upgrade() {
+                Some(inner) => !inner.is_closed(),
+                None => false,
+            });
+            !handles.is_empty()
         });
     }
 

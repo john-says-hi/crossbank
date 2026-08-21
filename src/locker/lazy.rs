@@ -22,7 +22,7 @@ use crate::key::LockerId;
 
 use super::inner::Inner;
 use super::policy::{LockerConfig, OnCorrupt};
-use super::transaction::{Staged, Transaction};
+use super::transaction::{Staged, Transaction, TxMode};
 use crate::watch::Event;
 
 /// A locker that keeps only its key index in memory.
@@ -54,6 +54,7 @@ where
         id: LockerId,
         name: String,
         config: LockerConfig,
+        value_ids: Arc<super::chunk::ValueIds>,
     ) -> Result<Self> {
         let inner = Arc::new(Inner {
             write_lock: futures::lock::Mutex::new(()),
@@ -62,6 +63,7 @@ where
             id,
             name,
             config,
+            value_ids,
             watchers: Default::default(),
             closed: AtomicBool::new(false),
         });
@@ -252,7 +254,7 @@ where
             return Ok(());
         }
 
-        let ops = Transaction::<T>::ops_for(&self.inner, &entries);
+        let ops = Transaction::<T>::ops_for(&self.inner, &entries, TxMode::Lazy).await?;
         self.inner.commit(ops).await?;
 
         // Index updates only after the commit lands, so a failed write cannot
@@ -590,6 +592,7 @@ mod tests {
             1,
             "test".into(),
             LockerConfig::default(),
+            Default::default(),
         ))
         .unwrap()
     }
@@ -900,6 +903,7 @@ mod tests {
             1,
             "one".into(),
             LockerConfig::default(),
+            Default::default(),
         ))
         .unwrap();
         let two: LazyLocker<String> = block_on(LazyLocker::open(
@@ -908,6 +912,7 @@ mod tests {
             2,
             "two".into(),
             LockerConfig::default(),
+            Default::default(),
         ))
         .unwrap();
 
@@ -935,6 +940,7 @@ mod tests {
             1,
             "l".into(),
             LockerConfig::default(),
+            Default::default(),
         ))
         .unwrap();
         for i in 0..5 {
@@ -948,6 +954,7 @@ mod tests {
             1,
             "l".into(),
             LockerConfig::default(),
+            Default::default(),
         ))
         .unwrap();
         assert_eq!(second.len(), 5);
@@ -967,6 +974,7 @@ mod tests {
             1,
             "l".into(),
             LockerConfig::default(),
+            Default::default(),
         ))
         .unwrap();
         for i in 0..600 {
@@ -980,6 +988,7 @@ mod tests {
             1,
             "l".into(),
             LockerConfig::default(),
+            Default::default(),
         ))
         .unwrap();
         assert_eq!(second.len(), 600);

@@ -480,6 +480,14 @@ pub async fn operations_after_close_report_closed<H: Harness>(h: &H) -> Result<(
     assert!(matches!(eager.delete("k").await, Err(Error::Closed)));
     assert!(matches!(eager.clear().await, Err(Error::Closed)));
 
+    // The streaming pair too: a `Writer` commits chunks of its own, so a
+    // closed locker must not be able to open one.
+    let bytes = bank.lazy_locker::<Vec<u8>>("bytes").await?;
+    bytes.put("k", &vec![1u8, 2, 3]).await?;
+    bytes.close();
+    assert!(matches!(bytes.writer("k").await, Err(Error::Closed)));
+    assert!(matches!(bytes.reader("k").await, Err(Error::Closed)));
+
     // Now the bank itself. A locker that was never individually closed still
     // has to stop working, because the store underneath it is gone.
     bank.close().await?;
@@ -851,5 +859,224 @@ pub async fn a_corrupt_record_is_skipped_when_configured<H: Harness>(h: &H) -> R
     let healed = bank.locker::<V>("l").await?;
     assert_eq!(healed.len(), 1);
     assert_eq!(healed.get("good").as_deref(), Some(&v("keep")));
+    Ok(())
+}
+
+/// A transactional overwrite drops the chunks the old value owned.
+///
+/// The transaction path used to stage a bare `Op::Put`, which replaced the
+/// pointer record while leaving every chunk it named on disk with nothing
+/// pointing at it — an unbounded leak on every `put_all` over a large value.
+pub async fn a_transaction_overwrite_gcs_the_old_chunks<H: Harness>(h: &H) -> Result<()> {
+    use crossbank::backend::Table;
+
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker_with::<V>("l", tiny_chunks()).await?;
+
+    locker.put("k", &"x".repeat(200)).await?;
+    assert!(
+        count_rows(&bank, Table::Chunks).await? > 0,
+        "the setup must actually have chunked something"
+    );
+
+    // put_all is transact underneath.
+    locker.put_all([("k".to_string(), v("small"))]).await?;
+    assert_eq!(locker.get("k").await?, Some(v("small")));
+    assert_eq!(
+        count_rows(&bank, Table::Chunks).await?,
+        0,
+        "overwriting a chunked value in a transaction must free its chunks"
+    );
+
+    // And the same for a transactional clear.
+    locker.put("k", &"y".repeat(200)).await?;
+    assert!(count_rows(&bank, Table::Chunks).await? > 0);
+    locker
+        .transact(|tx| async move {
+            tx.clear()?;
+            Ok(())
+        })
+        .await?;
+    assert_eq!(locker.get("k").await?, None);
+    assert_eq!(
+        count_rows(&bank, Table::Chunks).await?,
+        0,
+        "clearing in a transaction must free the chunks too"
+    );
+    Ok(())
+}
+
+/// A staged lazy put chunks exactly as a direct one does.
+///
+/// Without this the whole value landed as a single inline record, so
+/// `put_all` quietly defeated chunking — and with it the memory bound that is
+/// the entire point of a lazy locker.
+pub async fn a_transaction_chunks_a_large_lazy_value<H: Harness>(h: &H) -> Result<()> {
+    use crossbank::backend::Table;
+
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker_with::<V>("l", tiny_chunks()).await?;
+    let big = "q".repeat(200);
+
+    locker.put_all([("k".to_string(), big.clone())]).await?;
+
+    assert!(
+        count_rows(&bank, Table::Chunks).await? > 1,
+        "a value past the chunk size must be split, even inside a transaction"
+    );
+    assert_eq!(locker.get("k").await?, Some(big));
+    Ok(())
+}
+
+/// Two lockers allocating chunked values at once get distinct value ids.
+///
+/// The allocation used to be a read of the stored counter followed by a bump,
+/// guarded per locker, so two interleaved writers read the same number and
+/// their chunks collided in a shared table. This case pins the invariant on
+/// every backend; the genuinely *interleaved* reproduction needs a backend
+/// that suspends mid-commit and lives in `tests/value_ids.rs`.
+pub async fn concurrent_chunk_writers_do_not_collide<H: Harness>(h: &H) -> Result<()> {
+    use crossbank::backend::Table;
+
+    let bank = bank(h).await?;
+    let first = bank.lazy_locker_with::<V>("first", tiny_chunks()).await?;
+    let second = bank.lazy_locker_with::<V>("second", tiny_chunks()).await?;
+
+    let a = "a".repeat(200);
+    let b = "b".repeat(200);
+    let (l, r) = futures::future::join(first.put("k", &a), second.put("k", &b)).await;
+    l?;
+    r?;
+
+    assert_eq!(first.get("k").await?, Some(a.clone()));
+    assert_eq!(second.get("k").await?, Some(b.clone()));
+    let both = count_rows(&bank, Table::Chunks).await?;
+
+    // Two handles on ONE name are the same hazard: they share stored data but
+    // are separate objects.
+    let one = bank.lazy_locker_with::<V>("shared", tiny_chunks()).await?;
+    let two = bank.lazy_locker_with::<V>("shared", tiny_chunks()).await?;
+    let (l, r) = futures::future::join(one.put("x", &a), two.put("y", &b)).await;
+    l?;
+    r?;
+    assert_eq!(one.get("x").await?, Some(a));
+    assert_eq!(one.get("y").await?, Some(b));
+
+    assert_eq!(
+        count_rows(&bank, Table::Chunks).await?,
+        both * 2,
+        "four chunked values must own four disjoint sets of chunks"
+    );
+    Ok(())
+}
+
+/// One unreadable chunk pointer does not wedge maintenance forever.
+///
+/// `clear`, `delete_locker` and `locker_bytes` all walk every record. If a
+/// damaged pointer aborts that walk, the only operations that could clean the
+/// locker up are exactly the ones that stop working.
+pub async fn a_corrupt_chunk_pointer_does_not_block_delete<H: Harness>(h: &H) -> Result<()> {
+    use crossbank::backend::{Op, Table};
+
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker_with::<V>("l", tiny_chunks()).await?;
+    locker.put("good", &v("keep")).await?;
+    locker.put("bad", &v("lose")).await?;
+    let id = bank.locker_id("l").await?;
+
+    // A record that claims to be a chunk pointer but cannot be parsed as one.
+    bank.backend()
+        .commit(vec![Op::Put {
+            table: Table::Records,
+            key: crossbank::key::encode(id, "bad"),
+            value: b"CCHK truncated".to_vec(),
+        }])
+        .await?;
+
+    // Counting bytes must survive it, treating the record as inline.
+    assert!(bank.locker_bytes("l").await? > 0);
+
+    // So must clearing it out.
+    locker.clear().await?;
+    assert_eq!(locker.len(), 0);
+
+    locker.put("good", &v("keep")).await?;
+    bank.backend()
+        .commit(vec![Op::Put {
+            table: Table::Records,
+            key: crossbank::key::encode(id, "good"),
+            value: b"CCHK truncated".to_vec(),
+        }])
+        .await?;
+    locker.close();
+    assert!(bank.delete_locker("l").await?);
+    assert_eq!(count_rows(&bank, Table::Records).await?, 0);
+    Ok(())
+}
+
+/// A name stays open until every handle opened under it is gone.
+///
+/// The registry held one handle per name, so opening a name twice and
+/// dropping the second made the name read as closed while the first handle
+/// was still live and serving data — enough to let `delete_locker` pull the
+/// data out from under it.
+pub async fn a_name_is_open_until_every_handle_closes<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let first = bank.lazy_locker::<V>("l").await?;
+    let second = bank.lazy_locker::<V>("l").await?;
+    first.put("k", &v("x")).await?;
+
+    assert!(bank.is_locker_open("l"));
+    second.close();
+    assert!(
+        bank.is_locker_open("l"),
+        "the first handle is still live, so the name is still open"
+    );
+    assert_eq!(bank.open_locker_names(), vec!["l".to_string()]);
+    assert!(matches!(
+        bank.delete_locker("l").await,
+        Err(Error::InvalidConfig(_))
+    ));
+
+    // The surviving handle still works, which is the point.
+    assert_eq!(first.get("k").await?, Some(v("x")));
+
+    first.close();
+    assert!(!bank.is_locker_open("l"));
+    assert!(bank.open_locker_names().is_empty());
+    assert!(bank.delete_locker("l").await?);
+    Ok(())
+}
+
+/// A range that cannot contain anything answers with nothing.
+///
+/// `BTreeMap::range` *panics* on an inverted range, and on
+/// `(Excluded(k), Excluded(k))`. A wasm release build turns a panic into an
+/// abort, so a range built from user input must never reach it.
+pub async fn a_degenerate_range_is_empty_not_a_panic<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let lazy = bank.lazy_locker::<V>("lazy").await?;
+    let eager = bank.locker::<V>("eager").await?;
+    for k in ["a", "b", "c"] {
+        lazy.put(k, &v(k)).await?;
+        eager.put(k, v(k)).await?;
+    }
+
+    use std::ops::Bound::{Excluded, Included};
+
+    assert!(lazy.range("z".."a").await?.is_empty(), "inverted, lazy");
+    assert!(eager.range("z".."a").is_empty(), "inverted, eager");
+    assert!(lazy.range_rev("z".."a").await?.is_empty());
+    assert!(lazy.range_by(&b"z"[..]..&b"a"[..]).await?.is_empty());
+    assert!(lazy.range_rev_by(&b"z"[..]..&b"a"[..]).await?.is_empty());
+
+    assert!(lazy.range((Excluded("b"), Excluded("b"))).await?.is_empty());
+    assert!(eager.range((Excluded("b"), Excluded("b"))).is_empty());
+    assert!(lazy.range((Included("b"), Excluded("b"))).await?.is_empty());
+    assert!(eager.range((Included("b"), Excluded("b"))).is_empty());
+
+    // A sane range still works, so the guard has not eaten everything.
+    assert_eq!(lazy.range("a".."c").await?.len(), 2);
+    assert_eq!(eager.range("a".."c").len(), 2);
     Ok(())
 }

@@ -15,10 +15,7 @@ use crate::codec::{self, FilterChain};
 use crate::error::{Error, Result};
 use crate::key::{self, LockerId};
 
-use super::chunk::{
-    bump_counter_ops, chunk_key, gc_ops, is_pointer, parse_counter, ChunkPointer, FLAG_POSTCARD,
-    FLAG_RAW,
-};
+use super::chunk::{chunk_key, gc_ops, is_pointer, ChunkPointer, ValueIds, FLAG_POSTCARD, FLAG_RAW};
 use super::policy::LockerConfig;
 use crate::watch::{Event, Watchers};
 
@@ -36,6 +33,9 @@ pub(crate) struct Inner {
     pub(crate) id: LockerId,
     pub(crate) name: String,
     pub(crate) config: LockerConfig,
+    /// Shared with the bank and with every other locker it opened, so chunk
+    /// value ids are unique bank-wide rather than per handle.
+    pub(crate) value_ids: Arc<ValueIds>,
     pub(crate) watchers: Watchers,
     /// Set by `Locker::close` / `LazyLocker::close`.
     ///
@@ -171,12 +171,7 @@ impl Inner {
     }
 
     pub(crate) async fn next_value_id(&self) -> Result<(u64, Op)> {
-        let raw = self
-            .backend
-            .get(Table::Meta, super::chunk::next_value_id_key())
-            .await?;
-        let current = parse_counter(raw.as_deref())?;
-        bump_counter_ops(current)
+        self.value_ids.allocate(self.backend.as_ref()).await
     }
 
     /// Ops to store `postcard` bytes at `key`, chunking when needed, and to
@@ -254,8 +249,16 @@ impl Inner {
             true,
             |_, value| {
                 if let Some(raw) = value {
+                    // A pointer we cannot parse is treated as an inline
+                    // record: the range delete below still removes it, and
+                    // there is nothing to GC because the chunks it named
+                    // cannot be located. One damaged record must not make
+                    // `clear`, `delete_locker` and `locker_bytes` fail
+                    // forever.
                     if is_pointer(&raw) {
-                        ops.push(gc_ops(&ChunkPointer::parse(&raw)?));
+                        if let Ok(pointer) = ChunkPointer::parse(&raw) {
+                            ops.push(gc_ops(&pointer));
+                        }
                     }
                 }
                 Ok(())
@@ -288,6 +291,9 @@ impl Inner {
         want_values: bool,
         mut visit: impl FnMut(Vec<u8>, Option<Vec<u8>>) -> Result<()>,
     ) -> Result<()> {
+        if key::is_degenerate(start, end) {
+            return Ok(());
+        }
         let mut range = key::encode_range_bytes(self.id, start, end);
 
         loop {

@@ -129,6 +129,24 @@ pub fn encode_range_bytes(locker: LockerId, start: Bound<&[u8]>, end: Bound<&[u8
     KeyRange { start, end }
 }
 
+/// Whether a pair of user bounds describes a range that cannot contain
+/// anything — either inverted (`"z".."a"`) or empty by exclusion
+/// (`(Excluded(k), Excluded(k))`).
+///
+/// Both are *hard errors* for `BTreeMap::range`, which panics on them. A
+/// panic in a wasm release build is `panic = "abort"`, so a caller passing a
+/// user-supplied range would kill the process. Every range entry point checks
+/// this first and answers with nothing, which is what the range means.
+pub fn is_degenerate(start: Bound<&[u8]>, end: Bound<&[u8]>) -> bool {
+    match (start, end) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Included(s), Bound::Included(e)) => s > e,
+        (Bound::Included(s), Bound::Excluded(e))
+        | (Bound::Excluded(s), Bound::Included(e))
+        | (Bound::Excluded(s), Bound::Excluded(e)) => s >= e,
+    }
+}
+
 /// Reinterpret a `&str` bound as a byte bound. Free — a `&str` is its bytes.
 pub fn as_bytes(bound: Bound<&str>) -> Bound<&[u8]> {
     match bound {

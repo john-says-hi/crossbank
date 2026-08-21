@@ -31,7 +31,7 @@ use crate::key::LockerId;
 
 use super::inner::Inner;
 use super::policy::{LockerConfig, OnCorrupt, Policy};
-use super::transaction::{Staged, Transaction};
+use super::transaction::{Staged, Transaction, TxMode};
 use crate::watch::Event;
 
 /// A locker whose values live in memory.
@@ -62,6 +62,7 @@ where
         id: LockerId,
         name: String,
         config: LockerConfig,
+        value_ids: Arc<super::chunk::ValueIds>,
     ) -> Result<Self> {
         // Eviction and residency contradict each other: shedding a value from
         // storage while RAM still holds it leaves a replica that outlives the
@@ -80,6 +81,7 @@ where
             id,
             name,
             config,
+            value_ids,
             watchers: Default::default(),
             closed: AtomicBool::new(false),
         });
@@ -200,19 +202,9 @@ where
         }
 
         // An eager locker holds its values, so the size limit applies to
-        // transactional writes exactly as it does to a plain put.
-        for entry in &entries {
-            if let Staged::Put { bytes, .. } = entry {
-                if bytes.len() > self.inner.config.max_inline {
-                    return Err(Error::ValueTooLarge {
-                        bytes: bytes.len(),
-                        max_inline: self.inner.config.max_inline,
-                    });
-                }
-            }
-        }
-
-        let ops = Transaction::<T>::ops_for(&self.inner, &entries);
+        // transactional writes exactly as it does to a plain put. `ops_for`
+        // enforces it while sealing, so the bytes are only produced once.
+        let ops = Transaction::<T>::ops_for(&self.inner, &entries, TxMode::Eager).await?;
         self.inner.commit(ops).await?;
 
         if let Ok(mut guard) = self.values.lock() {
@@ -499,6 +491,11 @@ impl<T> Locker<T> {
     pub fn range<'a, R: std::ops::RangeBounds<&'a str>>(&self, range: R) -> Vec<(String, Arc<T>)> {
         let start = crate::key::as_bytes(str_bound(range.start_bound()));
         let end = crate::key::as_bytes(str_bound(range.end_bound()));
+        // `BTreeMap::range` *panics* on an inverted or empty-by-exclusion
+        // range, and a wasm release build turns that into an abort.
+        if crate::key::is_degenerate(start, end) {
+            return Vec::new();
+        }
         self.values
             .lock()
             .map(|v| {
@@ -561,6 +558,7 @@ mod tests {
             1,
             "test".into(),
             config,
+            Default::default(),
         ))
     }
 
@@ -709,6 +707,7 @@ mod tests {
             1,
             "l".into(),
             LockerConfig::default(),
+            Default::default(),
         ))
         .unwrap();
         block_on(first.put("a", "alpha".into())).unwrap();
@@ -721,6 +720,7 @@ mod tests {
             1,
             "l".into(),
             LockerConfig::default(),
+            Default::default(),
         ))
         .unwrap();
         assert_eq!(second.len(), 2);
@@ -739,6 +739,7 @@ mod tests {
             1,
             "l".into(),
             LockerConfig::default(),
+            Default::default(),
         ))
         .unwrap();
         for i in 0..50 {
@@ -752,6 +753,7 @@ mod tests {
             1,
             "l".into(),
             LockerConfig::default().with_eager_budget(1024),
+            Default::default(),
         ));
 
         match reopened {

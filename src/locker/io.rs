@@ -1,5 +1,8 @@
 //! Streaming writer and reader for large `Vec<u8>` values.
 //!
+//! Both are refused on a closed locker: a `Writer` commits chunks of its own,
+//! so a closed locker must not be able to open one.
+//!
 //! A `Writer` is not part of `transact()`. It spans many commits. Dropping it
 //! without [`Writer::finish`] leaves the previous complete value intact;
 //! orphan chunks from the unfinished write are dropped on [`Writer::abort`].
@@ -202,12 +205,14 @@ impl Reader {
 impl LazyLocker<Vec<u8>> {
     /// Stream a large value into `key`. Not part of a `transact()` closure.
     pub async fn writer(&self, key: &str) -> Result<Writer> {
+        self.inner.ensure_open()?;
         let _guard = self.inner.write_lock.lock().await;
         Writer::start(self.inner.clone(), key.to_string()).await
     }
 
     /// Stream a stored value out. `None` if the key is missing.
     pub async fn reader(&self, key: &str) -> Result<Option<Reader>> {
+        self.inner.ensure_open()?;
         let Some(raw) = self.inner.fetch(key.as_bytes()).await? else {
             return Ok(None);
         };

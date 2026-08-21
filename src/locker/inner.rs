@@ -43,6 +43,37 @@ pub(crate) struct Shared {
     pub(crate) coherence: Coherence,
 }
 
+/// What a caller already knows about whatever is stored under a key.
+///
+/// `put` and `delete` have to GC the chunks of a value they are replacing,
+/// and the only way to find those chunks is to read the old record first.
+/// That read is a whole extra backend round trip — a second IndexedDB
+/// transaction per write — and it is pure waste whenever the caller's own RAM
+/// index already settles the question.
+///
+/// The asymmetry is the point: a wrong `Unknown` costs a read, a wrong
+/// `Absent` or `Inline` **orphans chunks forever**. So every producer of this
+/// type errs towards `Unknown`, and anything that could make the index
+/// over-claim absence — a staged deferred batch, another tab's write — forces
+/// it back to `Unknown`. See [`super::resident::Resident::prior`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Prior {
+    /// Nothing is known. Read before writing.
+    #[default]
+    Unknown,
+    /// There is provably no record under this key, so there is nothing to GC.
+    Absent,
+    /// There is a record and it is provably inline, so it names no chunks.
+    Inline,
+}
+
+impl Prior {
+    /// Whether the old record still has to be read to find chunks to GC.
+    fn needs_read(self) -> bool {
+        matches!(self, Prior::Unknown)
+    }
+}
+
 pub(crate) struct Inner {
     /// Held for the duration of a transaction, so two overlapping transactions
     /// on one locker cannot lose each other's updates. A futures mutex rather
@@ -300,11 +331,14 @@ impl Inner {
         key: &[u8],
         payload: Vec<u8>,
         flags: u8,
+        prior: Prior,
     ) -> Result<Vec<Op>> {
         let mut ops = Vec::new();
-        if let Some(existing) = self.fetch(key).await? {
-            if is_pointer(&existing) {
-                ops.push(gc_ops(&ChunkPointer::parse(&existing)?));
+        if prior.needs_read() {
+            if let Some(existing) = self.fetch(key).await? {
+                if is_pointer(&existing) {
+                    ops.push(gc_ops(&ChunkPointer::parse(&existing)?));
+                }
             }
         }
 
@@ -347,15 +381,26 @@ impl Inner {
         Ok(ops)
     }
 
-    pub(crate) async fn delete_value_ops(&self, key: &[u8]) -> Result<Vec<Op>> {
+    pub(crate) async fn delete_value_ops(&self, key: &[u8], prior: Prior) -> Result<Vec<Op>> {
         let mut ops = Vec::new();
-        if let Some(existing) = self.fetch(key).await? {
-            if is_pointer(&existing) {
-                ops.push(gc_ops(&ChunkPointer::parse(&existing)?));
+        if prior.needs_read() {
+            if let Some(existing) = self.fetch(key).await? {
+                if is_pointer(&existing) {
+                    ops.push(gc_ops(&ChunkPointer::parse(&existing)?));
+                }
             }
         }
         ops.push(self.delete_op(key));
         Ok(ops)
+    }
+
+    /// Whether a payload of this size and shape will be stored inline.
+    ///
+    /// The single source of truth for the branch `put_payload_ops` takes, so
+    /// the caller's "is this now inline?" bookkeeping cannot drift from what
+    /// was actually written.
+    pub(crate) fn stores_inline(&self, payload_len: usize, flags: u8) -> bool {
+        payload_len <= self.config.chunk_size && flags == FLAG_POSTCARD
     }
 
     /// Clear this locker's records and every chunk those records pointed at.

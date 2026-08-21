@@ -15,12 +15,21 @@ use crate::error::Result;
 use super::chunk::{chunk_key, gc_ops, ChunkPointer, FLAG_RAW};
 use super::inner::Inner;
 use super::lazy::LazyLocker;
+use super::resident::Resident;
 use crate::backend::api::{Op, Table};
 use crate::watch::Event;
 
 /// Appends raw bytes to a key. Obtain from [`LazyLocker<Vec<u8>>::writer`].
 pub struct Writer {
     inner: Arc<Inner>,
+    /// Held so `finish` can put the key into the locker's RAM index.
+    ///
+    /// Load-bearing, not cosmetic: a key the index does not list reads as
+    /// *provably absent*, and the write paths use that to skip the
+    /// read-before-write that finds chunks to GC. A streamed value missing
+    /// from the index would therefore have its chunks orphaned by the next
+    /// ordinary `put` to the same key. See [`super::inner::Prior`].
+    res: Arc<Resident>,
     key: String,
     value_id: u64,
     seq: u32,
@@ -39,11 +48,12 @@ impl std::fmt::Debug for Writer {
 }
 
 impl Writer {
-    pub(crate) async fn start(inner: Arc<Inner>, key: String) -> Result<Self> {
+    pub(crate) async fn start(inner: Arc<Inner>, res: Arc<Resident>, key: String) -> Result<Self> {
         let (value_id, bump) = inner.next_value_id().await?;
         inner.commit(vec![bump]).await?;
         Ok(Self {
             inner,
+            res,
             key,
             value_id,
             seq: 0,
@@ -102,6 +112,12 @@ impl Writer {
             value: pointer.encode(),
         });
         self.inner.commit(ops).await?;
+        // After the commit, like every other index update in the crate: an
+        // index entry for a write that failed is worse than a missing one.
+        self.res.touch_index(|index| {
+            index.insert(self.key.clone().into_bytes());
+        });
+        self.res.note_inline(self.key.as_bytes(), false);
         self.inner.announce(Event::Put {
             key: self.key.clone().into_bytes(),
         });
@@ -207,7 +223,7 @@ impl LazyLocker<Vec<u8>> {
     pub async fn writer(&self, key: &str) -> Result<Writer> {
         self.inner.ensure_open()?;
         let _guard = self.inner.write_lock.lock().await;
-        Writer::start(self.inner.clone(), key.to_string()).await
+        Writer::start(self.inner.clone(), self.res.clone(), key.to_string()).await
     }
 
     /// Stream a stored value out. `None` if the key is missing.

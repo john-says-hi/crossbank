@@ -206,6 +206,51 @@ fn a_flush_that_evicts_leaves_no_orphan_chunks() {
     });
 }
 
+/// A streamed value replaced by an ordinary `put` must not orphan its chunks.
+///
+/// The hazard the read-before-write fast path creates. `put` skips the read
+/// that finds chunks to GC whenever the RAM key index proves the key is
+/// absent — and `Writer::finish` used to store a fully chunked record without
+/// ever telling the index about it. The key therefore read as *absent* while
+/// its chunks were very much present, and the next `put` to that key wrote
+/// over the pointer with the old chunks still sitting in the `chunks` table,
+/// unreachable and unreclaimable.
+///
+/// Both halves are asserted: the index has to list the key (which is a
+/// user-visible fix in its own right — `len()` and `keys()` missed streamed
+/// values entirely) and the table has to be free of orphans afterwards.
+#[test]
+fn a_streamed_value_overwritten_by_a_put_leaves_no_orphan_chunks() {
+    block_on(async {
+        let backend = Arc::new(MemoryBackend::new());
+        let bank = Bank::with_backend(backend.clone()).await.expect("bank");
+        let locker = bank
+            .lazy_locker_with::<Vec<u8>>("streamed", LockerConfig::default().with_chunk_size(256))
+            .await
+            .expect("open");
+
+        let mut writer = locker.writer("k").await.expect("writer");
+        for _ in 0..8 {
+            writer.write_chunk(&[7u8; 256]).await.expect("write chunk");
+        }
+        writer.finish().await.expect("finish");
+
+        assert_eq!(
+            locker.keys(),
+            vec!["k".to_string()],
+            "a finished streamed value must be in the key index"
+        );
+        assert!(locker.contains_key("k"));
+        assert_no_orphan_chunks(backend.as_ref()).await;
+
+        // Small enough to be stored inline, so every chunk the writer left
+        // behind is now dead and must have been collected.
+        locker.put("k", &vec![1u8; 8]).await.expect("overwrite");
+        assert_no_orphan_chunks(backend.as_ref()).await;
+        assert_eq!(locker.get("k").await.expect("read"), Some(vec![1u8; 8]));
+    });
+}
+
 // ---- F7: a failed flush must not destroy the batch ---------------------
 
 /// `close` must keep a batch its own flush could not land.

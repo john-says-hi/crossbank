@@ -21,7 +21,7 @@ use crate::backend::api::Op;
 use crate::error::{Error, Result};
 use crate::watch::Event;
 
-use super::inner::Inner;
+use super::inner::{Inner, Prior};
 use super::lru::{self, Entry, LruState, Plan};
 use super::policy::{Commit, Policy};
 use super::transaction::TxMode;
@@ -60,6 +60,14 @@ pub(crate) struct Resident {
     /// Byte-budget accounting, present only under [`Policy::Evictable`].
     lru: Option<Mutex<LruState>>,
     staged: Mutex<Vec<Pending>>,
+    /// Keys this handle has itself stored an **inline** record under, and has
+    /// not touched since in any way that could have made it chunked.
+    ///
+    /// Purely a fast path for [`Resident::prior`], and deliberately only ever
+    /// *shrinks* on doubt: forgetting a key costs one read, wrongly keeping
+    /// one orphans chunks. `None` on a locker with no index, where absence
+    /// cannot be proven anyway.
+    known_inline: Option<Mutex<BTreeSet<Vec<u8>>>>,
 }
 
 impl std::fmt::Debug for Resident {
@@ -81,6 +89,7 @@ impl Resident {
         Self {
             inner,
             mode,
+            known_inline: index.as_ref().map(|_| Mutex::new(BTreeSet::new())),
             index: index.map(Mutex::new),
             lru: lru.map(Mutex::new),
             staged: Mutex::new(Vec::new()),
@@ -97,6 +106,62 @@ impl Resident {
     pub(crate) fn touch_index(&self, f: impl FnOnce(&mut BTreeSet<Vec<u8>>)) {
         if let Some(Ok(mut guard)) = self.index.as_ref().map(|i| i.lock()) {
             f(&mut guard);
+        }
+    }
+
+    // ---- what is already stored under a key ----------------------------
+
+    /// What this handle can prove about the record currently under `key`.
+    ///
+    /// Conservative by construction. It answers anything but
+    /// [`Prior::Unknown`] only when **all** of these hold:
+    ///
+    /// * this locker keeps a key index at all (a lazy locker; an eager one
+    ///   never writes chunks and has its own resident map);
+    /// * nothing is staged. A staged delete drops the key from the index while
+    ///   the record is still stored, so a staged batch makes the index
+    ///   over-claim *absence* — the one direction that loses data.
+    ///
+    /// `Inline` additionally requires that this handle wrote the record and
+    /// nothing has since invalidated that. See [`Resident::note_inline`].
+    pub(crate) fn prior(&self, key: &[u8]) -> Prior {
+        if self.pending_len().unwrap_or(usize::MAX) != 0 {
+            return Prior::Unknown;
+        }
+        let Some(present) = self.read_index(|index| index.contains(key)) else {
+            return Prior::Unknown;
+        };
+        if !present {
+            return Prior::Absent;
+        }
+        match self.known_inline.as_ref().map(|k| k.lock()) {
+            Some(Ok(guard)) if guard.contains(key) => Prior::Inline,
+            _ => Prior::Unknown,
+        }
+    }
+
+    /// Record that `key` now holds an inline record (`true`) or that whatever
+    /// this handle knew about it is no longer trustworthy (`false`).
+    ///
+    /// Call with `false` on every path that could have made the key chunked,
+    /// deleted it, or handed it to someone else.
+    pub(crate) fn note_inline(&self, key: &[u8], inline: bool) {
+        let Some(Ok(mut guard)) = self.known_inline.as_ref().map(|k| k.lock()) else {
+            return;
+        };
+        if inline {
+            guard.insert(key.to_vec());
+        } else {
+            guard.remove(key);
+        }
+    }
+
+    /// Forget every inline marker. The answer to anything wholesale — a
+    /// clear, a close, another tab clearing, a transaction — where tracking
+    /// each key individually would be more ways to be wrong.
+    pub(crate) fn forget_inline(&self) {
+        if let Some(Ok(mut guard)) = self.known_inline.as_ref().map(|k| k.lock()) {
+            guard.clear();
         }
     }
 
@@ -189,7 +254,7 @@ impl Resident {
             ops.push(lru::delete_op(id, key));
         }
         for victim in &plan.victims {
-            ops.extend(self.inner.delete_value_ops(victim).await?);
+            ops.extend(self.inner.delete_value_ops(victim, Prior::Unknown).await?);
             ops.push(lru::delete_op(id, victim));
         }
         ops.push(self.inner.shared.ticks.counter_op()?);
@@ -220,6 +285,9 @@ impl Resident {
                     index.remove(victim.as_slice());
                 }
             });
+            for victim in &budget.plan.victims {
+                self.note_inline(victim, false);
+            }
         }
         for key in &budget.plan.victims {
             self.inner.announce(Event::Evicted { key: key.clone() });
@@ -245,7 +313,7 @@ impl Resident {
 
         let mut ops = Vec::new();
         for victim in &plan.victims {
-            ops.extend(self.inner.delete_value_ops(victim).await?);
+            ops.extend(self.inner.delete_value_ops(victim, Prior::Unknown).await?);
             ops.push(lru::delete_op(self.inner.id, victim));
         }
         self.inner.commit(ops).await?;

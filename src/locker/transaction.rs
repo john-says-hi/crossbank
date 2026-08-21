@@ -40,7 +40,7 @@ use crate::backend::api::{Op, Table};
 use crate::error::{Error, Result};
 
 use super::chunk::{gc_ops, is_pointer, ChunkPointer, FLAG_POSTCARD};
-use super::inner::Inner;
+use super::inner::{Inner, Prior};
 
 /// Which locker is committing a write-set.
 ///
@@ -248,12 +248,12 @@ pub(crate) async fn ops_for_items(
 
     for (key, action) in actions {
         match action {
-            Action::Delete => ops.extend(inner.delete_value_ops(key).await?),
+            Action::Delete => ops.extend(inner.delete_value_ops(key, Prior::Unknown).await?),
             Action::Put(payload) => match mode {
                 TxMode::Lazy => {
                     ops.extend(
                         inner
-                            .put_payload_ops(key, payload.to_vec(), FLAG_POSTCARD)
+                            .put_payload_ops(key, payload.to_vec(), FLAG_POSTCARD, Prior::Unknown)
                             .await?,
                     );
                 }

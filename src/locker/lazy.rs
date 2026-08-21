@@ -32,7 +32,7 @@ pub struct LazyLocker<T> {
     /// The key index, the byte budget and the staged writes, shared with the
     /// coherence sink and with [`crate::Bank::flush_all`] — neither of which
     /// can know `T`.
-    res: Arc<Resident>,
+    pub(crate) res: Arc<Resident>,
     /// Keys whose stored bytes failed to decode on a `get`. See
     /// [`LazyLocker::corrupt_keys`].
     corrupt: Mutex<BTreeSet<Vec<u8>>>,
@@ -176,6 +176,7 @@ where
             self.res.touch_index(|i| {
                 i.insert(key.to_vec());
             });
+            self.res.note_inline(key, false);
             self.inner.announce(Event::Put { key: key.to_vec() });
             if full {
                 self.res.flush_locked().await?;
@@ -183,9 +184,16 @@ where
             return Ok(());
         }
 
+        // The RAM index already knows whether there is anything here to
+        // replace, so most puts need no read-before-write at all. On
+        // IndexedDB that halves the transactions per put.
+        let prior = self.res.prior(key);
+        let inline = self
+            .inner
+            .stores_inline(payload.len(), super::chunk::FLAG_POSTCARD);
         let mut ops = self
             .inner
-            .put_payload_ops(key, payload, super::chunk::FLAG_POSTCARD)
+            .put_payload_ops(key, payload, super::chunk::FLAG_POSTCARD, prior)
             .await?;
 
         let budget = self
@@ -203,6 +211,9 @@ where
         self.res.touch_index(|i| {
             i.insert(key.to_vec());
         });
+        // Only after the commit landed: a marker for a write that failed
+        // would let the *next* write skip a GC it genuinely owes.
+        self.res.note_inline(key, inline);
         self.res.apply_budget(&budget);
         self.inner.announce(Event::Put { key: key.to_vec() });
         Ok(())
@@ -257,6 +268,7 @@ where
             self.res.touch_index(|i| {
                 i.remove(key);
             });
+            self.res.note_inline(key, false);
             self.inner.announce(Event::Deleted { key: key.to_vec() });
             if full {
                 self.res.flush_locked().await?;
@@ -264,7 +276,7 @@ where
             return Ok(());
         }
 
-        let mut ops = self.inner.delete_value_ops(key).await?;
+        let mut ops = self.inner.delete_value_ops(key, self.res.prior(key)).await?;
         let budget = self
             .res
             .budget_ops(&mut ops, Vec::new(), vec![key.to_vec()], false, &[])
@@ -273,6 +285,7 @@ where
         self.res.touch_index(|i| {
             i.remove(key);
         });
+        self.res.note_inline(key, false);
         self.res.apply_budget(&budget);
         self.inner.announce(Event::Deleted { key: key.to_vec() });
         Ok(())
@@ -339,6 +352,7 @@ where
         if self.res.is_deferred() {
             let full = self.res.stage(Pending::Clear)?;
             self.res.touch_index(|i| i.clear());
+            self.res.forget_inline();
             self.inner.announce(Event::Cleared);
             if full {
                 self.res.flush_locked().await?;
@@ -353,6 +367,7 @@ where
             .await?;
         self.inner.commit(ops).await?;
         self.res.touch_index(|i| i.clear());
+        self.res.forget_inline();
         self.res.apply_budget(&budget);
         self.inner.announce(Event::Cleared);
         Ok(())
@@ -441,6 +456,10 @@ where
                 }
             }
         });
+        // A transaction takes the `Prior::Unknown` path throughout, so it
+        // learns nothing about shape. Forgetting wholesale is both correct and
+        // fewer ways to be wrong than tracking each key it touched.
+        self.res.forget_inline();
         self.res.apply_budget(&budget);
 
         for entry in &entries {
@@ -675,6 +694,7 @@ impl crate::coherence::Sink for LazySink {
         }
         if announcement.cleared {
             self.res.touch_index(|index| index.clear());
+            self.res.forget_inline();
             // The byte budget has to follow the index, or this tab's
             // accounting drifts from what storage holds and it starts evicting
             // against a total that describes a locker that no longer exists.
@@ -690,6 +710,10 @@ impl crate::coherence::Sink for LazySink {
                     index.insert(change.key.clone());
                 }
             });
+            // Another tab may have replaced an inline record with a chunked
+            // one. This tab's marker is stale either way, and a stale
+            // `Inline` would skip the GC of chunks it did not write.
+            self.res.note_inline(&change.key, false);
             // The size, where it can be had without awaiting: an inlined value
             // is opened through this tab's own filter chain, and a chunked one
             // announced its payload length. Anything else marks the accounting
@@ -808,6 +832,7 @@ impl<T> LazyLocker<T> {
         let forced = self.inner.flush_backend().await;
         self.inner.mark_closed();
         self.res.touch_index(|index| index.clear());
+        self.res.forget_inline();
         flushed.and(forced)
     }
 

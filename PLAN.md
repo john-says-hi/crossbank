@@ -418,7 +418,8 @@ dense `f64` candle data is still open — this snapshot used a compressible
 ramp, not IEEE floats. Do not drop LZ4 from the default chain on this evidence.
 
 Web timings (`tests/bench_web.rs`, ignored) land the same named workloads
-against IndexedDB; they are not in this table yet.
+against IndexedDB; they are not in this table, but they are paired against
+Hive CE on IndexedDB under **Web comparison (2026-08-21)** below.
 
 ### M4 numbers (2026-08-20, same machine)
 
@@ -486,15 +487,75 @@ per operation.
 Caveats that make this a comparison of *engines on identical byte workloads*, not of apps:
 different languages and runtimes (Dart GC vs none), `Uint8List` vs `Vec<u8>` through postcard,
 Hive `TypeAdapter`s are bypassed, and Hive's eager `Box.get` is a `Map` lookup exactly as
-crossbank's `Locker::get` is. Web Hive (IndexedDB) vs crossbank IndexedDB was not run: the
-Dart-web compile is a time sink and the native comparison already answers the design question.
-It stays a follow-up.
+crossbank's `Locker::get` is. Web Hive (IndexedDB) vs crossbank IndexedDB was not run in this
+snapshot; it is the next section, measured 2026-08-21.
 
 **What the numbers change in the plan:** nothing in the design; one item in the roadmap.
 The durable-per-put cost is real for the `settings_eager` shape (Hive `Box`-style UI settings
 written on every toggle). M5 gains a small, explicit item: a *write-coalescing* option for
 eager lockers (`Policy`-level, off by default) so a burst of settings writes can share one
 commit without giving up durability-on-return for callers that want it.
+
+### Web comparison (2026-08-21) — Hive CE IndexedDB vs crossbank IndexedDB
+
+This is the comparison that decides "can crossbank replace Hive **on the web**", and until now
+it had never been run. Both halves drove the **same browser binary**: Google Chrome
+151.0.7922.108 — Playwright `executablePath` for the Hive half, chromedriver for the wasm half.
+Raw JSON: `bench/results/2026-08-21-web.json`. Reproduce with
+`ci/bench.sh --hive --web` (Hive half) and `ci/bench.sh --web` (crossbank half).
+
+**Read the durability column first — and note that on the web there isn't one.** Natively,
+crossbank's advantage in the table above is bought with an fsync per put and Hive's speed is
+bought by not having one. On IndexedDB *neither* engine is fsync-durable: Chromium runs
+IndexedDB transactions in `"relaxed"` durability by default, so a resolved put means "the
+transaction committed to the browser's store", not "the bytes survive a power cut". Hive CE web
+puts are not fsync-durable, and crossbank's IndexedDB backend inherits exactly the same
+browser-dependent guarantee. So unlike the native table, this one really is speed vs speed.
+
+The apples-to-apples pair — `tests/bench_web.rs` shapes, mirrored byte-for-byte by
+`bench/hive_ce/web`:
+
+| Workload (200 ops each) | Hive CE (IndexedDB) | crossbank (IndexedDB) |
+|---|---|---|
+| `settings_eager_web_small` — 50 × 1 KiB warm, 200 in-memory gets | 0.10 ms (0.5 µs/op) | < 1 ms — below `Date.now()` resolution |
+| `bulk_lazy_put_web_small` — 200 × 256 B, one put each | **21 ms** (p99 445 ms) | 41 ms (33–49 ms over three runs) |
+| `bulk_lazy_get_web_small` — 200 lazy gets | **14 ms** (p99 69 ms) | 26 ms (16–27 ms over three runs) |
+
+**The headline: crossbank is within ~2× of Hive CE on the web, on both puts and lazy gets, and
+ties on eager settings reads.** That is a completely different picture from the native table's
+35× put gap, and it is the expected one — on the web both engines are queueing work into the
+same IndexedDB, so the per-op cost is dominated by the browser, not by redb commits or Hive's
+append log. crossbank pays LZ4+CRC and a postcard envelope per value on top; ~2× is what that
+tax costs today, *before* any Phase 3 perf work. Hive's p99s are far worse than its medians
+(445 ms on puts vs a 21 ms median) — IndexedDB pauses hit it too, and the crossbank single-shot
+numbers cannot show that at all yet.
+
+Hive CE web rows with no crossbank counterpart yet (the large native shapes), for the re-run
+after Phase 3 lands:
+
+| Workload | Hive CE web | Hive CE native file | web tax |
+|---|---|---|---|
+| `settings_eager` — 1000 ops, 90/10 | 10.9 ms | 4.0 ms | 2.7× |
+| `bulk_lazy_put` — 2000 × 256 B | 362 ms | 27 ms | 13× |
+| `bulk_lazy_get` — 1000 gets | 69 ms | 19 ms | 3.6× |
+| `txn_batch` — 100 in one `putAll` | 4.0 ms | 0.11 ms | 36× |
+| `reopen` | 0.30 ms | 1.25 ms | 0.24× (faster) |
+| `big_value_put_get` — 8 MiB | 14.3 ms | 50 ms | 0.29× (faster) |
+
+**Method deviations, stated plainly.** The Hive half is a median/p99 over 20 iterations with a
+warm-up, timed with `performance.now()`. The crossbank half is `tests/bench_web.rs`: **one
+un-warmed shot**, timed with `Date.now()` (1 ms resolution), so it reports no p99 and a
+sub-millisecond loop reads as 0. The wasm build is `--release`; a debug build measured
+49 ms / 27 ms on the same two rows, which is why the lane defaults to release. The
+wasm-bindgen runner exits non-zero on this machine *after* printing its JSON (the browser is
+lost during the test's own database teardown); `ci/bench.sh` records the printed rows and warns,
+because a bench is not a gate.
+
+**The remaining Phase 5 item is unification.** `tests/bench_web.rs` runs the *small* shapes
+(50 settings keys, 200 bulk ops) while `benches/kv.rs` and `bench/hive_ce` run the large ones.
+`bench/hive_ce/web` emits both, which is how one honest pair exists today, but the real fix is
+to move `bench_web.rs` onto the large shapes with a warm-up and a median — then every row in
+the first table above gets a crossbank column.
 
 ---
 

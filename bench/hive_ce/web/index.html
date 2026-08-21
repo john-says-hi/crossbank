@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Hive CE web bench (IndexedDB)</title>
+    <!-- No CSP header, no external origins: the driver serves this directory
+         over plain http from one origin so IndexedDB is same-origin. -->
+  </head>
+  <body>
+    <h1>Hive CE web bench</h1>
+    <p>
+      Hive CE on IndexedDB, same named workloads and byte payloads as
+      <code>bench/hive_ce/bin/hive_ce_bench.dart</code>.
+      Result is printed to the console as <code>BENCH_JSON &lt;json&gt;</code>
+      and parked on <code>globalThis.__benchResult</code>.
+      Override the iteration count with <code>?iters=N</code>.
+    </p>
+    <pre id="status">running…</pre>
+    <script src="main.dart.js" defer></script>
+    <script>
+      setInterval(function () {
+        var el = document.getElementById('status');
+        if (globalThis.__benchError) {
+          el.textContent = 'ERROR: ' + globalThis.__benchError;
+        } else if (globalThis.__benchDone) {
+          el.textContent = 'done';
+        } else if (globalThis.__benchProgress) {
+          el.textContent = 'running ' + globalThis.__benchProgress + '…';
+        }
+      }, 250);
+    </script>
+  </body>
+</html>

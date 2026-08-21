@@ -12,3 +12,6 @@
 
 # Dart bench tool
 bench/hive_ce/.dart_tool/
+bench/hive_ce/web/main.dart.js
+bench/hive_ce/web/main.dart.js.deps
+bench/hive_ce/web/main.dart.js.map

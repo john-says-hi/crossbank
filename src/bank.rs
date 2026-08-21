@@ -122,8 +122,9 @@ pub struct Bank {
     /// made the name read as closed while the first was still live, which let
     /// `delete_locker` and `quarantine` run under a working locker.
     open_lockers: Mutex<HashMap<String, Vec<Weak<Inner>>>>,
-    /// Bank-wide allocator for chunk value ids, cloned into every locker.
-    value_ids: Arc<crate::locker::chunk::ValueIds>,
+    /// Bank-wide counters (chunk value ids, LRU ticks), cloned into every
+    /// locker so two handles on one name cannot collide.
+    counters: Arc<crate::locker::inner::Counters>,
     closed: AtomicBool,
 }
 
@@ -293,7 +294,7 @@ impl Bank {
             job_sender,
             job_receiver: Mutex::new(Some(job_receiver)),
             open_lockers: Mutex::new(HashMap::new()),
-            value_ids: Arc::new(crate::locker::chunk::ValueIds::default()),
+            counters: Arc::new(crate::locker::inner::Counters::default()),
             closed: AtomicBool::new(false),
         };
         bank.check_or_write_format_version().await?;
@@ -403,7 +404,7 @@ impl Bank {
             id,
             name.to_string(),
             config,
-            self.value_ids.clone(),
+            self.counters.clone(),
         )
         .await?;
         self.register_open(name, locker.inner());
@@ -437,7 +438,7 @@ impl Bank {
             id,
             name.to_string(),
             config,
-            self.value_ids.clone(),
+            self.counters.clone(),
         )
         .await?;
         self.register_open(name, locker.inner());
@@ -619,7 +620,7 @@ impl Bank {
             id,
             name: name.to_string(),
             config: LockerConfig::default(),
-            value_ids: self.value_ids.clone(),
+            counters: self.counters.clone(),
             watchers: Default::default(),
             closed: std::sync::atomic::AtomicBool::new(false),
         })

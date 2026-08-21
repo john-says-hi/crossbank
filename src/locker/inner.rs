@@ -15,13 +15,28 @@ use crate::codec::{self, FilterChain};
 use crate::error::{Error, Result};
 use crate::key::{self, LockerId};
 
-use super::chunk::{chunk_key, gc_ops, is_pointer, ChunkPointer, ValueIds, FLAG_POSTCARD, FLAG_RAW};
+use super::chunk::{
+    chunk_key, gc_ops, is_pointer, ChunkPointer, ValueIds, FLAG_POSTCARD, FLAG_RAW,
+};
+use super::lru::Ticks;
 use super::policy::LockerConfig;
 use crate::watch::{Event, Watchers};
 
 /// How many records a single scan page pulls. Bounded because an IndexedDB
 /// cursor cannot outlive its transaction, so every scan pages regardless.
 pub(crate) const SCAN_PAGE: usize = 256;
+
+/// The bank-wide counters every locker shares.
+///
+/// Bundled into one handle rather than passed separately so that adding a
+/// counter does not ripple through every `open` signature in the crate.
+#[derive(Debug, Default)]
+pub(crate) struct Counters {
+    /// Allocates chunk value ids. See [`ValueIds`].
+    pub(crate) values: ValueIds,
+    /// The logical clock the LRU orders by. See [`Ticks`].
+    pub(crate) ticks: Ticks,
+}
 
 pub(crate) struct Inner {
     /// Held for the duration of a transaction, so two overlapping transactions
@@ -34,8 +49,8 @@ pub(crate) struct Inner {
     pub(crate) name: String,
     pub(crate) config: LockerConfig,
     /// Shared with the bank and with every other locker it opened, so chunk
-    /// value ids are unique bank-wide rather than per handle.
-    pub(crate) value_ids: Arc<ValueIds>,
+    /// value ids and LRU ticks are unique bank-wide rather than per handle.
+    pub(crate) counters: Arc<Counters>,
     pub(crate) watchers: Watchers,
     /// Set by `Locker::close` / `LazyLocker::close`.
     ///
@@ -171,7 +186,7 @@ impl Inner {
     }
 
     pub(crate) async fn next_value_id(&self) -> Result<(u64, Op)> {
-        self.value_ids.allocate(self.backend.as_ref()).await
+        self.counters.values.allocate(self.backend.as_ref()).await
     }
 
     /// Ops to store `postcard` bytes at `key`, chunking when needed, and to

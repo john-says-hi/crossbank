@@ -7,6 +7,7 @@ pub mod eager;
 pub(crate) mod inner;
 pub mod io;
 pub mod lazy;
+pub(crate) mod lru;
 pub mod policy;
 pub mod transaction;
 

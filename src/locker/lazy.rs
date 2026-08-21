@@ -15,13 +15,14 @@ use std::sync::{Arc, Mutex};
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::backend::api::Backend;
+use crate::backend::api::{Backend, Op};
 use crate::codec::FilterChain;
 use crate::error::{Error, Result};
 use crate::key::LockerId;
 
 use super::inner::Inner;
-use super::policy::{LockerConfig, OnCorrupt};
+use super::lru::{self, Entry, LruState, Plan};
+use super::policy::{LockerConfig, OnCorrupt, Policy};
 use super::transaction::{Staged, Transaction, TxMode};
 use crate::watch::Event;
 
@@ -32,6 +33,11 @@ pub struct LazyLocker<T> {
     /// Keys whose stored bytes failed to decode on a `get`. See
     /// [`LazyLocker::corrupt_keys`].
     corrupt: Mutex<BTreeSet<Vec<u8>>>,
+    /// Byte-budget accounting, present only under [`Policy::Evictable`].
+    ///
+    /// `None` for a `Precious` locker, which is what makes eviction cost
+    /// exactly nothing for the lockers that refuse it.
+    lru: Option<Mutex<LruState>>,
     _value: PhantomData<fn() -> T>,
 }
 
@@ -54,7 +60,7 @@ where
         id: LockerId,
         name: String,
         config: LockerConfig,
-        value_ids: Arc<super::chunk::ValueIds>,
+        counters: Arc<super::inner::Counters>,
     ) -> Result<Self> {
         let inner = Arc::new(Inner {
             write_lock: futures::lock::Mutex::new(()),
@@ -63,7 +69,7 @@ where
             id,
             name,
             config,
-            value_ids,
+            counters,
             watchers: Default::default(),
             closed: AtomicBool::new(false),
         });
@@ -83,10 +89,29 @@ where
             )
             .await?;
 
+        // Eviction accounting is one more prefix scan, of `meta` this time,
+        // and only for a locker that asked for a budget.
+        let lru = match config.policy {
+            Policy::Precious => None,
+            Policy::Evictable { max_bytes } => {
+                let mut state = lru::load(inner.backend.as_ref(), inner.id, max_bytes).await?;
+                // Reconcile with what storage actually holds. A locker first
+                // written as `Precious` and reopened as `Evictable` has keys
+                // with no accounting, and a crash between two commits could
+                // leave accounting with no key.
+                state.retain_keys(|k| index.contains(k));
+                for key in &index {
+                    state.adopt(key.clone());
+                }
+                Some(Mutex::new(state))
+            }
+        };
+
         Ok(Self {
             inner,
             index: Mutex::new(index),
             corrupt: Mutex::new(BTreeSet::new()),
+            lru,
             _value: PhantomData,
         })
     }
@@ -107,6 +132,25 @@ where
     /// [`LazyLocker::corrupt_keys`] on the way out.
     pub async fn get_by(&self, key: &[u8]) -> Result<Option<T>> {
         self.inner.ensure_open()?;
+        let found = self.load_and_note(key).await;
+        if matches!(found, Ok(Some(_))) {
+            // A read must not write, so the bumped tick is recorded in RAM and
+            // rides along with the next commit. Losing the last few bumps to a
+            // crash costs nothing but eviction order.
+            let tick = self
+                .inner
+                .counters
+                .ticks
+                .allocate(self.inner.backend.as_ref())
+                .await?;
+            if let Some(mut state) = self.lru_lock() {
+                state.touch(key, tick);
+            }
+        }
+        found
+    }
+
+    async fn load_and_note(&self, key: &[u8]) -> Result<Option<T>> {
         match self.inner.load_value(key).await {
             Err(e) if self.inner.config.on_corrupt == OnCorrupt::Skip && e.is_corruption() => {
                 if let Ok(mut guard) = self.corrupt.lock() {
@@ -129,15 +173,32 @@ where
         let _guard = self.inner.write_lock.lock().await;
         let payload = postcard::to_allocvec(value)
             .map_err(|e| Error::Filter(format!("postcard serialisation failed: {e}")))?;
-        let ops = self
+        let bytes = payload.len() as u64;
+        let mut ops = self
             .inner
             .put_payload_ops(key, payload, super::chunk::FLAG_POSTCARD)
             .await?;
+
+        let budget = self
+            .budget_ops(
+                &mut ops,
+                vec![(key.to_vec(), bytes)],
+                Vec::new(),
+                false,
+                Some(key),
+            )
+            .await?;
+
         self.inner.commit(ops).await?;
+        self.apply_budget(&budget);
         self.touch_index(|i| {
             i.insert(key.to_vec());
+            for victim in &budget.plan.victims {
+                i.remove(victim.as_slice());
+            }
         });
         self.inner.announce(Event::Put { key: key.to_vec() });
+        self.announce_evictions(&budget);
         Ok(())
     }
 
@@ -150,8 +211,12 @@ where
     pub async fn delete_by(&self, key: &[u8]) -> Result<()> {
         self.inner.ensure_open()?;
         let _guard = self.inner.write_lock.lock().await;
-        let ops = self.inner.delete_value_ops(key).await?;
+        let mut ops = self.inner.delete_value_ops(key).await?;
+        let budget = self
+            .budget_ops(&mut ops, Vec::new(), vec![key.to_vec()], false, None)
+            .await?;
         self.inner.commit(ops).await?;
+        self.apply_budget(&budget);
         self.touch_index(|i| {
             i.remove(key);
         });
@@ -217,8 +282,12 @@ where
     pub async fn clear(&self) -> Result<()> {
         self.inner.ensure_open()?;
         let _guard = self.inner.write_lock.lock().await;
-        let ops = self.inner.clear_value_ops().await?;
+        let mut ops = self.inner.clear_value_ops().await?;
+        let budget = self
+            .budget_ops(&mut ops, Vec::new(), Vec::new(), true, None)
+            .await?;
         self.inner.commit(ops).await?;
+        self.apply_budget(&budget);
         self.touch_index(|i| i.clear());
         self.inner.announce(Event::Cleared);
         Ok(())
@@ -254,8 +323,36 @@ where
             return Ok(());
         }
 
-        let ops = Transaction::<T>::ops_for(&self.inner, &entries, TxMode::Lazy).await?;
+        let mut ops = Transaction::<T>::ops_for(&self.inner, &entries, TxMode::Lazy).await?;
+
+        // One transaction is one moment: every key it wrote is equally recent,
+        // so they share a tick rather than being ordered by staging order.
+        let cleared = entries.iter().any(|e| matches!(e, Staged::Clear));
+        let mut updates: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut removals: Vec<Vec<u8>> = Vec::new();
+        for entry in &entries {
+            match entry {
+                Staged::Put { key, payload, .. } => {
+                    updates.retain(|(k, _)| k != key);
+                    removals.retain(|k| k != key);
+                    updates.push((key.clone(), payload.len() as u64));
+                }
+                Staged::Delete { key } => {
+                    updates.retain(|(k, _)| k != key);
+                    removals.push(key.clone());
+                }
+                Staged::Clear => {
+                    updates.clear();
+                    removals.clear();
+                }
+            }
+        }
+        let budget = self
+            .budget_ops(&mut ops, updates, removals, cleared, None)
+            .await?;
+
         self.inner.commit(ops).await?;
+        self.apply_budget(&budget);
 
         // Index updates only after the commit lands, so a failed write cannot
         // leave the index claiming keys that were never stored.
@@ -271,6 +368,9 @@ where
                     Staged::Clear => i.clear(),
                 }
             }
+            for victim in &budget.plan.victims {
+                i.remove(victim.as_slice());
+            }
         });
 
         for entry in &entries {
@@ -280,6 +380,7 @@ where
                 Staged::Clear => self.inner.announce(Event::Cleared),
             }
         }
+        self.announce_evictions(&budget);
         Ok(())
     }
 
@@ -350,6 +451,76 @@ where
         ))
     }
 
+    /// Everything one commit is about to do to the byte budget.
+    ///
+    /// Computed before the commit, applied after it lands — so a commit that
+    /// fails leaves the accounting describing what is actually stored.
+    async fn budget_ops(
+        &self,
+        ops: &mut Vec<Op>,
+        updates: Vec<(Vec<u8>, u64)>,
+        removals: Vec<Vec<u8>>,
+        cleared: bool,
+        keep: Option<&[u8]>,
+    ) -> Result<Budget> {
+        if self.lru.is_none() {
+            return Ok(Budget::default());
+        }
+
+        let tick = self
+            .inner
+            .counters
+            .ticks
+            .allocate(self.inner.backend.as_ref())
+            .await?;
+        let updates: Vec<(Vec<u8>, Entry)> = updates
+            .into_iter()
+            .map(|(key, bytes)| (key, Entry { tick, bytes }))
+            .collect();
+
+        // The lock is taken, used, and dropped before any await below. A
+        // `std` mutex held across an await would deadlock the moment two
+        // futures on one thread interleaved.
+        let (plan, pending, mut pending_ops) = {
+            let Some(state) = self.lru_lock() else {
+                return Ok(Budget::default());
+            };
+            let plan = state.plan(&updates, &removals, cleared, state.max_bytes, keep);
+            let skip: Vec<Vec<u8>> = updates.iter().map(|(k, _)| k.clone()).collect();
+            let (pending, pending_ops) = if cleared {
+                (Vec::new(), Vec::new())
+            } else {
+                state.pending_ops(self.inner.id, &skip)
+            };
+            (plan, pending, pending_ops)
+        };
+
+        let id = self.inner.id;
+        if cleared {
+            ops.push(lru::clear_op(id));
+        }
+        for (key, entry) in &updates {
+            ops.push(lru::put_op(id, key, *entry));
+        }
+        ops.append(&mut pending_ops);
+        for key in &removals {
+            ops.push(lru::delete_op(id, key));
+        }
+        for victim in &plan.victims {
+            ops.extend(self.inner.delete_value_ops(victim).await?);
+            ops.push(lru::delete_op(id, victim));
+        }
+        ops.push(self.inner.counters.ticks.counter_op()?);
+
+        Ok(Budget {
+            updates,
+            removals,
+            cleared,
+            plan,
+            pending,
+        })
+    }
+
     async fn collect(
         &self,
         start: Bound<&[u8]>,
@@ -386,7 +557,99 @@ where
 /// Bounds-free accessors. Split out so `Debug` — and any caller holding a
 /// `LazyLocker<T>` for a `T` that is not itself serialisable — can still ask
 /// about the index.
+/// What one commit does to an evictable locker's accounting.
+///
+/// Empty, and free, for a `Precious` locker.
+#[derive(Debug, Default)]
+struct Budget {
+    updates: Vec<(Vec<u8>, Entry)>,
+    removals: Vec<Vec<u8>>,
+    cleared: bool,
+    plan: Plan,
+    /// Deferred tick bumps this commit carried, to forget once it lands.
+    pending: Vec<Vec<u8>>,
+}
+
 impl<T> LazyLocker<T> {
+    fn lru_lock(&self) -> Option<std::sync::MutexGuard<'_, LruState>> {
+        self.lru.as_ref()?.lock().ok()
+    }
+
+    fn apply_budget(&self, budget: &Budget) {
+        if let Some(mut state) = self.lru_lock() {
+            state.apply(
+                &budget.updates,
+                &budget.removals,
+                budget.cleared,
+                &budget.plan,
+            );
+            state.clear_pending(&budget.pending);
+        }
+    }
+
+    fn announce_evictions(&self, budget: &Budget) {
+        for key in &budget.plan.victims {
+            self.inner.announce(Event::Evicted { key: key.clone() });
+        }
+    }
+
+    /// Payload bytes this locker is accounted as holding, or 0 when it has no
+    /// budget to hold them against.
+    ///
+    /// Counts the values as the caller handed them over, not their on-disk
+    /// footprint — see the module docs on why an on-disk figure would be both
+    /// backend-dependent and unstable.
+    pub fn budget_used(&self) -> u64 {
+        self.lru_lock().map(|s| s.total()).unwrap_or(0)
+    }
+
+    /// Shed least-recently-used keys until at most `bytes` remain accounted.
+    ///
+    /// Returns how many keys went. A `Precious` locker sheds nothing and
+    /// returns 0: this method never turns a locker that refuses eviction into
+    /// one that performs it.
+    ///
+    /// Each shed key raises [`crate::Event::Evicted`], and the data is gone —
+    /// this is the same deletion the budget performs on its own, asked for
+    /// early.
+    pub async fn evict_to(&self, bytes: u64) -> Result<usize> {
+        self.inner.ensure_open()?;
+        if self.lru.is_none() {
+            return Ok(0);
+        }
+        let _guard = self.inner.write_lock.lock().await;
+
+        let plan = {
+            let Some(state) = self.lru_lock() else {
+                return Ok(0);
+            };
+            state.plan(&[], &[], false, bytes, None)
+        };
+        if plan.victims.is_empty() {
+            return Ok(0);
+        }
+
+        let mut ops = Vec::new();
+        for victim in &plan.victims {
+            ops.extend(self.inner.delete_value_ops(victim).await?);
+            ops.push(lru::delete_op(self.inner.id, victim));
+        }
+        self.inner.commit(ops).await?;
+
+        let budget = Budget {
+            plan,
+            ..Budget::default()
+        };
+        self.apply_budget(&budget);
+        self.touch_index(|i| {
+            for victim in &budget.plan.victims {
+                i.remove(victim.as_slice());
+            }
+        });
+        self.announce_evictions(&budget);
+        Ok(budget.plan.victims.len())
+    }
+
     pub fn name(&self) -> &str {
         &self.inner.name
     }

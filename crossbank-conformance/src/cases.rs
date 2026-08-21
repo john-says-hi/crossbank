@@ -12,7 +12,7 @@
 //!   "panics" is not.
 //! * Never rely on `Drop` for cleanup. With abort there is no unwinding.
 
-use crossbank::{Bank, Error, Event, LockerConfig, OnCorrupt, Result};
+use crossbank::{Bank, Error, Event, LockerConfig, OnCorrupt, Policy, Result};
 use futures::StreamExt;
 
 use crate::Harness;
@@ -1132,5 +1132,152 @@ pub async fn usage_is_reported_where_declared<H: Harness>(h: &H) -> Result<()> {
     // A closed bank answers Closed rather than reaching for the platform.
     bank.close().await?;
     assert!(matches!(bank.usage().await, Err(Error::Closed)));
+    Ok(())
+}
+
+/// A lazy locker with a byte budget stays inside it.
+///
+/// The budget counts payload bytes — the values as the caller handed them
+/// over — so the arithmetic here is the caller's arithmetic, not a guess at a
+/// compressed on-disk footprint.
+pub async fn evictable_locker_stays_under_its_budget<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let locker = bank
+        .lazy_locker_with::<Vec<u8>>(
+            "capped",
+            LockerConfig::default().with_policy(Policy::Evictable { max_bytes: 4_096 }),
+        )
+        .await?;
+
+    // Ten 1 KiB values into a 4 KiB budget. Six of them have to go.
+    for i in 0..10u32 {
+        locker
+            .put(&format!("k{i:02}"), &vec![i as u8; 1_000])
+            .await?;
+        assert!(
+            locker.budget_used() <= 4_096,
+            "budget exceeded after {i} writes: {}",
+            locker.budget_used()
+        );
+    }
+
+    assert!(locker.len() <= 4, "at most four 1 KiB values fit in 4 KiB");
+    assert!(!locker.is_empty(), "the budget must not empty the locker");
+
+    // The newest write is always the one that survives.
+    assert_eq!(locker.get("k09").await?, Some(vec![9u8; 1_000]));
+
+    // Shedding further on demand works, and is reported.
+    let before = locker.len();
+    let shed = locker.evict_to(1_500).await?;
+    assert!(shed > 0, "asking for a smaller budget must shed something");
+    assert_eq!(locker.len(), before - shed);
+    assert!(locker.budget_used() <= 1_500);
+
+    // An evicted key reads as absent, not as an error.
+    for key in locker.keys() {
+        assert!(locker.get(&key).await?.is_some());
+    }
+
+    // A `Precious` locker refuses all of it: the budget is opt-in, and
+    // `evict_to` never turns a locker that refuses eviction into one that
+    // performs it.
+    let precious = bank.lazy_locker::<Vec<u8>>("precious").await?;
+    for i in 0..10u32 {
+        precious.put(&format!("k{i:02}"), &vec![0u8; 1_000]).await?;
+    }
+    assert_eq!(precious.len(), 10);
+    assert_eq!(precious.evict_to(0).await?, 0);
+    assert_eq!(precious.len(), 10);
+    assert_eq!(precious.budget_used(), 0, "no budget, nothing accounted");
+    Ok(())
+}
+
+/// Eviction sheds the least recently *used* key, not the least recently
+/// written one.
+pub async fn eviction_prefers_the_least_recently_used<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let locker = bank
+        .lazy_locker_with::<Vec<u8>>(
+            "lru",
+            // Room for three 1 KiB values, not four.
+            LockerConfig::default().with_policy(Policy::Evictable { max_bytes: 3_100 }),
+        )
+        .await?;
+    let mut events = locker.watch();
+
+    for key in ["a", "b", "c"] {
+        locker.put(key, &vec![7u8; 1_000]).await?;
+    }
+    // Read `a`, making `b` the oldest by use even though `a` is oldest by
+    // write. This is the whole distinction the case exists to pin.
+    assert!(locker.get("a").await?.is_some());
+
+    locker.put("d", &vec![7u8; 1_000]).await?;
+
+    assert!(locker.contains_key("a"), "a was read, so it must survive");
+    assert!(!locker.contains_key("b"), "b was least recently used");
+    assert!(locker.contains_key("c"));
+    assert!(locker.contains_key("d"));
+    assert_eq!(
+        locker.get("b").await?,
+        None,
+        "an evicted key reads as absent"
+    );
+
+    let mut evicted = Vec::new();
+    while let Some(event) = events.try_recv() {
+        if let Event::Evicted { key } = event {
+            evicted.push(key);
+        }
+    }
+    assert_eq!(
+        evicted,
+        vec![b"b".to_vec()],
+        "eviction must be announced, and name the key that went"
+    );
+    Ok(())
+}
+
+/// Eviction bookkeeping survives a reopen on a backend that persists.
+///
+/// The LRU records live in `meta` and are written in the same commit as the
+/// put they describe, so a reopened locker must still know what it is holding
+/// rather than starting from zero and blowing straight past its budget.
+pub async fn eviction_accounting_survives_a_reopen<H: Harness>(h: &H) -> Result<()> {
+    let config = LockerConfig::default().with_policy(Policy::Evictable { max_bytes: 3_100 });
+    {
+        let bank = bank(h).await?;
+        let locker = bank.lazy_locker_with::<Vec<u8>>("lru", config).await?;
+        for key in ["a", "b", "c"] {
+            locker.put(key, &vec![7u8; 1_000]).await?;
+        }
+        assert_eq!(locker.budget_used(), 3_006);
+        bank.close().await?;
+    }
+
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker_with::<Vec<u8>>("lru", config).await?;
+
+    if !h.caps().persists_across_open {
+        assert_eq!(
+            locker.budget_used(),
+            0,
+            "nothing persisted, nothing accounted"
+        );
+        return Ok(());
+    }
+
+    assert_eq!(
+        locker.budget_used(),
+        3_006,
+        "a reopened locker must recover what it is already holding"
+    );
+
+    // Writing one more still evicts exactly one, rather than starting the
+    // budget over and holding four.
+    locker.put("d", &vec![7u8; 1_000]).await?;
+    assert_eq!(locker.len(), 3);
+    assert!(locker.budget_used() <= 3_100);
     Ok(())
 }

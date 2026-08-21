@@ -41,6 +41,13 @@ pub enum Event {
     Deleted { key: Vec<u8> },
     /// Every key was removed at once.
     Cleared,
+    /// A key was shed to keep an [`crate::Policy::Evictable`] locker inside
+    /// its byte budget.
+    ///
+    /// Distinct from [`Event::Deleted`] on purpose: nobody asked for this one.
+    /// A subscriber that treats it as a cache miss and refetches is behaving
+    /// correctly; one that treats it as a user deletion is not.
+    Evicted { key: Vec<u8> },
     /// The subscriber fell behind and `skipped` events were dropped.
     ///
     /// Delivered before the next event that does get through, so a subscriber
@@ -53,7 +60,7 @@ impl Event {
     /// events that concern no single key.
     pub fn key_bytes(&self) -> &[u8] {
         match self {
-            Self::Put { key } | Self::Deleted { key } => key,
+            Self::Put { key } | Self::Deleted { key } | Self::Evicted { key } => key,
             Self::Cleared | Self::Lagged { .. } => &[],
         }
     }
@@ -66,7 +73,9 @@ impl Event {
     /// [`Event::key_bytes`] and branch on the variant instead.
     pub fn key(&self) -> Option<&str> {
         match self {
-            Self::Put { key } | Self::Deleted { key } => std::str::from_utf8(key).ok(),
+            Self::Put { key } | Self::Deleted { key } | Self::Evicted { key } => {
+                std::str::from_utf8(key).ok()
+            }
             Self::Cleared | Self::Lagged { .. } => None,
         }
     }

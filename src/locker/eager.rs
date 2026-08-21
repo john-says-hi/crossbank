@@ -62,7 +62,7 @@ where
         id: LockerId,
         name: String,
         config: LockerConfig,
-        value_ids: Arc<super::chunk::ValueIds>,
+        counters: Arc<super::inner::Counters>,
     ) -> Result<Self> {
         // Eviction and residency contradict each other: shedding a value from
         // storage while RAM still holds it leaves a replica that outlives the
@@ -81,7 +81,7 @@ where
             id,
             name,
             config,
-            value_ids,
+            counters,
             watchers: Default::default(),
             closed: AtomicBool::new(false),
         });

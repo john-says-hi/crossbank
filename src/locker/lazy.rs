@@ -137,6 +137,60 @@ where
         Ok(())
     }
 
+    /// Store many entries in **one** atomic commit. Hive's `putAll`.
+    ///
+    /// Everything lands together or nothing does. This is also the answer to
+    /// bulk writes being slow: one commit rather than N.
+    pub async fn put_all(&self, entries: impl IntoIterator<Item = (String, T)>) -> Result<()> {
+        let entries: Vec<(String, T)> = entries.into_iter().collect();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.transact(move |tx| async move {
+            for (key, value) in entries {
+                tx.put(&key, value)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Remove many keys in **one** atomic commit. Hive's `deleteAll`.
+    ///
+    /// Removing an absent key is not an error.
+    pub async fn delete_all(&self, keys: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
+        let keys: Vec<String> = keys.into_iter().map(|k| k.as_ref().to_string()).collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.transact(move |tx| async move {
+            for key in keys {
+                tx.delete(&key)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Every entry, in byte order. UTF-8 keys only.
+    ///
+    /// Reads every value, so the cost is the whole locker — the opposite of
+    /// what a lazy locker is for. Reach for it on small lockers, or on the way
+    /// out of one (a migration, an export), not on a hot path.
+    pub async fn entries(&self) -> Result<Vec<(String, T)>> {
+        self.range(..).await
+    }
+
+    /// Every entry as a map, in byte order. Hive's `toMap`.
+    ///
+    /// UTF-8 keys only: a key that is not valid UTF-8 is **skipped**, since a
+    /// `BTreeMap<String, T>` has no way to spell it. Use
+    /// [`LazyLocker::range_by`] over an unbounded range to see every key.
+    /// Carries the same whole-locker cost as [`LazyLocker::entries`].
+    pub async fn to_map(&self) -> Result<std::collections::BTreeMap<String, T>> {
+        Ok(self.entries().await?.into_iter().collect())
+    }
+
     /// Remove everything in this locker, and nothing outside it.
     pub async fn clear(&self) -> Result<()> {
         self.inner.ensure_open()?;
@@ -422,6 +476,18 @@ impl<T> LazyLocker<T> {
         self.inner
             .watchers
             .subscribe(None, crate::watch::DEFAULT_CAPACITY)
+    }
+
+    /// Subscribe to changes affecting any of `keys`.
+    ///
+    /// Hive's `listenable(keys:)`. `Cleared` and `Lagged` always arrive: a
+    /// clear affects every key, and a gap notice must never be dropped. An
+    /// empty list therefore yields a stream of nothing but those two.
+    pub fn watch_keys(&self, keys: &[&str]) -> crate::watch::EventStream {
+        self.inner.watchers.subscribe(
+            Some(keys.iter().map(|k| k.as_bytes().to_vec()).collect()),
+            crate::watch::DEFAULT_CAPACITY,
+        )
     }
 
     /// Subscribe to changes affecting one key.
@@ -945,6 +1011,68 @@ mod tests {
         let event = block_on(events.next()).unwrap();
         assert_eq!(event.key_bytes(), &[0xFF]);
         assert_eq!(event.key(), None, "a binary key has no UTF-8 view");
+    }
+
+    #[test]
+    fn put_all_and_delete_all_are_single_commits() {
+        let l = locker();
+        let entries: Vec<(String, String)> = (0..50)
+            .map(|i| (format!("k{i:03}"), format!("v{i}")))
+            .collect();
+        block_on(l.put_all(entries)).unwrap();
+
+        assert_eq!(l.len(), 50);
+        assert_eq!(block_on(l.get("k049")).unwrap(), Some("v49".into()));
+
+        block_on(l.delete_all(["k000", "k001", "never_written"])).unwrap();
+        assert_eq!(l.len(), 48);
+        assert_eq!(block_on(l.get("k000")).unwrap(), None);
+    }
+
+    #[test]
+    fn entries_and_to_map_match_key_by_key_reads() {
+        let l = seeded(&[("a", "1"), ("b", "2"), ("c", "3")]);
+
+        let entries = block_on(l.entries()).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let map = block_on(l.to_map()).unwrap();
+        for key in l.keys() {
+            assert_eq!(map.get(&key), block_on(l.get(&key)).unwrap().as_ref());
+        }
+    }
+
+    #[test]
+    fn to_map_skips_a_key_it_cannot_spell() {
+        let l = locker();
+        block_on(l.put("a", &"1".to_string())).unwrap();
+        block_on(l.put_by(&[0xFF], &"2".to_string())).unwrap();
+
+        let map = block_on(l.to_map()).unwrap();
+        assert_eq!(map.len(), 1, "a binary key has no place in a String map");
+        assert!(map.contains_key("a"));
+        // But it is still there, and still readable by bytes.
+        assert_eq!(l.len(), 2);
+        assert_eq!(block_on(l.get_by(&[0xFF])).unwrap(), Some("2".into()));
+    }
+
+    #[test]
+    fn watch_keys_covers_several_keys_at_once() {
+        let l = locker();
+        let mut events = l.watch_keys(&["a", "b"]);
+
+        block_on(l.put("ignored", &"x".to_string())).unwrap();
+        block_on(l.put("a", &"1".to_string())).unwrap();
+        block_on(l.delete("b")).unwrap();
+
+        assert_eq!(
+            block_on(events.next()),
+            Some(Event::Put { key: b"a".to_vec() })
+        );
+        assert_eq!(
+            block_on(events.next()),
+            Some(Event::Deleted { key: b"b".to_vec() })
+        );
     }
 
     #[test]

@@ -239,6 +239,43 @@ where
         Ok(())
     }
 
+    /// Store many entries in **one** atomic commit.
+    ///
+    /// Hive's `putAll`. Everything lands together or nothing does, which is
+    /// both faster than N separate puts and the only way to write a set of
+    /// keys that must stay consistent with each other.
+    pub async fn put_all(&self, entries: impl IntoIterator<Item = (String, T)>) -> Result<()> {
+        let entries: Vec<(String, T)> = entries.into_iter().collect();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.transact(move |tx| async move {
+            for (key, value) in entries {
+                tx.put(&key, value)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Remove many keys in **one** atomic commit. Hive's `deleteAll`.
+    ///
+    /// Removing an absent key is not an error, exactly as for
+    /// [`Locker::delete`].
+    pub async fn delete_all(&self, keys: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
+        let keys: Vec<String> = keys.into_iter().map(|k| k.as_ref().to_string()).collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.transact(move |tx| async move {
+            for key in keys {
+                tx.delete(&key)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// Remove everything in this locker, and nothing outside it.
     pub async fn clear(&self) -> Result<()> {
         self.inner.ensure_open()?;
@@ -298,6 +335,35 @@ impl<T> Locker<T> {
     /// As [`Locker::get`], under a binary key.
     pub fn get_by(&self, key: &[u8]) -> Option<Arc<T>> {
         self.values.lock().ok()?.get(key).cloned()
+    }
+
+    /// Read a value by cloning it out of the resident copy.
+    ///
+    /// [`Locker::get`] hands back an `Arc` and asks nothing of `T`; this is
+    /// for callers who would rather own a `T` than reach through a pointer.
+    pub fn get_cloned(&self, key: &str) -> Option<T>
+    where
+        T: Clone,
+    {
+        self.get(key).map(|v| (*v).clone())
+    }
+
+    /// Read a value, falling back to `default` when the key is absent.
+    ///
+    /// Hive's `get(key, defaultValue:)`. The default is *not* written — a read
+    /// stays a read.
+    pub fn get_or(&self, key: &str, default: T) -> Arc<T> {
+        self.get(key).unwrap_or_else(|| Arc::new(default))
+    }
+
+    /// Run `f` over the stored value without cloning it or handing out an
+    /// `Arc`. `None` when the key is absent.
+    ///
+    /// The lock is **not** held while `f` runs, so `f` may call back into this
+    /// locker without deadlocking.
+    pub fn with<R>(&self, key: &str, f: impl FnOnce(&T) -> R) -> Option<R> {
+        let value = self.get(key)?;
+        Some(f(&value))
     }
 
     pub fn contains_key(&self, key: &str) -> bool {
@@ -378,6 +444,18 @@ impl<T> Locker<T> {
             .subscribe(None, crate::watch::DEFAULT_CAPACITY)
     }
 
+    /// Subscribe to changes affecting any of `keys`.
+    ///
+    /// Hive's `listenable(keys:)`. `Cleared` and `Lagged` always arrive: a
+    /// clear affects every key, and a gap notice must never be dropped. An
+    /// empty list therefore yields a stream of nothing but those two.
+    pub fn watch_keys(&self, keys: &[&str]) -> crate::watch::EventStream {
+        self.inner.watchers.subscribe(
+            Some(keys.iter().map(|k| k.as_bytes().to_vec()).collect()),
+            crate::watch::DEFAULT_CAPACITY,
+        )
+    }
+
     /// Subscribe to changes affecting one key.
     ///
     /// `Cleared` still arrives, because a clear affects every key.
@@ -386,6 +464,29 @@ impl<T> Locker<T> {
             Some(vec![key.as_bytes().to_vec()]),
             crate::watch::DEFAULT_CAPACITY,
         )
+    }
+
+    /// Entries over a key range, in byte order. UTF-8 keys only.
+    ///
+    /// Synchronous, like every other eager read: the values are already here.
+    pub fn range<'a, R: std::ops::RangeBounds<&'a str>>(&self, range: R) -> Vec<(String, Arc<T>)> {
+        let start = crate::key::as_bytes(str_bound(range.start_bound()));
+        let end = crate::key::as_bytes(str_bound(range.end_bound()));
+        self.values
+            .lock()
+            .map(|v| {
+                v.range::<[u8], _>((start, end))
+                    .filter_map(|(k, val)| super::lazy::utf8(k).map(|k| (k, val.clone())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every entry as a map, in byte order. UTF-8 keys only.
+    ///
+    /// Hive's `toMap`. Free of I/O — an eager locker already holds everything.
+    pub fn to_map(&self) -> BTreeMap<String, Arc<T>> {
+        self.entries().into_iter().collect()
     }
 
     /// A snapshot of every entry, in byte order. UTF-8 keys only.
@@ -406,6 +507,15 @@ impl<T> Locker<T> {
             .lock()
             .map(|v| v.iter().map(|(k, val)| (k.clone(), val.clone())).collect())
             .unwrap_or_default()
+    }
+}
+
+/// `Range<&str>` bounds arrive as `Bound<&&str>`; unwrap the extra reference.
+fn str_bound<'a>(bound: Bound<&&'a str>) -> Bound<&'a str> {
+    match bound {
+        Bound::Unbounded => Bound::Unbounded,
+        Bound::Included(s) => Bound::Included(s),
+        Bound::Excluded(s) => Bound::Excluded(s),
     }
 }
 
@@ -662,6 +772,97 @@ mod tests {
         block_on(l.put("a", "1".into())).unwrap();
         assert!(!l.has_non_utf8_keys());
         assert_eq!(l.keys_bytes(), vec![b"a".to_vec()]);
+    }
+
+    #[test]
+    fn get_ergonomics_cover_clone_default_and_borrow() {
+        let l = locker();
+        block_on(l.put("theme", "dark".into())).unwrap();
+
+        assert_eq!(l.get_cloned("theme"), Some("dark".to_string()));
+        assert_eq!(l.get_cloned("absent"), None);
+
+        assert_eq!(*l.get_or("theme", "light".into()), "dark".to_string());
+        assert_eq!(*l.get_or("absent", "light".into()), "light".to_string());
+        // The default is a read-time fallback, never a write.
+        assert!(!l.contains_key("absent"));
+
+        assert_eq!(l.with("theme", |v| v.len()), Some(4));
+        assert_eq!(l.with("absent", |v| v.len()), None);
+    }
+
+    #[test]
+    fn put_all_lands_as_one_commit() {
+        let l = locker();
+        let entries: Vec<(String, String)> = (0..50)
+            .map(|i| (format!("k{i:03}"), format!("v{i}")))
+            .collect();
+        block_on(l.put_all(entries)).unwrap();
+
+        assert_eq!(l.len(), 50);
+        assert_eq!(l.get("k049").as_deref(), Some(&"v49".to_string()));
+
+        block_on(l.delete_all(["k000", "k001"])).unwrap();
+        assert_eq!(l.len(), 48);
+        assert!(l.get("k000").is_none());
+    }
+
+    #[test]
+    fn a_put_all_carrying_an_oversized_value_writes_nothing() {
+        // The atomicity claim, stated as a negative: one bad entry must not
+        // leave the good ones behind.
+        let l = open_with(LockerConfig::default().with_max_inline(64)).unwrap();
+        let entries = vec![
+            ("ok".to_string(), "small".to_string()),
+            ("bad".to_string(), "x".repeat(10_000)),
+        ];
+
+        assert!(matches!(
+            block_on(l.put_all(entries)),
+            Err(Error::ValueTooLarge { .. })
+        ));
+        assert_eq!(l.len(), 0, "a refused put_all must write nothing at all");
+    }
+
+    #[test]
+    fn an_empty_bulk_operation_is_a_no_op() {
+        let l = locker();
+        block_on(l.put("k", "v".into())).unwrap();
+        block_on(l.put_all(Vec::<(String, String)>::new())).unwrap();
+        block_on(l.delete_all(Vec::<String>::new())).unwrap();
+        assert_eq!(l.len(), 1);
+    }
+
+    #[test]
+    fn range_and_to_map_read_straight_from_ram() {
+        let l = locker();
+        for k in ["a", "b", "c", "d"] {
+            block_on(l.put(k, k.to_uppercase())).unwrap();
+        }
+
+        let keys: Vec<String> = l.range("b".."d").into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec!["b", "c"]);
+        assert_eq!(l.range(..).len(), 4);
+
+        let map = l.to_map();
+        assert_eq!(map.len(), 4);
+        assert_eq!(map.get("c").map(|v| v.as_str()), Some("C"));
+    }
+
+    #[test]
+    fn watch_keys_passes_any_named_key_and_every_clear() {
+        let l = locker();
+        let mut events = l.watch_keys(&["a", "b"]);
+
+        block_on(l.put("ignored", "x".into())).unwrap();
+        block_on(l.put("b", "y".into())).unwrap();
+        block_on(l.clear()).unwrap();
+
+        assert_eq!(
+            block_on(events.next()),
+            Some(crate::watch::Event::Put { key: b"b".to_vec() })
+        );
+        assert_eq!(block_on(events.next()), Some(crate::watch::Event::Cleared));
     }
 
     #[test]

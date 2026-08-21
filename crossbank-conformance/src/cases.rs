@@ -687,3 +687,102 @@ pub async fn binary_keys_round_trip_and_sort_bytewise<H: Harness>(h: &H) -> Resu
     assert_eq!(locker.len(), 3);
     Ok(())
 }
+
+/// A bulk write is one commit, and a refused one writes nothing.
+///
+/// Hive's `putAll`. The negative half is the part that matters: crossbank
+/// validates the whole write-set before committing any of it, so a single
+/// oversized entry must leave the locker exactly as it was rather than
+/// half-filled.
+pub async fn put_all_is_atomic<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let lazy = bank.lazy_locker::<V>("bulk").await?;
+
+    let entries: Vec<(String, V)> = (0..50)
+        .map(|i| (format!("k{i:03}"), v(&format!("v{i}"))))
+        .collect();
+    lazy.put_all(entries).await?;
+
+    assert_eq!(lazy.len(), 50);
+    for i in 0..50 {
+        assert_eq!(
+            lazy.get(&format!("k{i:03}")).await?,
+            Some(v(&format!("v{i}"))),
+            "every entry of a put_all must be present"
+        );
+    }
+
+    lazy.delete_all(["k000", "k001", "never_written"]).await?;
+    assert_eq!(lazy.len(), 48);
+    assert_eq!(lazy.get("k000").await?, None);
+
+    // Now the negative half, on an eager locker whose inline limit the second
+    // entry breaks. No Fault backend needed: the refusal is crossbank's own.
+    let eager = bank
+        .locker_with::<V>("strict", LockerConfig::default().with_max_inline(64))
+        .await?;
+    let mixed = vec![
+        ("ok".to_string(), v("small")),
+        ("bad".to_string(), "x".repeat(10_000)),
+    ];
+    assert!(
+        matches!(eager.put_all(mixed).await, Err(Error::ValueTooLarge { .. })),
+        "an oversized entry must refuse the whole put_all"
+    );
+    assert_eq!(eager.len(), 0, "a refused put_all must write NOTHING");
+    assert!(eager.get("ok").is_none());
+
+    // And storage agrees with RAM: reopening finds nothing either.
+    eager.close();
+    let reopened = bank
+        .locker_with::<V>("strict", LockerConfig::default().with_max_inline(64))
+        .await?;
+    assert_eq!(reopened.len(), 0);
+    Ok(())
+}
+
+/// `to_map` is a bulk view of exactly what key-by-key reads return.
+///
+/// Hive's `toMap`, and the shape a Dart shim needs. Worth its own case
+/// because the map path and the `get` path take different routes through the
+/// backend — a scan versus point lookups — and a backend that ordered or
+/// paged its scan wrongly would disagree with itself here.
+pub async fn to_map_matches_key_by_key_reads<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let lazy = bank.lazy_locker::<V>("l").await?;
+
+    let entries: Vec<(String, V)> = (0..40)
+        .map(|i| (format!("k{i:03}"), v(&format!("v{i}"))))
+        .collect();
+    lazy.put_all(entries).await?;
+    lazy.put("empty", &v("")).await?;
+
+    let map = lazy.to_map().await?;
+    assert_eq!(map.len(), lazy.len());
+    for key in lazy.keys() {
+        assert_eq!(
+            map.get(&key),
+            lazy.get(&key).await?.as_ref(),
+            "to_map and get must agree about {key:?}"
+        );
+    }
+    assert_eq!(map.get("empty"), Some(&v("")), "an empty value is a value");
+
+    // The eager locker answers the same question from RAM.
+    let eager = bank.locker::<V>("e").await?;
+    eager
+        .put_all(vec![("a".to_string(), v("1")), ("b".to_string(), v("2"))])
+        .await?;
+    let eager_map = eager.to_map();
+    assert_eq!(eager_map.len(), 2);
+    assert_eq!(eager_map.get("a").map(|x| x.as_str()), Some("1"));
+    assert_eq!(
+        eager
+            .range("a".."b")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect::<Vec<_>>(),
+        vec!["a".to_string()]
+    );
+    Ok(())
+}

@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use serde::{de::DeserializeOwned, Serialize};
@@ -77,6 +78,7 @@ where
             name,
             config,
             watchers: Default::default(),
+            closed: AtomicBool::new(false),
         });
 
         let mut values = BTreeMap::new();
@@ -124,6 +126,7 @@ where
 
     /// Store a value. Writes are asynchronous even though reads are not.
     pub async fn put(&self, key: &str, value: T) -> Result<Arc<T>> {
+        self.inner.ensure_open()?;
         let sealed = self.inner.seal(&value)?;
         if sealed.len() > self.inner.config.max_inline {
             return Err(Error::ValueTooLarge {
@@ -160,6 +163,7 @@ where
         F: FnOnce(Transaction<T>) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
+        self.inner.ensure_open()?;
         let _guard = self.inner.write_lock.lock().await;
 
         let tx = Transaction::new(self.inner.clone());
@@ -218,6 +222,7 @@ where
 
     /// Remove a key. Removing an absent key is not an error.
     pub async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.ensure_open()?;
         self.inner.commit(vec![self.inner.delete_op(key)]).await?;
         if let Ok(mut guard) = self.values.lock() {
             guard.remove(key);
@@ -230,6 +235,7 @@ where
 
     /// Remove everything in this locker, and nothing outside it.
     pub async fn clear(&self) -> Result<()> {
+        self.inner.ensure_open()?;
         self.inner.commit(vec![self.inner.clear_op()]).await?;
         if let Ok(mut guard) = self.values.lock() {
             guard.clear();
@@ -244,6 +250,38 @@ where
 impl<T> Locker<T> {
     pub fn name(&self) -> &str {
         &self.inner.name
+    }
+
+    pub(crate) fn inner(&self) -> &Arc<Inner> {
+        &self.inner
+    }
+
+    /// Close this locker: drop its resident values and refuse further writes.
+    ///
+    /// The **bank's** backend is left open — closing one locker must not take
+    /// the store down with it. Use [`crate::Bank::close`] for that.
+    ///
+    /// After this, [`Locker::get`] returns `None` and [`Locker::len`] is 0 for
+    /// every key, exactly as if the locker were empty. That is not a lie the
+    /// caller has to live with: [`Locker::is_closed`] is what distinguishes a
+    /// closed locker from an empty one. Writes report [`Error::Closed`]
+    /// instead of silently succeeding.
+    ///
+    /// Idempotent, and it does not delete anything — reopening the same name
+    /// from the bank finds the data untouched.
+    pub fn close(&self) {
+        self.inner.mark_closed();
+        if let Ok(mut guard) = self.values.lock() {
+            guard.clear();
+        }
+    }
+
+    /// Whether [`Locker::close`] has been called.
+    ///
+    /// The only way to tell a closed locker from an empty one, since a closed
+    /// locker reads as empty by design.
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
     }
 
     /// Read a value. Synchronous and infallible — the whole point of the type.

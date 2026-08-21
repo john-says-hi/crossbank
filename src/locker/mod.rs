@@ -4,7 +4,7 @@
 
 pub mod chunk;
 pub mod eager;
-mod inner;
+pub(crate) mod inner;
 pub mod io;
 pub mod lazy;
 pub mod policy;

@@ -5,6 +5,7 @@
 //! scan to completion. Neither locker type owns any of it.
 
 use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::{de::DeserializeOwned, Serialize};
@@ -36,6 +37,13 @@ pub(crate) struct Inner {
     pub(crate) name: String,
     pub(crate) config: LockerConfig,
     pub(crate) watchers: Watchers,
+    /// Set by `Locker::close` / `LazyLocker::close`.
+    ///
+    /// Lives here rather than on the two locker types because the bank's
+    /// open-locker registry holds `Weak<Inner>` and needs to tell a closed
+    /// locker from a live one without a back-pointer from the locker to the
+    /// bank.
+    pub(crate) closed: AtomicBool,
 }
 
 impl std::fmt::Debug for Inner {
@@ -48,6 +56,25 @@ impl std::fmt::Debug for Inner {
 }
 
 impl Inner {
+    /// Whether this locker has been closed.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Mark closed. Returns true the first time, so callers can make close
+    /// idempotent without a second flag.
+    pub(crate) fn mark_closed(&self) -> bool {
+        !self.closed.swap(true, Ordering::AcqRel)
+    }
+
+    /// Refuse an operation on a closed locker.
+    pub(crate) fn ensure_open(&self) -> Result<()> {
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
+        Ok(())
+    }
+
     pub(crate) fn encode_key(&self, key: &str) -> Vec<u8> {
         key::encode(self.id, key)
     }

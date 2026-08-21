@@ -32,6 +32,7 @@
 
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use redb::{Database, Durability, ReadableDatabase, TableDefinition, TableError};
 
@@ -68,7 +69,13 @@ fn backend_err(context: &str, e: impl std::fmt::Display) -> Error {
 /// A bank stored in a single redb file.
 #[derive(Debug)]
 pub struct RedbBackend {
-    db: Database,
+    /// `None` once closed.
+    ///
+    /// redb takes an **exclusive** file lock that is only released when the
+    /// `Database` is dropped, so close-then-reopen in one process needs a way
+    /// to drop it while the `Arc<dyn Backend>` handle is still alive. An
+    /// `Option` behind a lock is that way.
+    db: RwLock<Option<Database>>,
     path: PathBuf,
 }
 
@@ -82,9 +89,29 @@ impl RedbBackend {
         let path = path.as_ref().to_path_buf();
         let db = Database::create(&path).map_err(|e| backend_err("opening the database", e))?;
 
-        let backend = Self { db, path };
+        let backend = Self {
+            db: RwLock::new(Some(db)),
+            path,
+        };
         backend.create_tables()?;
         Ok(backend)
+    }
+
+    /// Borrow the open database, or report [`Error::Closed`].
+    ///
+    /// A closure rather than a returned guard: the guard's lifetime is tied to
+    /// the borrow of `self`, and threading that through the boxed backend
+    /// futures is noise for no gain. Never unwraps a poisoned lock — a
+    /// poisoned lock is a backend failure, not a panic site.
+    fn with_db<T>(&self, f: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
+        let guard = self
+            .db
+            .read()
+            .map_err(|_| Error::backend("the redb handle lock was poisoned"))?;
+        match guard.as_ref() {
+            Some(db) => f(db),
+            None => Err(Error::Closed),
+        }
     }
 
     /// Create all three tables up front.
@@ -95,81 +122,84 @@ impl RedbBackend {
     /// honest and matches the fixed-table layout the web backend must use
     /// anyway.
     fn create_tables(&self) -> Result<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| backend_err("beginning the setup transaction", e))?;
-        {
-            for table in Table::ALL {
-                txn.open_table(definition(table))
-                    .map_err(|e| backend_err("creating a table", e))?;
+        self.with_db(|db| {
+            let txn = db
+                .begin_write()
+                .map_err(|e| backend_err("beginning the setup transaction", e))?;
+            {
+                for table in Table::ALL {
+                    txn.open_table(definition(table))
+                        .map_err(|e| backend_err("creating a table", e))?;
+                }
             }
-        }
-        txn.commit()
-            .map_err(|e| backend_err("committing table creation", e))
+            txn.commit()
+                .map_err(|e| backend_err("committing table creation", e))
+        })
     }
 
     fn read_one(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| backend_err("beginning a read", e))?;
-        let handle = match txn.open_table(definition(table)) {
-            Ok(handle) => handle,
-            Err(TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(backend_err("opening a table for reading", e)),
-        };
+        self.with_db(|db| {
+            let txn = db
+                .begin_read()
+                .map_err(|e| backend_err("beginning a read", e))?;
+            let handle = match txn.open_table(definition(table)) {
+                Ok(handle) => handle,
+                Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(e) => return Err(backend_err("opening a table for reading", e)),
+            };
 
-        handle
-            .get(key)
-            .map_err(|e| backend_err("reading a key", e))
-            .map(|found| found.map(|guard| guard.value().to_vec()))
+            handle
+                .get(key)
+                .map_err(|e| backend_err("reading a key", e))
+                .map(|found| found.map(|guard| guard.value().to_vec()))
+        })
     }
 
     fn scan_page(&self, request: &ScanRequest) -> Result<ScanPage> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| backend_err("beginning a scan", e))?;
-        let handle = match txn.open_table(definition(request.table)) {
-            Ok(handle) => handle,
-            Err(TableError::TableDoesNotExist(_)) => return Ok(ScanPage::default()),
-            Err(e) => return Err(backend_err("opening a table for scanning", e)),
-        };
+        self.with_db(|db| {
+            let txn = db
+                .begin_read()
+                .map_err(|e| backend_err("beginning a scan", e))?;
+            let handle = match txn.open_table(definition(request.table)) {
+                Ok(handle) => handle,
+                Err(TableError::TableDoesNotExist(_)) => return Ok(ScanPage::default()),
+                Err(e) => return Err(backend_err("opening a table for scanning", e)),
+            };
 
-        let bounds = as_ref_bounds(&request.range);
-        let iter = handle
-            .range::<&[u8]>(bounds)
-            .map_err(|e| backend_err("opening a range", e))?;
+            let bounds = as_ref_bounds(&request.range);
+            let iter = handle
+                .range::<&[u8]>(bounds)
+                .map_err(|e| backend_err("opening a range", e))?;
 
-        let mut items = Vec::new();
-        let mut resume = None;
+            let mut items = Vec::new();
+            let mut resume = None;
 
-        // `Box<dyn Iterator>` so direction is chosen once rather than
-        // duplicating the body.
-        let entries: Box<dyn Iterator<Item = _>> = if request.reverse {
-            Box::new(iter.rev())
-        } else {
-            Box::new(iter)
-        };
+            // `Box<dyn Iterator>` so direction is chosen once rather than
+            // duplicating the body.
+            let entries: Box<dyn Iterator<Item = _>> = if request.reverse {
+                Box::new(iter.rev())
+            } else {
+                Box::new(iter)
+            };
 
-        for entry in entries {
-            if items.len() >= request.limit {
-                break;
+            for entry in entries {
+                if items.len() >= request.limit {
+                    break;
+                }
+                let (key, value) = entry.map_err(|e| backend_err("reading a range entry", e))?;
+                let key = key.value().to_vec();
+                let value = request.want_values.then(|| value.value().to_vec());
+                resume = Some(key.clone());
+                items.push((key, value));
             }
-            let (key, value) = entry.map_err(|e| backend_err("reading a range entry", e))?;
-            let key = key.value().to_vec();
-            let value = request.want_values.then(|| value.value().to_vec());
-            resume = Some(key.clone());
-            items.push((key, value));
-        }
 
-        // Only offer a resume point when the page actually filled. An exhausted
-        // range must report `None`, or a paging caller loops forever.
-        let exhausted = items.len() < request.limit;
-        Ok(ScanPage {
-            items,
-            resume: if exhausted { None } else { resume },
+            // Only offer a resume point when the page actually filled. An exhausted
+            // range must report `None`, or a paging caller loops forever.
+            let exhausted = items.len() < request.limit;
+            Ok(ScanPage {
+                items,
+                resume: if exhausted { None } else { resume },
+            })
         })
     }
 
@@ -177,49 +207,50 @@ impl RedbBackend {
     ///
     /// No await points anywhere inside. See the module docs.
     fn apply(&self, ops: Vec<Op>) -> Result<()> {
-        let mut txn = self
-            .db
-            .begin_write()
-            .map_err(|e| backend_err("beginning a write", e))?;
+        self.with_db(|db| {
+            let mut txn = db
+                .begin_write()
+                .map_err(|e| backend_err("beginning a write", e))?;
 
-        // Stated explicitly rather than relied upon: a commit must be durable
-        // before it returns, or the crash-and-reopen tests prove nothing.
-        txn.set_durability(Durability::Immediate)
-            .map_err(|e| backend_err("setting durability", e))?;
+            // Stated explicitly rather than relied upon: a commit must be durable
+            // before it returns, or the crash-and-reopen tests prove nothing.
+            txn.set_durability(Durability::Immediate)
+                .map_err(|e| backend_err("setting durability", e))?;
 
-        {
-            for op in ops {
-                match op {
-                    Op::Put { table, key, value } => {
-                        let mut handle = txn
-                            .open_table(definition(table))
-                            .map_err(|e| backend_err("opening a table for writing", e))?;
-                        handle
-                            .insert(key.as_slice(), value.as_slice())
-                            .map_err(|e| backend_err("inserting a key", e))?;
-                    }
-                    Op::Delete { table, key } => {
-                        let mut handle = txn
-                            .open_table(definition(table))
-                            .map_err(|e| backend_err("opening a table for deletion", e))?;
-                        handle
-                            .remove(key.as_slice())
-                            .map_err(|e| backend_err("removing a key", e))?;
-                    }
-                    Op::DeleteRange { table, range } => {
-                        let mut handle = txn
-                            .open_table(definition(table))
-                            .map_err(|e| backend_err("opening a table for range deletion", e))?;
-                        let bounds = as_ref_bounds(&range);
-                        handle
-                            .retain_in::<&[u8], _>(bounds, |_, _| false)
-                            .map_err(|e| backend_err("deleting a range", e))?;
+            {
+                for op in ops {
+                    match op {
+                        Op::Put { table, key, value } => {
+                            let mut handle = txn
+                                .open_table(definition(table))
+                                .map_err(|e| backend_err("opening a table for writing", e))?;
+                            handle
+                                .insert(key.as_slice(), value.as_slice())
+                                .map_err(|e| backend_err("inserting a key", e))?;
+                        }
+                        Op::Delete { table, key } => {
+                            let mut handle = txn
+                                .open_table(definition(table))
+                                .map_err(|e| backend_err("opening a table for deletion", e))?;
+                            handle
+                                .remove(key.as_slice())
+                                .map_err(|e| backend_err("removing a key", e))?;
+                        }
+                        Op::DeleteRange { table, range } => {
+                            let mut handle = txn.open_table(definition(table)).map_err(|e| {
+                                backend_err("opening a table for range deletion", e)
+                            })?;
+                            let bounds = as_ref_bounds(&range);
+                            handle
+                                .retain_in::<&[u8], _>(bounds, |_, _| false)
+                                .map_err(|e| backend_err("deleting a range", e))?;
+                        }
                     }
                 }
             }
-        }
 
-        txn.commit().map_err(|e| backend_err("committing", e))
+            txn.commit().map_err(|e| backend_err("committing", e))
+        })
     }
 }
 
@@ -249,24 +280,25 @@ impl Backend for RedbBackend {
         Box::pin(async move {
             // One read transaction for the batch, so the results are a
             // consistent snapshot rather than N independent reads.
-            let txn = self
-                .db
-                .begin_read()
-                .map_err(|e| backend_err("beginning a batch read", e))?;
-            let handle = match txn.open_table(definition(table)) {
-                Ok(handle) => handle,
-                Err(TableError::TableDoesNotExist(_)) => return Ok(vec![None; keys.len()]),
-                Err(e) => return Err(backend_err("opening a table for batch reading", e)),
-            };
+            self.with_db(|db| {
+                let txn = db
+                    .begin_read()
+                    .map_err(|e| backend_err("beginning a batch read", e))?;
+                let handle = match txn.open_table(definition(table)) {
+                    Ok(handle) => handle,
+                    Err(TableError::TableDoesNotExist(_)) => return Ok(vec![None; keys.len()]),
+                    Err(e) => return Err(backend_err("opening a table for batch reading", e)),
+                };
 
-            keys.iter()
-                .map(|key| {
-                    handle
-                        .get(key.as_slice())
-                        .map_err(|e| backend_err("reading a key", e))
-                        .map(|found| found.map(|guard| guard.value().to_vec()))
-                })
-                .collect()
+                keys.iter()
+                    .map(|key| {
+                        handle
+                            .get(key.as_slice())
+                            .map_err(|e| backend_err("reading a key", e))
+                            .map(|found| found.map(|guard| guard.value().to_vec()))
+                    })
+                    .collect()
+            })
         })
     }
 
@@ -290,6 +322,22 @@ impl Backend for RedbBackend {
                 // Nothing evicts a file behind the application's back.
                 persisted: true,
             }))
+        })
+    }
+
+    fn close(&self) -> BFut<'_, ()> {
+        Box::pin(async move {
+            // Taking the Database out and dropping it is what releases redb's
+            // exclusive file lock. Idempotent: a second close finds `None`.
+            let taken = {
+                let mut guard = self
+                    .db
+                    .write()
+                    .map_err(|_| Error::backend("the redb handle lock was poisoned"))?;
+                guard.take()
+            };
+            drop(taken);
+            Ok(())
         })
     }
 

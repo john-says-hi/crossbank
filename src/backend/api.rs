@@ -237,6 +237,22 @@ pub trait Backend: MaybeSend + MaybeSync + 'static {
 
     /// Ensure prior commits have reached durable storage.
     fn flush(&self) -> BFut<'_, ()>;
+
+    /// Release the underlying handle.
+    ///
+    /// Idempotent: closing an already-closed backend succeeds. Every later
+    /// operation must fail with [`crate::Error::Closed`] rather than
+    /// reopening implicitly.
+    ///
+    /// This exists because `Drop` is not enough. `redb` takes an **exclusive**
+    /// file lock, and a `Bank` shares its backend through an `Arc`, so a
+    /// consuming application cannot reliably close-then-reopen the same file
+    /// in one process by dropping handles. Test suites do exactly that.
+    ///
+    /// The default is a no-op, for backends that hold nothing to release.
+    fn close(&self) -> BFut<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[cfg(test)]

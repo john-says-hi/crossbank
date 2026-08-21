@@ -10,8 +10,10 @@
 //! `view` aliases wasm memory, which is a `SharedArrayBuffer` on the atomics
 //! lane, and IndexedDB throws `DataCloneError` only on the build that ships.
 
+use std::cell::RefCell;
 use std::convert::Infallible;
 use std::ops::{Bound, RangeBounds};
+use std::rc::Rc;
 
 use indexed_db::{CursorDirection, Database, Factory};
 use js_sys::Uint8Array;
@@ -27,7 +29,12 @@ const STORES: [&str; 3] = ["meta", "records", "chunks"];
 /// A bank stored in a named IndexedDB database.
 #[derive(Debug)]
 pub struct IndexedDbBackend {
-    db: Database<Infallible>,
+    /// `None` once closed.
+    ///
+    /// Behind an `Rc` so an in-flight operation can hold the connection across
+    /// its awaits without keeping the `RefCell` borrowed — a borrow held over
+    /// an await would make [`Backend::close`] a panic waiting to happen.
+    db: RefCell<Option<Rc<Database<Infallible>>>>,
     name: String,
 }
 
@@ -50,7 +57,15 @@ impl IndexedDbBackend {
             })
             .await
             .map_err(map_err)?;
-        Ok(Self { db, name })
+        Ok(Self {
+            db: RefCell::new(Some(Rc::new(db))),
+            name,
+        })
+    }
+
+    /// The open connection, or [`Error::Closed`].
+    fn db(&self) -> Result<Rc<Database<Infallible>>> {
+        self.db.borrow().as_ref().cloned().ok_or(Error::Closed)
     }
 
     /// The IndexedDB database name this handle is connected to.
@@ -70,8 +85,11 @@ impl Drop for IndexedDbBackend {
     fn drop(&mut self) {
         // Close so a subsequent `delete_database` is not blocked waiting for
         // this connection. Close itself is asynchronous with no completion
-        // signal; the harness still has to tolerate that.
-        self.db.close();
+        // signal; the harness still has to tolerate that. A backend already
+        // closed explicitly has nothing left to do here.
+        if let Some(db) = self.db.borrow_mut().take() {
+            db.close();
+        }
     }
 }
 
@@ -141,8 +159,8 @@ impl Backend for IndexedDbBackend {
         let store_name = table.name();
         let key = js_bytes(key);
         Box::pin(async move {
-            let got = self
-                .db
+            let db = self.db()?;
+            let got = db
                 .transaction(&[store_name])
                 .run(async move |t| {
                     let store = t.object_store(store_name)?;
@@ -161,8 +179,8 @@ impl Backend for IndexedDbBackend {
         let store_name = table.name();
         Box::pin(async move {
             let js_keys: Vec<JsValue> = keys.iter().map(|k| js_bytes(k)).collect();
-            self.db
-                .transaction(&[store_name])
+            let db = self.db()?;
+            db.transaction(&[store_name])
                 .run(async move |t| {
                     let store = t.object_store(store_name)?;
                     let mut out = Vec::with_capacity(js_keys.len());
@@ -193,8 +211,8 @@ impl Backend for IndexedDbBackend {
                 CursorDirection::Next
             };
 
-            self.db
-                .transaction(&[store_name])
+            let db = self.db()?;
+            db.transaction(&[store_name])
                 .run(async move |t| {
                     let store = t.object_store(store_name)?;
                     let mut builder = store.cursor().direction(direction);
@@ -252,8 +270,8 @@ impl Backend for IndexedDbBackend {
 
     fn commit(&self, ops: Vec<Op>) -> BFut<'_, ()> {
         Box::pin(async move {
-            self.db
-                .transaction(&STORES)
+            let db = self.db()?;
+            db.transaction(&STORES)
                 .rw()
                 .run(async move |t| {
                     for op in ops {
@@ -320,6 +338,20 @@ impl Backend for IndexedDbBackend {
                 available,
                 persisted,
             }))
+        })
+    }
+
+    fn close(&self) -> BFut<'_, ()> {
+        Box::pin(async move {
+            // Closing the connection is what lets a later `delete_database`
+            // or a reopen proceed without being blocked. Idempotent: a second
+            // close finds `None`. IndexedDB's close has no completion signal,
+            // so there is nothing to await.
+            let taken = self.db.borrow_mut().take();
+            if let Some(db) = taken {
+                db.close();
+            }
+            Ok(())
         })
     }
 

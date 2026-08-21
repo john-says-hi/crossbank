@@ -13,7 +13,8 @@
 //! prefix would interleave their keys.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use futures::channel::mpsc;
 
@@ -23,6 +24,7 @@ use crate::codec::{default_chain, type_tag, FilterChain};
 use crate::error::{Error, Result};
 
 use crate::key::LockerId;
+use crate::locker::inner::Inner;
 use crate::locker::{LazyLocker, Locker, LockerConfig};
 use crate::remote::{Job, JOB_QUEUE};
 use serde::{de::DeserializeOwned, Serialize};
@@ -110,6 +112,13 @@ pub struct Bank {
     /// Taken exactly once, by `into_service`. A second service would silently
     /// steal jobs from the first.
     job_receiver: Mutex<Option<mpsc::Receiver<Job>>>,
+    /// Name to the locker handles currently open under it.
+    ///
+    /// `Weak`, so a locker the application dropped stops counting as open
+    /// without needing a destructor to reach back into the bank. Entries are
+    /// pruned lazily on every read.
+    open_lockers: Mutex<HashMap<String, Weak<Inner>>>,
+    closed: AtomicBool,
 }
 
 impl std::fmt::Debug for Bank {
@@ -210,6 +219,8 @@ impl Bank {
             registry: Mutex::new(HashMap::new()),
             job_sender,
             job_receiver: Mutex::new(Some(job_receiver)),
+            open_lockers: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
         };
         bank.check_or_write_format_version().await?;
         Ok(bank)
@@ -312,14 +323,16 @@ impl Bank {
         T: Serialize + DeserializeOwned,
     {
         let id = self.prepare::<T>(name).await?;
-        Locker::open(
+        let locker = Locker::open(
             self.backend.clone(),
             self.chain.clone(),
             id,
             name.to_string(),
             config,
         )
-        .await
+        .await?;
+        self.register_open(name, locker.inner());
+        Ok(locker)
     }
 
     /// Open a lazy locker: key index resident, values fetched on demand.
@@ -343,14 +356,16 @@ impl Bank {
         T: Serialize + DeserializeOwned,
     {
         let id = self.prepare::<T>(name).await?;
-        LazyLocker::open(
+        let locker = LazyLocker::open(
             self.backend.clone(),
             self.chain.clone(),
             id,
             name.to_string(),
             config,
         )
-        .await
+        .await?;
+        self.register_open(name, locker.inner());
+        Ok(locker)
     }
 
     /// Resolve the id and bind the value type, so reopening a locker under a
@@ -512,6 +527,74 @@ impl Bank {
         }
 
         Ok(names)
+    }
+
+    /// Close the bank: release the backend handle.
+    ///
+    /// Idempotent. Every later operation — through this bank or through any
+    /// locker still holding the same backend — reports [`Error::Closed`].
+    ///
+    /// This exists for close-then-reopen in a single process. `redb` holds an
+    /// exclusive file lock for as long as its `Database` is alive, and the
+    /// backend is shared through an `Arc`, so dropping the `Bank` is not
+    /// enough to let the same file be opened again. Test suites reopen
+    /// constantly; production code rarely closes at all.
+    ///
+    /// Lockers opened from this bank are *not* individually closed — they keep
+    /// whatever they already hold in RAM, and their writes start failing.
+    pub async fn close(&self) -> Result<()> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.backend.close().await
+    }
+
+    /// Whether [`Bank::close`] has been called.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn register_open(&self, name: &str, inner: &Arc<Inner>) {
+        if let Ok(mut guard) = self.open_lockers.lock() {
+            guard.insert(name.to_string(), Arc::downgrade(inner));
+        }
+    }
+
+    /// Whether a locker is currently open under `name`.
+    ///
+    /// A locker counts as open while a handle to it is alive and has not had
+    /// `close()` called on it. Dropped handles stop counting on the next read
+    /// of this registry.
+    ///
+    /// Note that opening the same name twice is **allowed** and returns two
+    /// independent handles over the same stored data — the eager form gives
+    /// each its own resident copy, which will diverge on write. The registry
+    /// records only the most recent handle per name.
+    pub fn is_locker_open(&self, name: &str) -> bool {
+        let Ok(mut guard) = self.open_lockers.lock() else {
+            return false;
+        };
+        Self::prune(&mut guard);
+        guard.contains_key(name)
+    }
+
+    /// Every locker name with a live, unclosed handle, in byte order.
+    pub fn open_locker_names(&self) -> Vec<String> {
+        let Ok(mut guard) = self.open_lockers.lock() else {
+            return Vec::new();
+        };
+        Self::prune(&mut guard);
+        let mut names: Vec<String> = guard.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Drop entries whose handle is gone or closed.
+    fn prune(map: &mut HashMap<String, Weak<Inner>>) {
+        map.retain(|_, weak| match weak.upgrade() {
+            Some(inner) => !inner.is_closed(),
+            None => false,
+        });
     }
 
     fn cached(&self, name: &str) -> Option<LockerId> {

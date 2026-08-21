@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use super::api::{BFut, Backend, Op, ScanPage, ScanRequest, Table, Usage};
@@ -51,6 +52,10 @@ impl Tables {
 #[derive(Debug, Default)]
 pub struct MemoryBackend {
     tables: Mutex<Tables>,
+    /// Set by [`Backend::close`]. Memory has no handle to release, so the flag
+    /// *is* the closure: it makes a closed memory backend behave like a closed
+    /// file, which is what lets one conformance case grade every backend.
+    closed: AtomicBool,
 }
 
 impl MemoryBackend {
@@ -59,6 +64,9 @@ impl MemoryBackend {
     }
 
     fn with_tables<T>(&self, f: impl FnOnce(&mut Tables) -> T) -> Result<T> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
         let mut guard = self
             .tables
             .lock()
@@ -165,6 +173,19 @@ impl Backend for MemoryBackend {
                     Self::apply(t, op);
                 }
             })
+        })
+    }
+
+    fn close(&self) -> BFut<'_, ()> {
+        Box::pin(async move {
+            // Idempotent, and the data goes with it: a closed memory backend
+            // that kept its tables would silently resurrect on reopen.
+            if !self.closed.swap(true, Ordering::AcqRel) {
+                if let Ok(mut guard) = self.tables.lock() {
+                    *guard = Tables::default();
+                }
+            }
+            Ok(())
         })
     }
 

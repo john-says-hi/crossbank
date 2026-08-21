@@ -74,7 +74,7 @@ pub trait Harness {
 }
 
 /// Number of cases in the spec. The arity guard compares against this.
-pub const CASE_COUNT: usize = 22;
+pub const CASE_COUNT: usize = 25;
 
 /// Run `block_on` without pulling in an async runtime.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -111,6 +111,9 @@ macro_rules! __for_each_case {
         $crate::__emit!(overwriting_a_chunked_value_replaces_it, $make);
         $crate::__emit!(deleting_a_chunked_value_removes_it, $make);
         $crate::__emit!(unfinished_writer_leaves_the_previous_value, $make);
+        $crate::__emit!(close_then_reopen_sees_the_same_data, $make);
+        $crate::__emit!(operations_after_close_report_closed, $make);
+        $crate::__emit!(close_is_idempotent, $make);
     };
 }
 
@@ -222,5 +225,8 @@ macro_rules! __count_cases {
         $counter!(overwriting_a_chunked_value_replaces_it, ());
         $counter!(deleting_a_chunked_value_removes_it, ());
         $counter!(unfinished_writer_leaves_the_previous_value, ());
+        $counter!(close_then_reopen_sees_the_same_data, ());
+        $counter!(operations_after_close_report_closed, ());
+        $counter!(close_is_idempotent, ());
     };
 }

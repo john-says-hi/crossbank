@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use serde::{de::DeserializeOwned, Serialize};
@@ -59,6 +60,7 @@ where
             name,
             config,
             watchers: Default::default(),
+            closed: AtomicBool::new(false),
         });
 
         // Keys only. Reading values here would defeat the entire point.
@@ -85,11 +87,13 @@ where
 
     /// Fetch and decode one value.
     pub async fn get(&self, key: &str) -> Result<Option<T>> {
+        self.inner.ensure_open()?;
         self.inner.load_value(key).await
     }
 
     /// Store one value. Large payloads are split across the `chunks` table.
     pub async fn put(&self, key: &str, value: &T) -> Result<()> {
+        self.inner.ensure_open()?;
         let _guard = self.inner.write_lock.lock().await;
         let payload = postcard::to_allocvec(value)
             .map_err(|e| Error::Filter(format!("postcard serialisation failed: {e}")))?;
@@ -109,6 +113,7 @@ where
 
     /// Remove one key. Removing an absent key is not an error.
     pub async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.ensure_open()?;
         let _guard = self.inner.write_lock.lock().await;
         let ops = self.inner.delete_value_ops(key).await?;
         self.inner.commit(ops).await?;
@@ -123,6 +128,7 @@ where
 
     /// Remove everything in this locker, and nothing outside it.
     pub async fn clear(&self) -> Result<()> {
+        self.inner.ensure_open()?;
         let _guard = self.inner.write_lock.lock().await;
         let ops = self.inner.clear_value_ops().await?;
         self.inner.commit(ops).await?;
@@ -144,6 +150,7 @@ where
         F: FnOnce(Transaction<T>) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
+        self.inner.ensure_open()?;
         let _guard = self.inner.write_lock.lock().await;
 
         let tx = Transaction::new(self.inner.clone());
@@ -259,6 +266,38 @@ where
 impl<T> LazyLocker<T> {
     pub fn name(&self) -> &str {
         &self.inner.name
+    }
+
+    pub(crate) fn inner(&self) -> &Arc<Inner> {
+        &self.inner
+    }
+
+    /// Close this locker: drop its resident key index and refuse further use.
+    ///
+    /// The **bank's** backend is left open — closing one locker must not take
+    /// the store down with it. Use [`crate::Bank::close`] for that.
+    ///
+    /// After this the locker reads as empty: [`LazyLocker::len`] is 0 and
+    /// [`LazyLocker::contains_key`] is false for every key.
+    /// [`LazyLocker::is_closed`] is what distinguishes a closed locker from an
+    /// empty one. `get`, `put`, `delete`, `clear` and `transact` report
+    /// [`Error::Closed`].
+    ///
+    /// Idempotent, and it does not delete anything — reopening the same name
+    /// from the bank finds the data untouched.
+    pub fn close(&self) {
+        self.inner.mark_closed();
+        if let Ok(mut guard) = self.index.lock() {
+            guard.clear();
+        }
+    }
+
+    /// Whether [`LazyLocker::close`] has been called.
+    ///
+    /// The only way to tell a closed locker from an empty one, since a closed
+    /// locker reads as empty by design.
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
     }
 
     /// Number of keys. Synchronous — the index is already here.

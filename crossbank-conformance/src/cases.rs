@@ -402,3 +402,120 @@ pub async fn unfinished_writer_leaves_the_previous_value<H: Harness>(h: &H) -> R
     assert_eq!(locker.get("k").await?, Some(vec![1u8; 80]));
     Ok(())
 }
+
+/// Closing a bank releases the store, and reopening finds the same data.
+///
+/// The case the whole close machinery exists for. `redb` holds an exclusive
+/// file lock for as long as its `Database` lives, so before `close()` this was
+/// simply impossible in one process — and a consuming test suite that closes
+/// and reopens between tests would deadlock on its own data.
+pub async fn close_then_reopen_sees_the_same_data<H: Harness>(h: &H) -> Result<()> {
+    let first = bank(h).await?;
+    let locker = first.lazy_locker::<V>("l").await?;
+    locker.put("k", &v("survives")).await?;
+
+    first.close().await?;
+    assert!(first.is_closed(), "close() must be observable");
+
+    let second = bank(h).await?;
+    let locker = second.lazy_locker::<V>("l").await?;
+
+    if h.caps().persists_across_open {
+        assert_eq!(
+            locker.get("k").await?,
+            Some(v("survives")),
+            "a persistent backend must find its data after close and reopen"
+        );
+    } else {
+        assert_eq!(
+            locker.get("k").await?,
+            None,
+            "a non-persistent backend must NOT find data after close and reopen"
+        );
+    }
+    Ok(())
+}
+
+/// Everything refuses politely after a close. Nothing panics, nothing lies.
+pub async fn operations_after_close_report_closed<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let lazy = bank.lazy_locker::<V>("lazy").await?;
+    let eager = bank.locker::<V>("eager").await?;
+    let survivor = bank.lazy_locker::<V>("survivor").await?;
+
+    lazy.put("k", &v("x")).await?;
+    eager.put("k", v("x")).await?;
+
+    assert!(bank.is_locker_open("lazy"));
+    assert!(bank.is_locker_open("eager"));
+
+    lazy.close();
+    eager.close();
+
+    // A closed locker reads as empty; `is_closed` is what tells the two apart.
+    assert!(lazy.is_closed());
+    assert_eq!(lazy.len(), 0);
+    assert!(!lazy.contains_key("k"));
+    assert!(eager.is_closed());
+    assert_eq!(eager.get("k"), None, "an eager get must not await or fail");
+    assert_eq!(eager.len(), 0);
+
+    assert!(!bank.is_locker_open("lazy"), "a closed locker is not open");
+    assert!(!bank.is_locker_open("eager"));
+    assert_eq!(bank.open_locker_names(), vec!["survivor".to_string()]);
+
+    assert!(matches!(lazy.get("k").await, Err(Error::Closed)));
+    assert!(matches!(lazy.put("k", &v("y")).await, Err(Error::Closed)));
+    assert!(matches!(lazy.delete("k").await, Err(Error::Closed)));
+    assert!(matches!(lazy.clear().await, Err(Error::Closed)));
+    assert!(matches!(
+        lazy.transact(|tx| async move {
+            tx.put("k", v("y"))?;
+            Ok(())
+        })
+        .await,
+        Err(Error::Closed)
+    ));
+    assert!(matches!(eager.put("k", v("y")).await, Err(Error::Closed)));
+    assert!(matches!(eager.delete("k").await, Err(Error::Closed)));
+    assert!(matches!(eager.clear().await, Err(Error::Closed)));
+
+    // Now the bank itself. A locker that was never individually closed still
+    // has to stop working, because the store underneath it is gone.
+    bank.close().await?;
+    assert!(bank.is_closed());
+
+    assert!(matches!(survivor.get("k").await, Err(Error::Closed)));
+    assert!(matches!(
+        survivor.put("k", &v("y")).await,
+        Err(Error::Closed)
+    ));
+    assert!(matches!(survivor.delete("k").await, Err(Error::Closed)));
+    assert!(matches!(
+        bank.lazy_locker::<V>("opened_too_late").await,
+        Err(Error::Closed)
+    ));
+    Ok(())
+}
+
+/// Closing twice is not an error, at either level.
+pub async fn close_is_idempotent<H: Harness>(h: &H) -> Result<()> {
+    let first = bank(h).await?;
+    let locker = first.lazy_locker::<V>("l").await?;
+    locker.put("k", &v("x")).await?;
+
+    locker.close();
+    locker.close();
+    assert!(locker.is_closed());
+
+    first.close().await?;
+    first.close().await?;
+    assert!(first.is_closed());
+
+    // And the store is genuinely released, not merely flagged: a second close
+    // must not have left anything behind that blocks the next open.
+    let second = bank(h).await?;
+    second.lazy_locker::<V>("l").await?;
+    second.close().await?;
+    Ok(())
+}

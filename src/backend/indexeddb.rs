@@ -331,7 +331,12 @@ impl Backend for IndexedDbBackend {
                     .filter(|n| n.is_finite())
             };
 
-            let used = number("usage").unwrap_or(0.0).max(0.0) as u64;
+            // No `usage` field means the browser declined to say, which is
+            // not the same as "you are using nothing". Reporting a fabricated
+            // zero would let a caller conclude it has room it may not have.
+            let Some(used) = number("usage").map(|u| u.max(0.0) as u64) else {
+                return Ok(None);
+            };
             let available = number("quota").map(|q| q.max(0.0) as u64);
 
             let persisted = match storage.persisted() {

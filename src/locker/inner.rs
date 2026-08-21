@@ -4,9 +4,10 @@
 //! into locker-prefixed bytes, seal a value through the filter chain, page a
 //! scan to completion. Neither locker type owns any of it.
 
+use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -63,6 +64,69 @@ pub(crate) struct Inner {
     /// locker from a live one without a back-pointer from the locker to the
     /// bank.
     pub(crate) closed: AtomicBool,
+    /// The epoch of this tab's own last commit that touched each key, and the
+    /// highest epoch absorbed from another tab. Together they let a coherence
+    /// sink refuse news that is not actually newer. See
+    /// [`crate::BankConfig::coherence`] for exactly what that orders.
+    ///
+    /// Only ever written when coherence is on, because it is filled from the
+    /// announcement a commit produced and there is none otherwise.
+    pub(crate) epochs: Epochs,
+}
+
+/// Per-locker epoch bookkeeping for cross-tab coherence.
+#[derive(Debug, Default)]
+pub(crate) struct Epochs {
+    /// Keys this tab has written, and the epoch it wrote them at.
+    ///
+    /// Bounded: past [`EPOCH_MEMORY`] keys the whole map is dropped rather
+    /// than grown without limit. Forgetting fails *open* — this tab simply
+    /// stops refusing another tab's news for those keys, which is the same
+    /// behaviour as before any of it was recorded.
+    local: Mutex<BTreeMap<Vec<u8>, u64>>,
+    /// The highest epoch this tab has absorbed from any other tab.
+    applied: AtomicU64,
+}
+
+/// How many locally-written keys one locker remembers an epoch for.
+pub(crate) const EPOCH_MEMORY: usize = 4096;
+
+impl Epochs {
+    /// Record that this tab committed `keys` at `epoch`.
+    pub(crate) fn note_local(&self, keys: impl Iterator<Item = Vec<u8>>, epoch: u64) {
+        let Ok(mut guard) = self.local.lock() else {
+            return;
+        };
+        for key in keys {
+            guard.insert(key, epoch);
+        }
+        if guard.len() > EPOCH_MEMORY {
+            guard.clear();
+        }
+    }
+
+    /// The epoch of this tab's own last commit touching `key`, if remembered.
+    pub(crate) fn local(&self, key: &[u8]) -> Option<u64> {
+        self.local.lock().ok()?.get(key).copied()
+    }
+
+    /// The highest epoch absorbed from another tab.
+    pub(crate) fn applied(&self) -> u64 {
+        self.applied.load(Ordering::Acquire)
+    }
+
+    /// Raise the absorbed watermark. Never lowers it.
+    pub(crate) fn note_applied(&self, epoch: u64) {
+        self.applied.fetch_max(epoch, Ordering::AcqRel);
+    }
+
+    /// Forget every local marker. Used when another tab clears the locker:
+    /// nothing this tab wrote survives, so nothing it wrote outranks anything.
+    pub(crate) fn forget_local(&self) {
+        if let Ok(mut guard) = self.local.lock() {
+            guard.clear();
+        }
+    }
 }
 
 impl std::fmt::Debug for Inner {
@@ -134,6 +198,14 @@ impl Inner {
         let news = self.shared.coherence.prepare(self.id, &ops);
         self.backend.commit(ops).await?;
         if let Some(news) = news {
+            // Remember what this tab just wrote, and when, so another tab's
+            // older news cannot undo it. Recorded before the post so it is in
+            // place before any reply can arrive.
+            self.epochs
+                .note_local(news.changes.iter().map(|c| c.key.clone()), news.epoch);
+            if news.cleared {
+                self.epochs.forget_local();
+            }
             self.shared.coherence.post(news);
         }
         Ok(())

@@ -74,6 +74,7 @@ where
             shared,
             watchers: Default::default(),
             closed: AtomicBool::new(false),
+            epochs: Default::default(),
         });
 
         // Keys only. Reading values here would defeat the entire point.
@@ -194,7 +195,7 @@ where
                 vec![(key.to_vec(), bytes)],
                 Vec::new(),
                 false,
-                Some(key),
+                std::slice::from_ref(&key.to_vec()),
             )
             .await?;
 
@@ -211,19 +212,29 @@ where
     ///
     /// Always safe to call: an immediate-commit locker has nothing staged and
     /// returns at once.
+    ///
+    /// **A closed locker may still be flushed.** [`LazyLocker::close`] keeps
+    /// the batch when its own flush fails, so `pending()` stays honest and the
+    /// caller can fix the cause — a full disk, a quota — and retry here. That
+    /// is the one operation a closed lazy locker still accepts; every write
+    /// reports [`Error::Closed`].
     pub async fn flush(&self) -> Result<()> {
-        self.inner.ensure_open()?;
         self.res.flush().await
     }
 
     /// How many writes are staged and not yet committed.
+    ///
+    /// Reads 0 if the staging lock has been poisoned by a panic in another
+    /// thread; [`LazyLocker::flush`] reports that as [`Error::Backend`]
+    /// rather than silently doing nothing.
     pub fn pending(&self) -> usize {
-        self.res.pending_len()
+        self.res.pending_len().unwrap_or(0)
     }
 
-    /// Payload bytes staged and not yet committed.
+    /// Payload bytes staged and not yet committed. See [`LazyLocker::pending`]
+    /// for the poisoned-lock caveat.
     pub fn pending_bytes(&self) -> u64 {
-        self.res.pending_bytes()
+        self.res.pending_bytes().unwrap_or(0)
     }
 
     /// Remove one key. Removing an absent key is not an error.
@@ -250,7 +261,7 @@ where
         let mut ops = self.inner.delete_value_ops(key).await?;
         let budget = self
             .res
-            .budget_ops(&mut ops, Vec::new(), vec![key.to_vec()], false, None)
+            .budget_ops(&mut ops, Vec::new(), vec![key.to_vec()], false, &[])
             .await?;
         self.inner.commit(ops).await?;
         self.res.touch_index(|i| {
@@ -332,7 +343,7 @@ where
         let mut ops = self.inner.clear_value_ops().await?;
         let budget = self
             .res
-            .budget_ops(&mut ops, Vec::new(), Vec::new(), true, None)
+            .budget_ops(&mut ops, Vec::new(), Vec::new(), true, &[])
             .await?;
         self.inner.commit(ops).await?;
         self.res.touch_index(|i| i.clear());
@@ -371,36 +382,43 @@ where
             return Ok(());
         }
 
-        let mut ops = Transaction::<T>::ops_for(&self.inner, &entries, TxMode::Lazy).await?;
+        // Absorb anything this handle has staged under `Commit::Deferred`.
+        // Both batches have to ride in one commit, staged first, or a later
+        // flush would write the older staged value over this transaction's
+        // newer one. `ops_for_pending` collapses the merged list, so the
+        // transaction is the last writer for any key both touch.
+        let staged_before = self.res.take_staged()?;
+        let merged = merge_batches(&staged_before, &entries);
+
+        let mut ops = match super::transaction::ops_for_pending(&self.inner, &merged, TxMode::Lazy).await {
+            Ok(ops) => ops,
+            Err(e) => {
+                self.res.restage(staged_before);
+                return Err(e);
+            }
+        };
 
         // One transaction is one moment: every key it wrote is equally recent,
         // so they share a tick rather than being ordered by staging order.
-        let cleared = entries.iter().any(|e| matches!(e, Staged::Clear));
-        let mut updates: Vec<(Vec<u8>, u64)> = Vec::new();
-        let mut removals: Vec<Vec<u8>> = Vec::new();
-        for entry in &entries {
-            match entry {
-                Staged::Put { key, payload, .. } => {
-                    updates.retain(|(k, _)| k != key);
-                    removals.retain(|k| k != key);
-                    updates.push((key.clone(), payload.len() as u64));
-                }
-                Staged::Delete { key } => {
-                    updates.retain(|(k, _)| k != key);
-                    removals.push(key.clone());
-                }
-                Staged::Clear => {
-                    updates.clear();
-                    removals.clear();
-                }
-            }
-        }
-        let budget = self
+        let (updates, removals, cleared) = resident::accounting(&merged);
+        // Never evict a key this same commit is writing.
+        let keep: Vec<Vec<u8>> = updates.iter().map(|(k, _)| k.clone()).collect();
+        let budget = match self
             .res
-            .budget_ops(&mut ops, updates, removals, cleared, None)
-            .await?;
+            .budget_ops(&mut ops, updates, removals, cleared, &keep)
+            .await
+        {
+            Ok(budget) => budget,
+            Err(e) => {
+                self.res.restage(staged_before);
+                return Err(e);
+            }
+        };
 
-        self.inner.commit(ops).await?;
+        if let Err(e) = self.inner.commit(ops).await {
+            self.res.restage(staged_before);
+            return Err(e);
+        }
 
         // Index updates only after the commit lands, so a failed write cannot
         // leave the index claiming keys that were never stored.
@@ -496,6 +514,13 @@ where
         ))
     }
 
+    /// The shared body of every listing: walk storage, fold in whatever this
+    /// handle has staged but not committed, and decode.
+    ///
+    /// The overlay is not optional. `get`, `len`, `keys` and `contains_key`
+    /// all show a staged write to its own handle, so a listing that walked
+    /// storage alone would have one locker telling two different stories about
+    /// its own uncommitted writes.
     async fn collect(
         &self,
         start: Bound<&[u8]>,
@@ -503,30 +528,119 @@ where
         reverse: bool,
         limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, T)>> {
+        let staged = self.res.staged_snapshot()?;
+
+        // Only a locker with nothing staged can apply the limit during the
+        // walk: otherwise a staged key could belong inside a truncation the
+        // walk has already made.
+        let cap = match staged.is_empty() {
+            true => limit.unwrap_or(usize::MAX),
+            false => usize::MAX,
+        };
+
         // Decode outside the visitor so a decode failure surfaces as an error
         // rather than being swallowed mid-walk.
-        let mut raw: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let cap = limit.unwrap_or(usize::MAX);
-
+        let mut stored: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         self.inner
             .walk(start, end, reverse, true, |key, value| {
-                if raw.len() >= cap {
+                if stored.len() >= cap {
                     return Ok(());
                 }
                 let bytes = value.ok_or_else(|| {
                     Error::Corrupt(format!("backend omitted a value for key {key:?}"))
                 })?;
-                raw.push((key, bytes));
+                stored.push((key, bytes));
                 Ok(())
             })
             .await?;
 
-        let mut out = Vec::with_capacity(raw.len());
-        for (k, bytes) in raw {
-            out.push((k, self.inner.decode_record(&bytes).await?));
+        if staged.is_empty() {
+            let mut out = Vec::with_capacity(stored.len());
+            for (key, bytes) in stored {
+                out.push((key, self.inner.decode_record(&bytes).await?));
+            }
+            return Ok(out);
+        }
+
+        // A staged clear wipes everything before it: nothing in storage
+        // survives it, only the writes staged after it.
+        let after_clear = match staged.iter().rposition(|e| matches!(e, Pending::Clear)) {
+            Some(i) => {
+                stored.clear();
+                &staged[i + 1..]
+            }
+            None => &staged[..],
+        };
+
+        // Later staged entries win, exactly as `staged_view` resolves them.
+        let mut merged: std::collections::BTreeMap<Vec<u8>, Option<Source>> = stored
+            .into_iter()
+            .map(|(key, bytes)| (key, Some(Source::Stored(bytes))))
+            .collect();
+        for entry in after_clear {
+            match entry {
+                Pending::Put { key, payload } => {
+                    if in_bounds(key, start, end) {
+                        merged.insert(key.clone(), Some(Source::Staged(payload.clone())));
+                    }
+                }
+                Pending::Delete { key } => {
+                    merged.remove(key.as_slice());
+                }
+                // None can remain: `after_clear` starts past the last one.
+                Pending::Clear => {}
+            }
+        }
+
+        let mut items: Vec<(Vec<u8>, Source)> = merged
+            .into_iter()
+            .filter_map(|(key, source)| source.map(|s| (key, s)))
+            .collect();
+        // `BTreeMap` already gives byte order; a reverse listing is that
+        // reversed, and only then is the limit applied.
+        if reverse {
+            items.reverse();
+        }
+        items.truncate(limit.unwrap_or(usize::MAX));
+
+        let mut out = Vec::with_capacity(items.len());
+        for (key, source) in items {
+            let value = match source {
+                Source::Stored(bytes) => self.inner.decode_record(&bytes).await?,
+                Source::Staged(payload) => postcard::from_bytes(&payload)
+                    .map_err(|e| Error::Corrupt(format!("postcard deserialisation failed: {e}")))?,
+            };
+            out.push((key, value));
         }
         Ok(out)
     }
+}
+
+/// Where one entry of a listing came from. A stored record is a sealed
+/// envelope; a staged one is the bare postcard payload, so they decode
+/// differently.
+enum Source {
+    Stored(Vec<u8>),
+    Staged(Vec<u8>),
+}
+
+/// Whether a staged key belongs in the range being listed.
+///
+/// The walk applies the bounds itself; a staged write has never been near the
+/// backend, so it has to be filtered here or a `range("b".."d")` would start
+/// reporting keys outside it.
+fn in_bounds(key: &[u8], start: Bound<&[u8]>, end: Bound<&[u8]>) -> bool {
+    let above = match start {
+        Bound::Unbounded => true,
+        Bound::Included(s) => key >= s,
+        Bound::Excluded(s) => key > s,
+    };
+    let below = match end {
+        Bound::Unbounded => true,
+        Bound::Included(e) => key <= e,
+        Bound::Excluded(e) => key < e,
+    };
+    above && below
 }
 
 /// Bounds-free accessors. Split out so `Debug` — and any caller holding a
@@ -555,6 +669,11 @@ impl crate::coherence::Sink for LazySink {
         }
         if announcement.cleared {
             self.res.touch_index(|index| index.clear());
+            // The byte budget has to follow the index, or this tab's
+            // accounting drifts from what storage holds and it starts evicting
+            // against a total that describes a locker that no longer exists.
+            self.res.remote_budget_clear();
+            self.inner.epochs.forget_local();
             self.inner.announce(Event::Cleared);
         }
         for change in &announcement.changes {
@@ -565,6 +684,16 @@ impl crate::coherence::Sink for LazySink {
                     index.insert(change.key.clone());
                 }
             });
+            // The size, where it can be had without awaiting: an inlined value
+            // is opened through this tab's own filter chain, and a chunked one
+            // announced its payload length. Anything else marks the accounting
+            // dirty, and the next commit reloads it.
+            let bytes = match (&change.value, change.bytes) {
+                (Some(sealed), _) => self.inner.chain.open(sealed).ok().map(|p| p.len() as u64),
+                (None, announced) => announced,
+            };
+            self.res.remote_budget(&change.key, bytes, change.deleted);
+
             // A lazy locker never holds values, so a write it could not carry
             // inline costs it nothing: the next `get` reads the new bytes.
             if change.deleted {
@@ -662,7 +791,11 @@ impl<T> LazyLocker<T> {
         // who is shutting down must not be left holding an open locker just
         // because its last batch would not land.
         let flushed = self.res.flush().await;
-        self.res.discard_staged();
+        // Only discard once the batch is actually stored. A failed flush has
+        // written nothing, and this staging buffer is the only copy of it.
+        if flushed.is_ok() {
+            self.res.discard_staged();
+        }
         self.inner.mark_closed();
         self.res.touch_index(|index| index.clear());
         flushed
@@ -810,6 +943,25 @@ pub(crate) fn utf8(key: &[u8]) -> Option<String> {
     std::str::from_utf8(key).ok().map(str::to_string)
 }
 
+/// One deferred batch followed by one transaction's write-set, as a single
+/// ordered list of mutations.
+///
+/// Order is what makes this correct: the staged writes are older, so they go
+/// first and the transaction's writes overwrite them wherever both name the
+/// same key.
+pub(crate) fn merge_batches<T>(staged: &[Pending], tx: &[Staged<T>]) -> Vec<Pending> {
+    let mut merged: Vec<Pending> = staged.to_vec();
+    merged.extend(tx.iter().map(|entry| match entry {
+        Staged::Put { key, payload, .. } => Pending::Put {
+            key: key.clone(),
+            payload: payload.clone(),
+        },
+        Staged::Delete { key } => Pending::Delete { key: key.clone() },
+        Staged::Clear => Pending::Clear,
+    }));
+    merged
+}
+
 /// Drop the entries whose keys are not UTF-8. Used by the `&str` listing
 /// methods, which cannot spell a binary key.
 fn utf8_entries<T>(entries: Vec<(Vec<u8>, T)>) -> Vec<(String, T)> {
@@ -835,6 +987,7 @@ mod tests {
                 .map(|(key, deleted)| crate::coherence::api::Change {
                     key: key.to_vec(),
                     value: None,
+                    bytes: None,
                     deleted,
                 })
                 .collect(),
@@ -889,6 +1042,115 @@ mod tests {
         sink.apply(&news(l.inner.id, true, Vec::new()));
         assert_eq!(l.len(), 0);
         assert_eq!(events.try_recv(), Some(Event::Cleared));
+    }
+
+    /// Another tab's news must move the byte budget, not just the index.
+    ///
+    /// It did not: a lazy locker folded a remote write into its key index and
+    /// left its LRU accounting untouched, so two tabs' budgets drifted apart
+    /// and each evicted against a total that described neither of them.
+    #[test]
+    fn a_sink_keeps_the_byte_budget_in_step_with_another_tab() {
+        let l = block_on(LazyLocker::<Vec<u8>>::open(
+            Arc::new(MemoryBackend::new()),
+            Arc::new(default_chain()),
+            1,
+            "budget".into(),
+            LockerConfig::default().with_policy(crate::Policy::Evictable { max_bytes: 10_000 }),
+            Default::default(),
+        ))
+        .expect("open");
+        block_on(l.put("mine", &vec![1u8; 100])).expect("put");
+        let before = l.budget_used();
+        assert!(before > 0);
+
+        let sink = l.sink();
+        let id = l.inner.id;
+
+        // An inlined value: the receiver has the bytes and can size it exactly
+        // by opening them through its own filter chain.
+        let payload = postcard::to_allocvec(&vec![9u8; 500]).expect("encode");
+        let sealed = l.inner.chain.seal(&payload).expect("seal");
+        sink.apply(&Announcement {
+            instance: 2,
+            locker_id: id,
+            epoch: 1,
+            cleared: false,
+            changes: vec![crate::coherence::api::Change {
+                key: b"theirs".to_vec(),
+                value: Some(sealed),
+                bytes: None,
+                deleted: false,
+            }],
+        });
+        assert_eq!(
+            l.budget_used(),
+            before + payload.len() as u64,
+            "a remote write must be accounted for"
+        );
+
+        // A remote delete gives the bytes back.
+        sink.apply(&Announcement {
+            instance: 2,
+            locker_id: id,
+            epoch: 2,
+            cleared: false,
+            changes: vec![crate::coherence::api::Change {
+                key: b"theirs".to_vec(),
+                value: None,
+                bytes: None,
+                deleted: true,
+            }],
+        });
+        assert_eq!(l.budget_used(), before, "a remote delete must give it back");
+
+        // A write whose size cannot be worked out marks the accounting dirty
+        // rather than inventing a number.
+        sink.apply(&Announcement {
+            instance: 2,
+            locker_id: id,
+            epoch: 3,
+            cleared: false,
+            changes: vec![crate::coherence::api::Change {
+                key: b"unknown".to_vec(),
+                value: None,
+                bytes: None,
+                deleted: false,
+            }],
+        });
+        assert!(l.contains_key("unknown"));
+
+        // And a remote clear zeroes it.
+        sink.apply(&news(id, true, Vec::new()));
+        assert_eq!(l.budget_used(), 0, "a remote clear must zero the budget");
+    }
+
+    /// A chunked remote write states its payload length, so it is accounted
+    /// for exactly even though its bytes could not ride along.
+    #[test]
+    fn a_sink_accounts_for_a_chunked_remote_write_from_its_pointer() {
+        let l = block_on(LazyLocker::<Vec<u8>>::open(
+            Arc::new(MemoryBackend::new()),
+            Arc::new(default_chain()),
+            1,
+            "budget".into(),
+            LockerConfig::default().with_policy(crate::Policy::Evictable { max_bytes: 10_000 }),
+            Default::default(),
+        ))
+        .expect("open");
+        l.sink().apply(&Announcement {
+            instance: 2,
+            locker_id: l.inner.id,
+            epoch: 1,
+            cleared: false,
+            changes: vec![crate::coherence::api::Change {
+                key: b"big".to_vec(),
+                value: None,
+                bytes: Some(4_242),
+                deleted: false,
+            }],
+        });
+        assert_eq!(l.budget_used(), 4_242);
     }
 
     /// A closed locker absorbs nothing. Its index is deliberately empty, and

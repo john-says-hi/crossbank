@@ -223,6 +223,11 @@ pub(crate) struct LruState {
     /// Ticks bumped by `get` that no commit has carried yet. Reads must not
     /// write, so these ride along with the next write — or a `flush`.
     pending: BTreeMap<Vec<u8>, u64>,
+    /// Set when another tab's news named a key whose size this tab could not
+    /// work out. The accounting is then known to be incomplete, and the next
+    /// commit reloads the `lru::` prefix before planning. See
+    /// [`LruState::mark_dirty`].
+    dirty: bool,
 }
 
 impl LruState {
@@ -232,11 +237,88 @@ impl LruState {
             entries: BTreeMap::new(),
             total: 0,
             pending: BTreeMap::new(),
+            dirty: false,
         }
     }
 
     pub fn total(&self) -> u64 {
         self.total
+    }
+
+    /// Whether the accounting is known to be incomplete and wants a reload.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Say that a remote change could not be accounted for.
+    ///
+    /// Nothing is guessed: the total simply stops being trustworthy until
+    /// [`LruState::adopt_loaded`] replaces it with what storage records.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Replace the accounting wholesale with a freshly loaded one, keeping the
+    /// deferred read-ticks this tab has not committed yet.
+    pub fn adopt_loaded(&mut self, loaded: LruState) {
+        self.entries = loaded.entries;
+        self.total = loaded.total;
+        self.pending.retain(|k, _| self.entries.contains_key(k));
+        self.dirty = false;
+    }
+
+    /// A tick that sorts after everything this state currently holds.
+    ///
+    /// Used for another tab's write, which this tab cannot allocate a real
+    /// bank tick for without awaiting — a coherence callback must never await.
+    /// It only has to order the remote write as "more recent than what is
+    /// here", which this does.
+    pub fn next_local_tick(&self) -> u64 {
+        self.entries
+            .values()
+            .map(|e| e.tick)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    /// Fold another tab's put into the accounting.
+    ///
+    /// `bytes` is `None` when the size could not be determined, which marks
+    /// the state dirty rather than inventing a number.
+    pub fn remote_put(&mut self, key: &[u8], bytes: Option<u64>) {
+        let tick = self.next_local_tick();
+        match bytes {
+            Some(bytes) => {
+                if let Some(old) = self.entries.insert(key.to_vec(), Entry { tick, bytes }) {
+                    self.total = self.total.saturating_sub(old.bytes);
+                }
+                self.total = self.total.saturating_add(bytes);
+            }
+            None => {
+                // The key exists, so it must be in the index and in the
+                // ordering; only its size is unknown. Account it as zero and
+                // let the reload correct the total.
+                self.entries.entry(key.to_vec()).or_insert(Entry { tick, bytes: 0 });
+                self.mark_dirty();
+            }
+        }
+    }
+
+    /// Fold another tab's delete into the accounting.
+    pub fn remote_delete(&mut self, key: &[u8]) {
+        if let Some(old) = self.entries.remove(key) {
+            self.total = self.total.saturating_sub(old.bytes);
+        }
+        self.pending.remove(key);
+    }
+
+    /// Fold another tab's clear into the accounting.
+    pub fn remote_clear(&mut self) {
+        self.entries.clear();
+        self.pending.clear();
+        self.total = 0;
+        self.dirty = false;
     }
 
     /// Note that `key` was read. RAM only — see [`LruState::pending`].
@@ -286,8 +368,11 @@ impl LruState {
     }
 
     /// Work out what a commit will cost and who has to go, without touching
-    /// anything. `keep` is the key being written, which must not be evicted to
-    /// make room for itself.
+    /// anything. `keep` names the keys this same commit is writing, which must
+    /// never be evicted to make room for themselves — a batch of them just as
+    /// much as a single put. If the batch alone exceeds the budget, everything
+    /// else is shed and the batch is left in place: refusing to store what we
+    /// were just asked to store would be the wrong failure.
     ///
     /// `budget` is normally [`LruState::max_bytes`];
     /// [`crate::LazyLocker::evict_to`] passes a smaller one.
@@ -297,7 +382,7 @@ impl LruState {
         removals: &[Vec<u8>],
         cleared: bool,
         budget: u64,
-        keep: Option<&[u8]>,
+        keep: &[Vec<u8>],
     ) -> Plan {
         let mut total = if cleared { 0 } else { self.total };
 
@@ -331,7 +416,7 @@ impl LruState {
             for (key, entry) in &self.entries {
                 if removals.iter().any(|r| r == key)
                     || updates.iter().any(|(k, _)| k == key)
-                    || keep.is_some_and(|k| k == key.as_slice())
+                    || keep.iter().any(|k| k.as_slice() == key.as_slice())
                 {
                     continue;
                 }
@@ -339,7 +424,7 @@ impl LruState {
             }
         }
         for (key, entry) in updates {
-            if keep.is_some_and(|k| k == key.as_slice()) {
+            if keep.iter().any(|k| k == key) {
                 continue;
             }
             candidates.push((entry.tick, key.as_slice(), entry.bytes));
@@ -484,7 +569,7 @@ mod tests {
             &[],
             false,
             s.max_bytes,
-            Some(b"c"),
+            &[b"c".to_vec()],
         );
         assert!(plan.victims.is_empty());
         assert_eq!(plan.total, 100);
@@ -499,7 +584,7 @@ mod tests {
             &[],
             false,
             s.max_bytes,
-            Some(b"d"),
+            &[b"d".to_vec()],
         );
         assert_eq!(plan.victims, vec![b"a".to_vec()]);
         assert_eq!(plan.total, 90);
@@ -522,7 +607,7 @@ mod tests {
             &[],
             false,
             s.max_bytes,
-            Some(b"big"),
+            &[b"big".to_vec()],
         );
         assert_eq!(plan.victims.len(), 3);
         assert_eq!(plan.total, 500);
@@ -549,7 +634,7 @@ mod tests {
             &[],
             false,
             s.max_bytes,
-            Some(b"d"),
+            &[b"d".to_vec()],
         );
         // `a` is no longer the oldest, so `b` is shed instead.
         assert_eq!(plan.victims, vec![b"b".to_vec()]);

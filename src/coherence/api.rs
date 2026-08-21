@@ -58,6 +58,15 @@ pub(crate) struct Change {
     /// exactly why [`Change::deleted`] exists: a receiver has to tell "this
     /// key is gone" from "this key changed and you will have to read it".
     pub value: Option<Vec<u8>>,
+    /// The value's **payload** length, when the sender could state it without
+    /// the receiver having to decode anything.
+    ///
+    /// Only a chunk pointer carries it, because a pointer records the payload
+    /// length it was built from. An inlined value needs no announcement — the
+    /// receiver has the bytes and its own filter chain. A large non-chunked
+    /// write states nothing, and a receiver that keeps a byte budget marks its
+    /// accounting dirty rather than guessing (see [`crate::Policy::Evictable`]).
+    pub bytes: Option<u64>,
     pub deleted: bool,
 }
 
@@ -67,9 +76,14 @@ pub(crate) struct Announcement {
     /// Which bank instance posted it, so a tab can ignore its own news.
     pub instance: u32,
     pub locker_id: LockerId,
-    /// A per-bank counter. Only ever used for diagnostics and ordering
-    /// within one sender — it is not a vector clock and does not order two
-    /// tabs against each other.
+    /// A per-bank counter, bumped once per commit that has news.
+    ///
+    /// **It is not a vector clock.** It orders one sender's own messages, and
+    /// a receiver uses it for exactly two things: dropping a message it has
+    /// already seen (an epoch at or below the last it applied from any tab),
+    /// and refusing to let another tab's news undo a write this tab committed
+    /// at an equal or later epoch of its own. See
+    /// [`crate::BankConfig::coherence`] for what that does and does not order.
     pub epoch: u64,
     pub cleared: bool,
     pub changes: Vec<Change>,
@@ -110,15 +124,25 @@ pub(crate) fn announcement_from_ops(
                 };
                 // A chunk pointer is never inlined: the bytes it names are in
                 // another table and the receiver has to go and read them.
-                let inline =
-                    if value.len() <= INLINE_LIMIT && !crate::locker::chunk::is_pointer(value) {
-                        Some(value.clone())
-                    } else {
-                        None
-                    };
+                let pointer = crate::locker::chunk::is_pointer(value);
+                let inline = if value.len() <= INLINE_LIMIT && !pointer {
+                    Some(value.clone())
+                } else {
+                    None
+                };
+                // A pointer already records the payload length it was built
+                // from, so a chunked write can be accounted for without a read.
+                let bytes = if pointer {
+                    crate::locker::chunk::ChunkPointer::parse(value)
+                        .ok()
+                        .map(|p| p.total_len)
+                } else {
+                    None
+                };
                 changes.push(Change {
                     key: user_key.to_vec(),
                     value: inline,
+                    bytes,
                     deleted: false,
                 });
             }
@@ -132,6 +156,7 @@ pub(crate) fn announcement_from_ops(
                 changes.push(Change {
                     key: user_key.to_vec(),
                     value: None,
+                    bytes: None,
                     deleted: true,
                 });
             }
@@ -211,6 +236,11 @@ mod tests {
         let a = announcement_from_ops(1, 7, 0, &[put(7, "k", pointer)]).expect("news");
         assert_eq!(a.changes[0].value, None);
         assert!(!a.changes[0].deleted);
+        assert_eq!(
+            a.changes[0].bytes,
+            Some(9),
+            "a pointer states its payload length so a receiver can account for it"
+        );
     }
 
     #[test]

@@ -1366,3 +1366,208 @@ pub async fn deferred_writes_are_visible_before_flush_and_durable_after<H: Harne
     assert!(bank.locker_bytes("deferred_eager").await? > 0);
     Ok(())
 }
+
+/// A transaction must carry the deferred writes staged before it.
+///
+/// The bug: `transact` built its ops from its own write-set only, leaving the
+/// staged batch behind. The transaction committed the newer value, and the
+/// next flush then wrote the *older* staged value straight over it. A put
+/// followed by a transaction on the same key silently lost the transaction.
+pub async fn a_transaction_absorbs_staged_deferred_writes<H: Harness>(h: &H) -> Result<()> {
+    let deferred = LockerConfig::default().with_commit(Commit::Deferred { after: 16 });
+    {
+        let bank = bank(h).await?;
+        let locker = bank.lazy_locker_with::<V>("tx_absorb", deferred).await?;
+
+        locker.put("k", &v("staged")).await?;
+        locker.put("other", &v("kept")).await?;
+        assert_eq!(locker.pending(), 2);
+
+        locker
+            .transact(|tx| async move {
+                tx.put("k", v("transacted"))?;
+                Ok(())
+            })
+            .await?;
+
+        assert_eq!(
+            locker.pending(),
+            0,
+            "the transaction must have absorbed the staged batch, not left it behind"
+        );
+        assert_eq!(locker.get("k").await?, Some(v("transacted")));
+        assert_eq!(
+            locker.get("other").await?,
+            Some(v("kept")),
+            "absorbing the batch must not drop the writes the transaction did not touch"
+        );
+
+        // A flush now has nothing left that could overwrite the transaction.
+        locker.flush().await?;
+        assert_eq!(locker.get("k").await?, Some(v("transacted")));
+
+        locker.close().await?;
+        bank.close().await?;
+    }
+
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker_with::<V>("tx_absorb", deferred).await?;
+    if h.caps().persists_across_open {
+        assert_eq!(
+            locker.get("k").await?,
+            Some(v("transacted")),
+            "the transaction's value is the newer one and must be what survives"
+        );
+        assert_eq!(locker.get("other").await?, Some(v("kept")));
+    }
+
+    // The same on an eager locker, where the resident copy and storage must
+    // still agree after a reopen.
+    let eager = bank.locker_with::<V>("tx_absorb_eager", deferred).await?;
+    eager.put("k", v("staged")).await?;
+    eager
+        .transact(|tx| async move {
+            tx.put("k", v("transacted"))?;
+            Ok(())
+        })
+        .await?;
+    assert_eq!(eager.pending(), 0);
+    assert_eq!(eager.get("k").as_deref(), Some(&v("transacted")));
+
+    // A deferred locker may have only one live handle, so let this one go
+    // before reading the same name back through another.
+    eager.close().await?;
+    let reader = bank.lazy_locker::<V>("tx_absorb_eager").await?;
+    assert_eq!(
+        reader.get("k").await?,
+        Some(v("transacted")),
+        "an eager locker's resident copy must match what it actually stored"
+    );
+    Ok(())
+}
+
+/// A commit must never evict a key it is writing in that same commit.
+///
+/// The bug: a deferred batch large enough to push an evictable locker past its
+/// budget was planned with no `keep` set, so the eviction could pick a key the
+/// very same commit was storing — deleting the value it had just written (and
+/// GC-ing the chunks it had just allocated). The batch's own keys are exactly
+/// the ones that must be safe.
+pub async fn a_batch_is_never_its_own_eviction_victim<H: Harness>(h: &H) -> Result<()> {
+    let config = LockerConfig::default()
+        .with_policy(Policy::Evictable { max_bytes: 4_000 })
+        .with_commit(Commit::Deferred { after: 32 });
+
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker_with::<Vec<u8>>("self_evict", config).await?;
+
+    // Two older keys, committed, that eviction is free to shed.
+    for key in ["old_a", "old_b"] {
+        locker.put(key, &vec![1u8; 1_000]).await?;
+    }
+    locker.flush().await?;
+    assert_eq!(locker.len(), 2);
+
+    // A batch that on its own is larger than the whole budget. Shedding the
+    // older keys is not enough, so without a `keep` set the eviction reaches
+    // into the batch and deletes values this very commit is writing.
+    let batch = ["new_a", "new_b", "new_c", "new_d", "new_e"];
+    for key in batch {
+        locker.put(key, &vec![2u8; 1_000]).await?;
+    }
+    locker.flush().await?;
+
+    for key in batch {
+        assert_eq!(
+            locker.get(key).await?,
+            Some(vec![2u8; 1_000]),
+            "{key} was written by the commit that evicted, so it must have survived it"
+        );
+        assert!(locker.contains_key(key), "{key} must still be in the index");
+    }
+    assert_eq!(
+        locker.len(),
+        5,
+        "the older keys are shed, the batch is kept whole"
+    );
+    for key in ["old_a", "old_b"] {
+        assert_eq!(
+            locker.get(key).await?,
+            None,
+            "{key} is older than the batch and must have been shed to make room"
+        );
+    }
+    Ok(())
+}
+
+/// Every read path must agree about a staged deferred write.
+///
+/// The bug: `get`, `len`, `keys` and `contains_key` all saw the staged batch,
+/// but `range`, `entries` and `to_map` walked storage and did not — so one
+/// handle answered two different stories about its own uncommitted writes.
+pub async fn listings_see_staged_deferred_writes<H: Harness>(h: &H) -> Result<()> {
+    let deferred = LockerConfig::default().with_commit(Commit::Deferred { after: 32 });
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker_with::<V>("listings", deferred).await?;
+
+    // Committed groundwork.
+    locker.put("a", &v("alpha")).await?;
+    locker.put("b", &v("beta")).await?;
+    locker.put("c", &v("gamma")).await?;
+    locker.flush().await?;
+
+    // Now stage: one overwrite, one new key, one delete. None committed.
+    locker.put("b", &v("beta2")).await?;
+    locker.put("d", &v("delta")).await?;
+    locker.delete("a").await?;
+    assert_eq!(locker.pending(), 3);
+
+    let map = locker.to_map().await?;
+    assert_eq!(
+        map.keys().cloned().collect::<Vec<_>>(),
+        locker.keys(),
+        "to_map and keys must describe the same locker"
+    );
+    assert_eq!(map.get("a"), None, "a staged delete must hide the key");
+    assert_eq!(
+        map.get("b"),
+        Some(&v("beta2")),
+        "a staged overwrite must win over the stored value"
+    );
+    assert_eq!(map.get("d"), Some(&v("delta")));
+    assert_eq!(map.get("c"), Some(&v("gamma")));
+
+    // Key-by-key reads must agree with the listing, which is the whole point.
+    for key in ["a", "b", "c", "d"] {
+        assert_eq!(
+            locker.get(key).await?,
+            map.get(key).cloned(),
+            "get and to_map disagree about {key}"
+        );
+    }
+
+    // Ranges and reverse ranges see it too, and stay inside their bounds.
+    let range = locker.range("b".."d").await?;
+    assert_eq!(
+        range,
+        vec![("b".to_string(), v("beta2")), ("c".to_string(), v("gamma"))]
+    );
+    let rev = locker.range_rev(..).await?;
+    assert_eq!(
+        rev.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        vec!["d".to_string(), "c".to_string(), "b".to_string()]
+    );
+    let latest = locker.latest(2).await?;
+    assert_eq!(
+        latest.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        vec!["d".to_string(), "c".to_string()],
+        "a limit must be applied after the staged writes are folded in"
+    );
+
+    // A staged clear hides everything, committed or not.
+    locker.clear().await?;
+    assert!(locker.to_map().await?.is_empty());
+    assert!(locker.entries().await?.is_empty());
+    assert_eq!(locker.keys(), Vec::<String>::new());
+    Ok(())
+}

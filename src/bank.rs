@@ -88,12 +88,42 @@ pub struct BankConfig {
     /// an eager locker's values — raising the same [`crate::Event`]s a local
     /// write would.
     ///
-    /// **It changes what an eager `get()` can return.** A value another tab
+    /// **It changes what an eager locker can return.** A value another tab
     /// wrote that is too large to carry in a message cannot be decoded here
     /// without an await, and an eager `get()` cannot await, so the resident
-    /// copy is dropped and [`crate::Event::Stale`] is raised. `get()` answers
-    /// `None` for that key until the locker is reopened. Lazy lockers have no
-    /// such limit: their index is updated either way.
+    /// copy is dropped and [`crate::Event::Stale`] is raised. The key is then
+    /// gone from *every* resident answer, not just `get()`: `len()`, `keys()`,
+    /// `keys_bytes()`, `contains_key()`, `entries()` and `to_map()` all stop
+    /// reporting it, until the locker is reopened and reads the bytes that are
+    /// still perfectly intact in storage. Lazy lockers have no such limit:
+    /// their key index is updated either way.
+    ///
+    /// # How two tabs writing one key are resolved
+    ///
+    /// **Newest epoch wins, per tab clock.** Each bank keeps a counter it
+    /// bumps once per commit that has news, and stamps it on the message. A
+    /// receiving eager locker drops a message whose epoch is at or below one
+    /// it has already applied, and drops any change whose key this tab itself
+    /// committed at an equal or higher epoch of its own.
+    ///
+    /// That makes two things true, and one thing not:
+    ///
+    /// * A tab never has its own committed write undone by a message that was
+    ///   already in flight when it wrote.
+    /// * A message that arrives twice, or out of order behind a newer one, is
+    ///   ignored rather than replayed.
+    /// * **Two tabs writing the same key concurrently are not ordered.** The
+    ///   counters are independent — they are not a vector clock, and there is
+    ///   no shared clock to make one from — so which resident copy each tab
+    ///   ends up holding depends on message timing. Storage itself is always
+    ///   consistent: the backend serialises the commits and the last one to
+    ///   land is what is stored. It is only the *resident* copies that may
+    ///   disagree with it until a reopen. If two tabs genuinely write one key,
+    ///   put it in a lazy locker, which reads through to storage.
+    ///
+    /// A lazy locker's byte budget is kept in step with another tab's news
+    /// too; where a message cannot state a size, the accounting is reloaded
+    /// from storage before the next commit plans an eviction.
     ///
     /// Native accepts the flag and does nothing — `redb` takes an exclusive
     /// file lock, so there is no second process to stay coherent with.
@@ -460,10 +490,16 @@ impl Bank {
     }
 
     /// As [`Bank::locker`], with explicit limits.
+    ///
+    /// Opening the same name twice is allowed and gives two independent
+    /// handles — **except under [`crate::Commit::Deferred`]**, where the
+    /// second open reports [`Error::InvalidConfig`]. See
+    /// [`Bank::refuse_second_deferred_handle`].
     pub async fn locker_with<T>(&self, name: &str, config: LockerConfig) -> Result<Locker<T>>
     where
         T: Serialize + DeserializeOwned + 'static,
     {
+        self.refuse_second_deferred_handle(name, &config)?;
         let id = self.prepare::<T>(name).await?;
         let locker = Locker::open(
             self.backend.clone(),
@@ -492,6 +528,11 @@ impl Bank {
     }
 
     /// As [`Bank::lazy_locker`], with explicit limits.
+    ///
+    /// Opening the same name twice is allowed and gives two independent
+    /// handles — **except under [`crate::Commit::Deferred`]**, where the
+    /// second open reports [`Error::InvalidConfig`]. See
+    /// [`Bank::refuse_second_deferred_handle`].
     pub async fn lazy_locker_with<T>(
         &self,
         name: &str,
@@ -500,6 +541,7 @@ impl Bank {
     where
         T: Serialize + DeserializeOwned,
     {
+        self.refuse_second_deferred_handle(name, &config)?;
         let id = self.prepare::<T>(name).await?;
         let locker = LazyLocker::open(
             self.backend.clone(),
@@ -694,6 +736,7 @@ impl Bank {
             shared: self.shared.clone(),
             watchers: Default::default(),
             closed: std::sync::atomic::AtomicBool::new(false),
+            epochs: Default::default(),
         })
     }
 
@@ -1030,6 +1073,42 @@ impl Bank {
         }
     }
 
+    /// Refuse a second live handle on a name where either side stages writes.
+    ///
+    /// Two handles under [`crate::Commit::Deferred`] each hold their own
+    /// staging buffer over the same stored data. Neither can see the other's,
+    /// so whichever flushes last overwrites the other's writes — silently, and
+    /// with no way for either caller to notice. There is no sane merge to
+    /// perform after the fact, so the second open is refused instead.
+    ///
+    /// Two `Commit::Immediate` handles stay allowed: they hold nothing back,
+    /// so every write is already serialised by the backend.
+    fn refuse_second_deferred_handle(&self, name: &str, config: &LockerConfig) -> Result<()> {
+        let Ok(mut guard) = self.open_lockers.lock() else {
+            return Ok(());
+        };
+        Self::prune(&mut guard);
+        let Some(handles) = guard.get(name) else {
+            return Ok(());
+        };
+        let existing_defers = handles
+            .iter()
+            .filter_map(|weak| weak.upgrade())
+            .any(|inner| inner.config.defers_writes());
+        if !existing_defers && !config.defers_writes() {
+            return Ok(());
+        }
+        if handles.is_empty() {
+            return Ok(());
+        }
+        Err(Error::InvalidConfig(format!(
+            "locker {name:?} is already open and one of the two handles uses \
+             Commit::Deferred; a deferred locker may have only one live handle, \
+             because two staging buffers over one name overwrite each other. \
+             Close the other handle first, or share this one."
+        )))
+    }
+
     fn register_open(&self, name: &str, inner: &Arc<Inner>) {
         if let Ok(mut guard) = self.open_lockers.lock() {
             Self::prune(&mut guard);
@@ -1050,7 +1129,8 @@ impl Bank {
     /// independent handles over the same stored data — the eager form gives
     /// each its own resident copy, which will diverge on write. The name
     /// counts as open until *every* one of those handles is dropped or
-    /// closed.
+    /// closed. The one exception is [`crate::Commit::Deferred`], where a
+    /// second live handle is refused outright.
     pub fn is_locker_open(&self, name: &str) -> bool {
         let Ok(mut guard) = self.open_lockers.lock() else {
             return false;

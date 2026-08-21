@@ -66,7 +66,7 @@ impl std::fmt::Debug for Resident {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Resident")
             .field("locker", &self.inner.name)
-            .field("pending", &self.pending_len())
+            .field("pending", &self.pending_len().unwrap_or(0))
             .finish()
     }
 }
@@ -138,11 +138,16 @@ impl Resident {
         updates: Vec<(Vec<u8>, u64)>,
         removals: Vec<Vec<u8>>,
         cleared: bool,
-        keep: Option<&[u8]>,
+        keep: &[Vec<u8>],
     ) -> Result<Budget> {
         if self.lru.is_none() {
             return Ok(Budget::default());
         }
+
+        // Another tab's news may have named a key whose size this tab could
+        // not work out (see [`super::lazy::LazySink`]). Reload before planning
+        // rather than evicting against a total that is known to be wrong.
+        self.reload_lru_if_dirty().await?;
 
         let tick = self
             .inner
@@ -232,7 +237,7 @@ impl Resident {
             let Some(state) = self.lru_lock() else {
                 return Ok(0);
             };
-            state.plan(&[], &[], false, bytes, None)
+            state.plan(&[], &[], false, bytes, &[])
         };
         if plan.victims.is_empty() {
             return Ok(0);
@@ -253,6 +258,46 @@ impl Resident {
         Ok(shed)
     }
 
+    /// Reload the `lru::` prefix when a coherence callback could not account
+    /// for another tab's write. Cheap in the normal case: the flag is false.
+    async fn reload_lru_if_dirty(&self) -> Result<()> {
+        let (dirty, max_bytes) = match self.lru_lock() {
+            Some(state) => (state.is_dirty(), state.max_bytes),
+            None => return Ok(()),
+        };
+        if !dirty {
+            return Ok(());
+        }
+        let loaded = lru::load(self.inner.backend.as_ref(), self.inner.id, max_bytes).await?;
+        if let Some(mut state) = self.lru_lock() {
+            state.adopt_loaded(loaded);
+        }
+        Ok(())
+    }
+
+    /// Fold another tab's news into the byte budget.
+    ///
+    /// Synchronous by necessity — a coherence callback must never await — so
+    /// a size it cannot determine marks the accounting dirty instead of
+    /// guessing. See [`LruState::remote_put`].
+    pub(crate) fn remote_budget(&self, key: &[u8], bytes: Option<u64>, deleted: bool) {
+        let Some(mut state) = self.lru_lock() else {
+            return;
+        };
+        if deleted {
+            state.remote_delete(key);
+        } else {
+            state.remote_put(key, bytes);
+        }
+    }
+
+    /// Fold another tab's clear into the byte budget.
+    pub(crate) fn remote_budget_clear(&self) {
+        if let Some(mut state) = self.lru_lock() {
+            state.remote_clear();
+        }
+    }
+
     // ---- staged writes -------------------------------------------------
 
     /// How many writes must pile up before this locker commits by itself, or
@@ -271,11 +316,19 @@ impl Resident {
         self.deferred_after().is_some()
     }
 
-    pub(crate) fn pending_len(&self) -> usize {
-        self.staged.lock().map(|s| s.len()).unwrap_or(0)
+    /// How many writes are staged.
+    ///
+    /// `Err` on a poisoned lock rather than 0: reporting "nothing staged"
+    /// there would turn [`Resident::flush`] into a silent no-op and lose the
+    /// only copy of the batch.
+    pub(crate) fn pending_len(&self) -> Result<usize> {
+        self.staged
+            .lock()
+            .map(|s| s.len())
+            .map_err(|_| Error::backend("staged write lock was poisoned"))
     }
 
-    pub(crate) fn pending_bytes(&self) -> u64 {
+    pub(crate) fn pending_bytes(&self) -> Result<u64> {
         self.staged
             .lock()
             .map(|s| {
@@ -286,7 +339,7 @@ impl Resident {
                     })
                     .sum()
             })
-            .unwrap_or(0)
+            .map_err(|_| Error::backend("staged write lock was poisoned"))
     }
 
     /// Queue a write. Returns whether the batch is now full.
@@ -320,9 +373,21 @@ impl Resident {
         Ok(None)
     }
 
+    /// A copy of everything staged, oldest first.
+    ///
+    /// Used by the listing paths, which walk storage and must then overlay
+    /// what this handle has staged but not committed.
+    pub(crate) fn staged_snapshot(&self) -> Result<Vec<Pending>> {
+        let guard = self
+            .staged
+            .lock()
+            .map_err(|_| Error::backend("staged write lock was poisoned"))?;
+        Ok(guard.clone())
+    }
+
     /// Commit everything staged, taking the locker's write lock.
     pub(crate) async fn flush(&self) -> Result<()> {
-        if self.pending_len() == 0 {
+        if self.pending_len()? == 0 {
             return Ok(());
         }
         let _guard = self.inner.write_lock.lock().await;
@@ -331,13 +396,7 @@ impl Resident {
 
     /// As [`Resident::flush`], for a caller that already holds the write lock.
     pub(crate) async fn flush_locked(&self) -> Result<()> {
-        let entries = {
-            let mut guard = self
-                .staged
-                .lock()
-                .map_err(|_| Error::backend("staged write lock was poisoned"))?;
-            std::mem::take(&mut *guard)
-        };
+        let entries = self.take_staged()?;
         if entries.is_empty() {
             return Ok(());
         }
@@ -355,8 +414,12 @@ impl Resident {
             };
 
         let (updates, removals, cleared) = accounting(&entries);
+        // The batch's own keys are `keep`: a commit must never evict a key it
+        // is writing in that same commit, which would GC the new chunks and
+        // leave the record pointing at nothing.
+        let keep: Vec<Vec<u8>> = updates.iter().map(|(k, _)| k.clone()).collect();
         let budget = match self
-            .budget_ops(&mut ops, updates, removals, cleared, None)
+            .budget_ops(&mut ops, updates, removals, cleared, &keep)
             .await
         {
             Ok(budget) => budget,
@@ -374,7 +437,18 @@ impl Resident {
         Ok(())
     }
 
-    fn restage(&self, mut entries: Vec<Pending>) {
+    /// Drain the staged batch. The caller owns it and must restage it if the
+    /// commit it was drained for does not land.
+    pub(crate) fn take_staged(&self) -> Result<Vec<Pending>> {
+        let mut guard = self
+            .staged
+            .lock()
+            .map_err(|_| Error::backend("staged write lock was poisoned"))?;
+        Ok(std::mem::take(&mut *guard))
+    }
+
+    /// Put a drained batch back at the front, ahead of anything staged since.
+    pub(crate) fn restage(&self, mut entries: Vec<Pending>) {
         if let Ok(mut guard) = self.staged.lock() {
             entries.append(&mut guard);
             *guard = entries;
@@ -391,10 +465,10 @@ impl Resident {
 
 /// Keys written with their payload sizes, keys removed, and whether the batch
 /// began with a clear.
-type Accounting = (Vec<(Vec<u8>, u64)>, Vec<Vec<u8>>, bool);
+pub(crate) type Accounting = (Vec<(Vec<u8>, u64)>, Vec<Vec<u8>>, bool);
 
 /// What a batch of staged writes does to the byte budget, collapsed.
-fn accounting(entries: &[Pending]) -> Accounting {
+pub(crate) fn accounting(entries: &[Pending]) -> Accounting {
     let mut updates: Vec<(Vec<u8>, u64)> = Vec::new();
     let mut removals: Vec<Vec<u8>> = Vec::new();
     let mut cleared = false;
@@ -438,6 +512,62 @@ pub(crate) async fn open_lru(inner: &Inner, index: &BTreeSet<Vec<u8>>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn resident() -> Resident {
+        let inner = Arc::new(Inner {
+            write_lock: futures::lock::Mutex::new(()),
+            backend: Arc::new(crate::backend::MemoryBackend::new()),
+            chain: Arc::new(crate::codec::default_chain()),
+            id: 1,
+            name: "test".into(),
+            config: super::super::policy::LockerConfig::default()
+                .with_commit(Commit::Deferred { after: 8 }),
+            shared: Default::default(),
+            watchers: Default::default(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            epochs: Default::default(),
+        });
+        Resident::new(inner, TxMode::Lazy, Some(BTreeSet::new()), None)
+    }
+
+    /// A poisoned staging lock must never read as "nothing staged".
+    ///
+    /// It did, and `flush` returned `Ok(())` without writing anything: the
+    /// batch was still sitting in the buffer, the caller was told it had
+    /// landed, and the next `close` threw it away. Losing writes silently is
+    /// the one outcome a store may not have.
+    /// Native only: poisoning a lock needs a second thread to panic in, and
+    /// wasm32 has none.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_poisoned_staging_lock_fails_the_flush_rather_than_skipping_it() {
+        let res = Arc::new(resident());
+        res.stage(Pending::Put {
+            key: b"k".to_vec(),
+            payload: vec![1, 2, 3],
+        })
+        .expect("staged");
+        assert_eq!(res.pending_len().expect("healthy"), 1);
+
+        // Poison it exactly as a panicking writer would.
+        let poisoner = res.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.staged.lock();
+            panic!("poison the staging lock");
+        })
+        .join();
+
+        assert!(
+            res.pending_len().is_err(),
+            "a poisoned lock must not answer 0"
+        );
+        let flushed = futures::executor::block_on(res.flush());
+        assert!(
+            matches!(flushed, Err(Error::Backend(_))),
+            "flush must report the poisoning, not silently do nothing: {flushed:?}"
+        );
+    }
 
     #[test]
     fn a_batch_of_one_is_not_deferral() {

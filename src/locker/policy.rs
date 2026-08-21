@@ -56,6 +56,12 @@ pub enum Commit {
 
     /// Stage writes in memory and commit them in batches of `after`.
     ///
+    /// **Only one handle per name may use it.** Two handles on one locker each
+    /// keep their own staging buffer, so whichever flushed last would win and
+    /// the other's writes would be silently overwritten. [`crate::Bank`]
+    /// refuses the second open with [`crate::Error::InvalidConfig`] rather
+    /// than let that happen — see [`crate::Bank::locker_with`].
+    ///
     /// # You must call `flush` yourself
     ///
     /// **crossbank spawns nothing.** There is no timer, no background task and
@@ -155,6 +161,15 @@ impl LockerConfig {
 
     /// See [`Commit`]. Deferred writes are never the default, and the caller
     /// takes on the duty of flushing them.
+    /// Whether this config actually stages writes.
+    ///
+    /// `Deferred { after: 0 }` and `after: 1` both mean "commit on the next
+    /// write", which is [`Commit::Immediate`] with extra steps, so they are
+    /// not deferral and carry none of its restrictions.
+    pub(crate) fn defers_writes(&self) -> bool {
+        matches!(self.commit, Commit::Deferred { after } if after > 1)
+    }
+
     pub fn with_commit(mut self, commit: Commit) -> Self {
         self.commit = commit;
         self

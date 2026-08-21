@@ -46,9 +46,18 @@ pub enum Event {
     ///
     /// Only ever raised on an **eager** locker, and only with
     /// [`crate::BankConfig::with_coherence`] on. The stored data is fine; it
-    /// is this tab's in-memory copy that is gone, and `get()` answers `None`
-    /// for that key until the locker is reopened. A lazy locker has no such
-    /// limit — it fetches on demand — so it raises [`Event::Put`] instead.
+    /// is this tab's in-memory copy that is gone.
+    ///
+    /// **The key disappears from every resident answer, not only `get()`.**
+    /// Until the locker is reopened, `crate::Locker::len`, `keys`,
+    /// `keys_bytes`, `contains_key`, `entries` and `to_map` all behave as
+    /// though the key were never written — because a resident locker answers
+    /// all of them from the same map, and a value it cannot decode is a value
+    /// it cannot hold. Reopening the locker reads the stored bytes and brings
+    /// the key back.
+    ///
+    /// A lazy locker has no such limit — it fetches on demand — so it raises
+    /// [`Event::Put`] instead.
     Stale { key: Vec<u8> },
     /// A key was shed to keep an [`crate::Policy::Evictable`] locker inside
     /// its byte budget.

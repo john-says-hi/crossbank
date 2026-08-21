@@ -182,3 +182,69 @@ async fn without_the_flag_nothing_crosses() {
         .await
         .unwrap();
 }
+
+/// A bank dropped without `close` must not leave the channel calling into it.
+///
+/// The `BroadcastChannel` holds a raw pointer into the `Closure` the bank
+/// owns. Dropping the bank freed that closure while the browser was still
+/// holding the pointer, so the next message any other tab posted was a
+/// use-after-free — silent, and only ever fatal later. `Drop for Coherence`
+/// unregisters synchronously, which is what this proves.
+///
+/// The assertion is survival: the page must still be running, the message
+/// must reach a bank that *is* still open, and the test after this one must
+/// run at all.
+#[wasm_bindgen_test]
+async fn a_bank_dropped_without_close_does_not_take_the_page_with_it() {
+    let name = "crossbank-coherence-drop";
+    let _ = crossbank::delete_bank(&BankConfig::web(name)).await;
+
+    let survivor = Bank::open(config(name)).await.unwrap();
+    let watching = survivor.lazy_locker::<String>("l").await.unwrap();
+
+    // A third bank that is dropped without `close` — the exact mistake.
+    {
+        let doomed = Bank::open(config(name)).await.unwrap();
+        let locker = doomed.lazy_locker::<String>("l").await.unwrap();
+        locker.put("before", &"dropped".to_string()).await.unwrap();
+        assert!(settles(|| watching.contains_key("before")).await);
+        // No `doomed.close()`. This is the whole point of the case.
+    }
+
+    // Give the event loop a turn, so anything the dropped bank had queued
+    // would have fired by now.
+    tick(50).await;
+
+    // A live bank still posts, and the survivor still receives.
+    let writer = Bank::open(config(name)).await.unwrap();
+    let wl = writer.lazy_locker::<String>("l").await.unwrap();
+    wl.put("after", &"still here".to_string()).await.unwrap();
+    assert!(
+        settles(|| watching.contains_key("after")).await,
+        "the surviving bank must still hear the channel"
+    );
+    assert_eq!(
+        watching.get("after").await.unwrap(),
+        Some("still here".to_string())
+    );
+
+    writer.close().await.unwrap();
+    survivor.close().await.unwrap();
+    let _ = crossbank::delete_bank(&BankConfig::web(name)).await;
+}
+
+/// The test that has to run after the one above, to prove the page survived
+/// it rather than the harness merely stopping.
+#[wasm_bindgen_test]
+async fn the_page_is_still_alive_after_a_bank_was_dropped_uncleanly() {
+    let name = "crossbank-coherence-after-drop";
+    let _ = crossbank::delete_bank(&BankConfig::web(name)).await;
+
+    let bank = Bank::open(config(name)).await.unwrap();
+    let locker = bank.lazy_locker::<String>("l").await.unwrap();
+    locker.put("k", &"alive".to_string()).await.unwrap();
+    assert_eq!(locker.get("k").await.unwrap(), Some("alive".to_string()));
+
+    bank.close().await.unwrap();
+    let _ = crossbank::delete_bank(&BankConfig::web(name)).await;
+}

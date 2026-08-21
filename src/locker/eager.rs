@@ -95,6 +95,7 @@ where
             shared,
             watchers: Default::default(),
             closed: AtomicBool::new(false),
+            epochs: Default::default(),
         });
 
         let mut values = BTreeMap::new();
@@ -217,19 +218,27 @@ where
     ///
     /// Always safe to call: an immediate-commit locker has nothing staged and
     /// returns at once.
+    /// **A closed locker may still be flushed.** [`Locker::close`] keeps the
+    /// batch when its own flush fails, so `pending()` stays honest and the
+    /// caller can fix the cause and retry here. Every write still reports
+    /// [`Error::Closed`].
     pub async fn flush(&self) -> Result<()> {
-        self.inner.ensure_open()?;
         self.res.flush().await
     }
 
     /// How many writes are staged and not yet committed.
+    ///
+    /// Reads 0 if the staging lock has been poisoned by a panic in another
+    /// thread; [`Locker::flush`] reports that as [`Error::Backend`] rather
+    /// than silently doing nothing.
     pub fn pending(&self) -> usize {
-        self.res.pending_len()
+        self.res.pending_len().unwrap_or(0)
     }
 
-    /// Payload bytes staged and not yet committed.
+    /// Payload bytes staged and not yet committed. See [`Locker::pending`] for
+    /// the poisoned-lock caveat.
     pub fn pending_bytes(&self) -> u64 {
-        self.res.pending_bytes()
+        self.res.pending_bytes().unwrap_or(0)
     }
 
     /// Run a transaction: every staged write lands together, or none does.
@@ -258,11 +267,29 @@ where
             return Ok(());
         }
 
+        // Absorb anything this handle has staged under `Commit::Deferred`, so
+        // both batches ride in one commit — staged first, transaction last.
+        // Without this, a later flush would write the older staged value over
+        // this transaction's newer one.
+        let staged_before = self.res.take_staged()?;
+        let merged = super::lazy::merge_batches(&staged_before, &entries);
+
         // An eager locker holds its values, so the size limit applies to
-        // transactional writes exactly as it does to a plain put. `ops_for`
-        // enforces it while sealing, so the bytes are only produced once.
-        let ops = Transaction::<T>::ops_for(&self.inner, &entries, TxMode::Eager).await?;
-        self.inner.commit(ops).await?;
+        // transactional writes exactly as it does to a plain put.
+        // `ops_for_pending` enforces it while sealing, so the bytes are only
+        // produced once.
+        let ops =
+            match super::transaction::ops_for_pending(&self.inner, &merged, TxMode::Eager).await {
+                Ok(ops) => ops,
+                Err(e) => {
+                    self.res.restage(staged_before);
+                    return Err(e);
+                }
+            };
+        if let Err(e) = self.inner.commit(ops).await {
+            self.res.restage(staged_before);
+            return Err(e);
+        }
 
         if let Ok(mut guard) = self.values.lock() {
             for entry in &entries {
@@ -397,13 +424,34 @@ impl<T: DeserializeOwned> crate::coherence::Sink for EagerSink<T> {
         if self.inner.is_closed() {
             return;
         }
+        // A message this tab has already absorbed, or one from a tab whose
+        // clock is behind news already applied, tells it nothing new.
+        if announcement.epoch <= self.inner.epochs.applied() {
+            return;
+        }
+        self.inner.epochs.note_applied(announcement.epoch);
+
         if announcement.cleared {
             if let Ok(mut values) = self.values.lock() {
                 values.clear();
             }
+            self.inner.epochs.forget_local();
             self.inner.announce(Event::Cleared);
         }
         for change in &announcement.changes {
+            // This tab's own commit for that key is at least as new, so the
+            // message would be undoing a write this tab has already made. See
+            // `BankConfig::coherence` for exactly what this does and does not
+            // order.
+            if self
+                .inner
+                .epochs
+                .local(&change.key)
+                .is_some_and(|mine| announcement.epoch <= mine)
+            {
+                continue;
+            }
+
             // Decoded here, in a plain callback, so `get()` stays synchronous
             // and infallible. What cannot be decoded here cannot be held.
             let decoded = match (change.deleted, &change.value) {
@@ -514,7 +562,11 @@ impl<T> Locker<T> {
         // who is shutting down must not be left holding an open locker just
         // because its last batch would not land.
         let flushed = self.res.flush().await;
-        self.res.discard_staged();
+        // Only discard once the batch is actually stored — a failed flush has
+        // written nothing, and this buffer is the only copy of it.
+        if flushed.is_ok() {
+            self.res.discard_staged();
+        }
         self.inner.mark_closed();
         if let Ok(mut guard) = self.values.lock() {
             guard.clear();
@@ -767,6 +819,7 @@ mod tests {
             changes: vec![Change {
                 key: b"k".to_vec(),
                 value: Some(sealed),
+                bytes: None,
                 deleted: false,
             }],
         });
@@ -794,12 +847,97 @@ mod tests {
             changes: vec![Change {
                 key: b"k".to_vec(),
                 value: None,
+                bytes: None,
                 deleted: false,
             }],
         });
 
         assert_eq!(l.get("k"), None, "a value we cannot decode is not held");
         assert_eq!(events.try_recv(), Some(Event::Stale { key: b"k".to_vec() }));
+    }
+
+    fn one_change(id: LockerId, epoch: u64, key: &[u8], sealed: Option<Vec<u8>>) -> Announcement {
+        Announcement {
+            instance: 2,
+            locker_id: id,
+            epoch,
+            cleared: false,
+            changes: vec![Change {
+                key: key.to_vec(),
+                value: sealed,
+                bytes: None,
+                deleted: false,
+            }],
+        }
+    }
+
+    /// The epoch on an announcement must actually be used.
+    ///
+    /// It was decoded and thrown away, so a message that arrived twice, or
+    /// out of order behind a newer one, was replayed over the resident copy
+    /// and the locker ended up holding an older value than it had already
+    /// absorbed.
+    #[test]
+    fn a_sink_ignores_an_announcement_it_has_already_overtaken() {
+        let l = locker();
+        let id = l.inner.id;
+        let sink = l.sink();
+
+        let newer = l.inner.seal(&"newer".to_string()).unwrap();
+        let older = l.inner.seal(&"older".to_string()).unwrap();
+
+        sink.apply(&one_change(id, 5, b"k", Some(newer)));
+        assert_eq!(l.get("k").as_deref(), Some(&"newer".to_string()));
+
+        // Same epoch again — a duplicate delivery.
+        sink.apply(&one_change(id, 5, b"k", Some(older.clone())));
+        assert_eq!(
+            l.get("k").as_deref(),
+            Some(&"newer".to_string()),
+            "a duplicate epoch must not be replayed"
+        );
+
+        // And an older one, arriving late.
+        sink.apply(&one_change(id, 3, b"k", Some(older)));
+        assert_eq!(
+            l.get("k").as_deref(),
+            Some(&"newer".to_string()),
+            "an out-of-order older epoch must not overwrite a newer one"
+        );
+
+        // A genuinely newer one still lands.
+        let newest = l.inner.seal(&"newest".to_string()).unwrap();
+        sink.apply(&one_change(id, 9, b"k", Some(newest)));
+        assert_eq!(l.get("k").as_deref(), Some(&"newest".to_string()));
+    }
+
+    /// This tab's own committed write outranks another tab's older news for
+    /// the same key, so a message already in flight cannot undo it.
+    #[test]
+    fn a_sink_will_not_undo_this_tabs_own_newer_commit() {
+        let l = locker();
+        let id = l.inner.id;
+        // Natively no announcement is produced, so record the marker the way
+        // a commit under coherence would.
+        l.inner
+            .epochs
+            .note_local([b"k".to_vec()].into_iter(), 7);
+        block_on(l.put("k", "mine".into())).unwrap();
+
+        let theirs = l.inner.seal(&"theirs".to_string()).unwrap();
+        l.sink().apply(&one_change(id, 7, b"k", Some(theirs.clone())));
+        assert_eq!(
+            l.get("k").as_deref(),
+            Some(&"mine".to_string()),
+            "an equal epoch must not undo this tab's own commit"
+        );
+
+        l.sink().apply(&one_change(id, 8, b"k", Some(theirs)));
+        assert_eq!(
+            l.get("k").as_deref(),
+            Some(&"theirs".to_string()),
+            "a strictly newer epoch still wins"
+        );
     }
 
     #[test]

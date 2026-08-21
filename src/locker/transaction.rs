@@ -102,33 +102,6 @@ where
         self.staged.clone()
     }
 
-    /// Turn a drained write-set into backend ops.
-    ///
-    /// Async because it is GC-aware: overwriting or deleting a key that holds
-    /// a chunk pointer has to look the old pointer up so its chunks are
-    /// dropped in the same commit. Staging bare `Op::Put`s here is what
-    /// orphaned chunks forever on the `put_all` / `transact` path.
-    ///
-    /// The write-set is collapsed first — everything before the last `clear`
-    /// is dropped, and only the last action per key survives — so one key
-    /// written twice in a transaction allocates one value id, not two (the
-    /// first of which nothing would ever point at).
-    pub(crate) async fn ops_for(
-        inner: &Inner,
-        staged: &[Staged<T>],
-        mode: TxMode,
-    ) -> Result<Vec<Op>> {
-        let items: Vec<Item<'_>> = staged
-            .iter()
-            .map(|entry| match entry {
-                Staged::Put { key, payload, .. } => Item::Put(key, payload),
-                Staged::Delete { key } => Item::Delete(key),
-                Staged::Clear => Item::Clear,
-            })
-            .collect();
-        ops_for_items(inner, &items, mode).await
-    }
-
     /// Stage a write. Encoding happens now, on this thread, so no user code
     /// ever runs while a backend transaction is open.
     pub fn put(&self, key: &str, value: T) -> Result<()> {
@@ -315,7 +288,7 @@ pub(crate) async fn ops_for_items(
     Ok(ops)
 }
 
-/// The deferred-write twin of [`Transaction::ops_for`].
+/// The deferred-write twin of [`ops_for_items`], over a staged batch.
 pub(crate) async fn ops_for_pending(
     inner: &Inner,
     staged: &[super::resident::Pending],

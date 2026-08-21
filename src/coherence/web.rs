@@ -156,6 +156,24 @@ impl Coherence {
     }
 }
 
+/// The backstop for a bank that is dropped without [`crate::Bank::close`].
+///
+/// The channel holds a raw function pointer into the `Closure` this struct
+/// owns. Dropping the struct frees the closure while the browser is still
+/// holding that pointer, so the next message any other tab posts calls into
+/// freed wasm memory — a use-after-free with no Rust-level symptom until it
+/// corrupts something.
+///
+/// So the unregistration is synchronous and happens here as well as in
+/// [`Coherence::close`]. Both are idempotent, and running both is normal:
+/// `close` is the documented path, this is what covers the one nobody took.
+/// Nothing here awaits, because a `Drop` cannot.
+impl Drop for Coherence {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 fn instance_id() -> u32 {
     (js_sys::Math::random() * (u32::MAX as f64)) as u32
 }
@@ -203,6 +221,10 @@ fn encode(announcement: &Announcement) -> JsValue {
             Some(bytes) => set(&item, "value", &js_sys::Uint8Array::from(&bytes[..]).into()),
             None => set(&item, "value", &JsValue::NULL),
         }
+        match change.bytes {
+            Some(bytes) => set(&item, "bytes", &JsValue::from_f64(bytes as f64)),
+            None => set(&item, "bytes", &JsValue::NULL),
+        }
         set(&item, "deleted", &JsValue::from_bool(change.deleted));
         changes.push(&item);
     }
@@ -225,6 +247,10 @@ fn decode(value: &JsValue) -> Option<Announcement> {
             changes.push(Change {
                 key,
                 value: get(&item, "value").and_then(bytes),
+                bytes: get(&item, "bytes")
+                    .and_then(|v| v.as_f64())
+                    .filter(|n| n.is_finite() && *n >= 0.0)
+                    .map(|n| n as u64),
                 deleted: get(&item, "deleted")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),

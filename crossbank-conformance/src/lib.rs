@@ -74,7 +74,7 @@ pub trait Harness {
 }
 
 /// Number of cases in the spec. The arity guard compares against this.
-pub const CASE_COUNT: usize = 43;
+pub const CASE_COUNT: usize = 46;
 
 /// Run `block_on` without pulling in an async runtime.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -135,6 +135,9 @@ macro_rules! __for_each_case {
         );
         $crate::__emit!(eviction_prefers_the_least_recently_used, $make);
         $crate::__emit!(evictable_locker_stays_under_its_budget, $make);
+        $crate::__emit!(a_transaction_absorbs_staged_deferred_writes, $make);
+        $crate::__emit!(a_batch_is_never_its_own_eviction_victim, $make);
+        $crate::__emit!(listings_see_staged_deferred_writes, $make);
     };
 }
 
@@ -270,5 +273,8 @@ macro_rules! __count_cases {
         );
         $counter!(eviction_prefers_the_least_recently_used, ());
         $counter!(evictable_locker_stays_under_its_budget, ());
+        $counter!(a_transaction_absorbs_staged_deferred_writes, ());
+        $counter!(a_batch_is_never_its_own_eviction_victim, ());
+        $counter!(listings_see_staged_deferred_writes, ());
     };
 }

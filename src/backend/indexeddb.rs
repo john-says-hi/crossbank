@@ -373,6 +373,12 @@ impl Backend for IndexedDbBackend {
     fn flush(&self) -> BFut<'_, ()> {
         // A completed IndexedDB transaction has already committed. There is
         // no extra durability lever to pull.
+        //
+        // The same reason there is no `commit_with` override here:
+        // [`crate::Durability`] is a *native* trade. IndexedDB exposes no
+        // fsync knob at all, so an `Eventual` locker on the web behaves
+        // exactly like an `Immediate` one. That is honest rather than a gap —
+        // the setting stays portable, it simply costs nothing here.
         Box::pin(async move { Ok(()) })
     }
 }

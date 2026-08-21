@@ -36,7 +36,10 @@ use std::sync::RwLock;
 
 use redb::{Database, Durability, ReadableDatabase, TableDefinition, TableError};
 
-use super::api::{BFut, Backend, KeyRange, Op, ScanPage, ScanRequest, Table, Usage};
+use super::api::{
+    BFut, Backend, CommitOptions, Durability as CommitDurability, KeyRange, Op, ScanPage,
+    ScanRequest, Table, Usage,
+};
 use crate::error::{Error, Result};
 
 type Def = TableDefinition<'static, &'static [u8], &'static [u8]>;
@@ -206,15 +209,27 @@ impl RedbBackend {
     /// Apply every op in one transaction, or none of them.
     ///
     /// No await points anywhere inside. See the module docs.
-    fn apply(&self, ops: Vec<Op>) -> Result<()> {
+    fn apply(&self, ops: Vec<Op>, durability: CommitDurability) -> Result<()> {
         self.with_db(|db| {
             let mut txn = db
                 .begin_write()
                 .map_err(|e| backend_err("beginning a write", e))?;
 
-            // Stated explicitly rather than relied upon: a commit must be durable
-            // before it returns, or the crash-and-reopen tests prove nothing.
-            txn.set_durability(Durability::Immediate)
+            // Stated explicitly rather than relied upon: at `Immediate` a
+            // commit must be durable before it returns, or the crash-and-reopen
+            // tests prove nothing. At `Eventual` the commit is still atomic and
+            // still visible to a reopen in this process — it is the fsync that
+            // is deferred to `flush`.
+            // redb 4 spells the relaxed level `None`, not `Eventual` — that
+            // variant was removed. Its own docs state the contract we rely on:
+            // such a commit "will not be persisted to disk unless followed by
+            // a commit with `Durability::Immediate`", which is exactly what
+            // `flush` below issues.
+            let redb_durability = match durability {
+                CommitDurability::Immediate => Durability::Immediate,
+                CommitDurability::Eventual => Durability::None,
+            };
+            txn.set_durability(redb_durability)
                 .map_err(|e| backend_err("setting durability", e))?;
 
             {
@@ -307,7 +322,11 @@ impl Backend for RedbBackend {
     }
 
     fn commit(&self, ops: Vec<Op>) -> BFut<'_, ()> {
-        Box::pin(async move { self.apply(ops) })
+        Box::pin(async move { self.apply(ops, CommitDurability::Immediate) })
+    }
+
+    fn commit_with(&self, ops: Vec<Op>, options: CommitOptions) -> BFut<'_, ()> {
+        Box::pin(async move { self.apply(ops, options.durability) })
     }
 
     fn usage(&self) -> BFut<'_, Option<Usage>> {
@@ -342,9 +361,12 @@ impl Backend for RedbBackend {
     }
 
     fn flush(&self) -> BFut<'_, ()> {
-        // Every commit already runs at `Durability::Immediate`, so a commit that
-        // returned is a commit that reached the disk. Nothing left to force.
-        Box::pin(async move { Ok(()) })
+        // A commit at `Durability::Immediate` already reached the disk, so for
+        // those this is genuinely nothing to do. But `Eventual` commits may be
+        // sitting in redb's write-ahead state, and the only way to force them
+        // out through redb's public API is a commit that *is* immediate. An
+        // empty op list makes that as cheap as redb allows.
+        Box::pin(async move { self.apply(Vec::new(), CommitDurability::Immediate) })
     }
 }
 

@@ -16,12 +16,13 @@
 //! Driven by two environment variables:
 //!
 //! * `CROSSBANK_CRASH_DB`   — path to the database file
-//! * `CROSSBANK_CRASH_MODE` — `baseline`, `commit-then-die`, or `die-mid-transaction`
+//! * `CROSSBANK_CRASH_MODE` — `baseline`, `commit-then-die`,
+//!   `eventual-flush-then-die`, or `die-mid-transaction`
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
     use crossbank::backend::RedbBackend;
-    use crossbank::Bank;
+    use crossbank::{Bank, Durability, LockerConfig};
     use futures::executor::block_on;
     use std::sync::Arc;
 
@@ -54,6 +55,26 @@ fn main() {
                     .put("committed", &"survives".to_string())
                     .await
                     .expect("write failed");
+                std::process::abort();
+            }
+
+            // An `Eventual` commit skips the per-commit fsync, so on its own it
+            // proves nothing about durability. An explicit `flush` is the
+            // caller's half of that bargain, and this asserts the bargain is
+            // real: flush, then die, then find the data.
+            "eventual-flush-then-die" => {
+                let eventual = bank
+                    .lazy_locker_with::<String>(
+                        "eventual",
+                        LockerConfig::default().with_durability(Durability::Eventual),
+                    )
+                    .await
+                    .expect("could not open the eventual locker");
+                eventual
+                    .put("flushed", &"survives".to_string())
+                    .await
+                    .expect("write failed");
+                eventual.flush().await.expect("flush failed");
                 std::process::abort();
             }
 

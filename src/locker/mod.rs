@@ -15,5 +15,5 @@ pub mod transaction;
 pub use eager::Locker;
 pub use io::{Reader, Writer};
 pub use lazy::LazyLocker;
-pub use policy::{Commit, LockerConfig, OnCorrupt, Policy};
+pub use policy::{Commit, Durability, LockerConfig, OnCorrupt, Policy};
 pub use transaction::Transaction;

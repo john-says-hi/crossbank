@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::backend::api::{Backend, Op, ScanRequest, Table};
+use crate::backend::api::{Backend, CommitOptions, Op, ScanRequest, Table};
 use crate::codec::{self, FilterChain};
 use crate::error::{Error, Result};
 use crate::key::{self, LockerId};
@@ -189,6 +189,17 @@ impl Inner {
         self.backend.get(Table::Records, &encoded).await
     }
 
+    /// Ask the backend to make this locker's commits durable, when it is the
+    /// locker's own setting that left them otherwise.
+    ///
+    /// A no-op on an `Immediate` locker, where every commit already landed.
+    pub(crate) async fn flush_backend(&self) -> Result<()> {
+        if !self.config.is_eventual() {
+            return Ok(());
+        }
+        self.backend.flush().await
+    }
+
     /// Commit, then tell the other tabs.
     ///
     /// The news is worked out **before** the commit (the op list is moved into
@@ -196,7 +207,14 @@ impl Inner {
     /// that failed, and no op list is cloned to make that possible.
     pub(crate) async fn commit(&self, ops: Vec<Op>) -> Result<()> {
         let news = self.shared.coherence.prepare(self.id, &ops);
-        self.backend.commit(ops).await?;
+        self.backend
+            .commit_with(
+                ops,
+                CommitOptions {
+                    durability: self.config.durability,
+                },
+            )
+            .await?;
         if let Some(news) = news {
             // Remember what this tab just wrote, and when, so another tab's
             // older news cannot undo it. Recorded before the post so it is in

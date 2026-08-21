@@ -10,7 +10,8 @@ pub mod memory;
 pub mod redb;
 
 pub use api::{
-    BFut, Backend, KeyRange, MaybeSend, MaybeSync, Op, ScanPage, ScanRequest, Table, Usage,
+    BFut, Backend, CommitOptions, Durability, KeyRange, MaybeSend, MaybeSync, Op, ScanPage,
+    ScanRequest, Table, Usage,
 };
 #[cfg(target_arch = "wasm32")]
 pub use indexeddb::IndexedDbBackend;

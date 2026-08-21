@@ -12,7 +12,7 @@
 //!   "panics" is not.
 //! * Never rely on `Drop` for cleanup. With abort there is no unwinding.
 
-use crossbank::{Bank, Commit, Error, Event, LockerConfig, OnCorrupt, Policy, Result};
+use crossbank::{Bank, Commit, Durability, Error, Event, LockerConfig, OnCorrupt, Policy, Result};
 use futures::StreamExt;
 
 use crate::Harness;
@@ -1569,5 +1569,47 @@ pub async fn listings_see_staged_deferred_writes<H: Harness>(h: &H) -> Result<()
     assert!(locker.to_map().await?.is_empty());
     assert!(locker.entries().await?.is_empty());
     assert_eq!(locker.keys(), Vec::<String>::new());
+    Ok(())
+}
+
+/// An `Eventual` locker's writes survive a reopen once `flush` has been called.
+///
+/// The knob's whole promise, at the level this suite can see it: `Eventual`
+/// relaxes *when* the fsync happens, never *whether* the data is there.
+/// Process-death durability is a separate, native-only claim and lives in
+/// `tests/crash_recovery.rs`, because only a real killed process can prove it.
+pub async fn eventual_durability_survives_flush_then_reopen<H: Harness>(h: &H) -> Result<()> {
+    {
+        let bank = bank(h).await?;
+        let locker = bank
+            .lazy_locker_with::<V>(
+                "l",
+                LockerConfig::default().with_durability(Durability::Eventual),
+            )
+            .await?;
+        locker.put("k", &v("eventual")).await?;
+        // The one call the caller owes an `Eventual` locker. On a backend with
+        // no fsync to force this is a no-op, which is why the assertion below
+        // is about persistence rather than about the flush.
+        locker.flush().await?;
+    }
+
+    let bank = bank(h).await?;
+    let locker = bank.lazy_locker::<V>("l").await?;
+
+    if h.caps().persists_across_open {
+        assert_eq!(
+            locker.get("k").await?,
+            Some(v("eventual")),
+            "a flushed eventual write must survive a reopen"
+        );
+    } else {
+        assert_eq!(
+            locker.get("k").await?,
+            None,
+            "a non-persistent backend must NOT find data after reopening, \
+             whatever durability was asked for"
+        );
+    }
     Ok(())
 }

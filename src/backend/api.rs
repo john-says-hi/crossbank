@@ -185,6 +185,52 @@ pub enum Op {
     },
 }
 
+/// How hard a commit works to reach durable storage before it returns.
+///
+/// The default is [`Durability::Immediate`] and it is never chosen for you:
+/// losing a write nobody asked to risk would be the wrong way round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Durability {
+    /// The commit is on stable storage when the future resolves.
+    ///
+    /// What the crash-recovery tests prove, and what makes a returned `put`
+    /// a promise rather than a hope.
+    #[default]
+    Immediate,
+
+    /// The commit is atomic and visible, but may still be in the operating
+    /// system's hands when the future resolves.
+    ///
+    /// A process that dies still sees the write — redb's write-ahead state is
+    /// already consistent — but a power cut may not. Pair it with an explicit
+    /// [`Backend::flush`] at a point the application chooses.
+    Eventual,
+}
+
+/// Per-commit knobs. A struct rather than a bare enum so a later knob does not
+/// break every [`Backend`] implementation again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CommitOptions {
+    pub durability: Durability,
+}
+
+impl CommitOptions {
+    /// Durable before the future resolves.
+    pub const fn immediate() -> Self {
+        Self {
+            durability: Durability::Immediate,
+        }
+    }
+
+    /// Durable at the next [`Backend::flush`], or whenever the platform gets
+    /// round to it.
+    pub const fn eventual() -> Self {
+        Self {
+            durability: Durability::Eventual,
+        }
+    }
+}
+
 /// A bounded scan. Bounded because an IndexedDB cursor cannot outlive its
 /// transaction, so the caller resumes rather than holding one open.
 #[derive(Debug, Clone)]
@@ -228,14 +274,28 @@ pub trait Backend: MaybeSend + MaybeSync + 'static {
 
     fn scan(&self, request: ScanRequest) -> BFut<'_, ScanPage>;
 
-    /// Apply every op, or none of them.
+    /// Apply every op, or none of them, durably.
     fn commit(&self, ops: Vec<Op>) -> BFut<'_, ()>;
+
+    /// Apply every op, or none of them, under `options`.
+    ///
+    /// The default delegates to [`Backend::commit`], which is always correct:
+    /// a backend that ignores the knob is simply *more* durable than asked,
+    /// never less. Backends that can honour it override this.
+    fn commit_with(&self, ops: Vec<Op>, options: CommitOptions) -> BFut<'_, ()> {
+        let _ = options;
+        self.commit(ops)
+    }
 
     /// `None` where the platform does not report usage, which is the normal
     /// case natively. Reporting a fabricated number would be worse.
     fn usage(&self) -> BFut<'_, Option<Usage>>;
 
     /// Ensure prior commits have reached durable storage.
+    ///
+    /// The point of the pairing with [`Durability::Eventual`]: a run of cheap
+    /// commits followed by one `flush` costs one fsync instead of N, and the
+    /// application picks the moment.
     fn flush(&self) -> BFut<'_, ()>;
 
     /// Release the underlying handle.

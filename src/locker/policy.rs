@@ -1,4 +1,27 @@
 //! Per-locker limits and retention policy.
+//!
+//! # Commit × Durability
+//!
+//! Two independent knobs decide when a write is safe, and they answer
+//! different questions. [`Commit`] decides **when a commit happens**;
+//! [`Durability`] decides **how hard that commit works to reach the disk**.
+//! All four combinations are legal and each is useful:
+//!
+//! | | `Durability::Immediate` (default) | `Durability::Eventual` |
+//! |---|---|---|
+//! | **`Commit::Immediate`** (default) | Safest, slowest. One fsync per `put`; when `put` returns, the data survives a power cut. | One commit per `put`, no fsync. Survives the process dying; a power cut may lose recent writes until `flush`. |
+//! | **`Commit::Deferred { after }`** | One fsync per batch of `after` writes. Nothing is stored — at all — until the batch commits or you `flush`. | Cheapest. Neither the batch nor the fsync happens until it fills or you `flush`. |
+//!
+//! **`flush` covers both.** [`crate::Locker::flush`],
+//! [`crate::LazyLocker::flush`] and [`crate::Bank::flush_all`] commit whatever
+//! is staged *and*, on an `Eventual` locker, force the backend fsync. One call
+//! from `pagehide` or a native stop hook is the whole contract.
+//!
+//! The web backend does not honour `Durability` at all: IndexedDB has no
+//! fsync knob to turn, and its own durability is the browser's business. An
+//! `Eventual` locker on IndexedDB behaves exactly like an `Immediate` one, so
+//! the setting is portable rather than platform-specific — it just costs
+//! nothing there.
 
 /// What happens to a locker's contents when storage runs short.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -99,6 +122,8 @@ pub enum Commit {
     },
 }
 
+pub use crate::backend::api::Durability;
+
 /// Limits applied to one locker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LockerConfig {
@@ -120,6 +145,10 @@ pub struct LockerConfig {
     /// When writes reach storage. See [`Commit`].
     pub commit: Commit,
 
+    /// How hard each commit works to reach the disk. See [`Durability`] and
+    /// the table in the module docs.
+    pub durability: Durability,
+
     /// What to do about a record that will not decode. See [`OnCorrupt`].
     pub on_corrupt: OnCorrupt,
 
@@ -137,6 +166,7 @@ impl Default for LockerConfig {
             eager_budget: 32 * 1024 * 1024,
             policy: Policy::Precious,
             commit: Commit::Immediate,
+            durability: Durability::Immediate,
             on_corrupt: OnCorrupt::Fail,
             chunk_size: 256 * 1024,
         }
@@ -175,6 +205,18 @@ impl LockerConfig {
         self
     }
 
+    /// See [`Durability`]. `Eventual` trades power-cut safety for speed and
+    /// hands the caller the duty of calling `flush`.
+    pub fn with_durability(mut self, durability: Durability) -> Self {
+        self.durability = durability;
+        self
+    }
+
+    /// Whether this locker's commits skip the per-commit fsync.
+    pub(crate) fn is_eventual(&self) -> bool {
+        matches!(self.durability, Durability::Eventual)
+    }
+
     pub fn with_on_corrupt(mut self, on_corrupt: OnCorrupt) -> Self {
         self.on_corrupt = on_corrupt;
         self
@@ -198,6 +240,18 @@ mod tests {
         assert_eq!(c.policy, Policy::Precious);
         assert_eq!(c.chunk_size, 256 * 1024);
         assert_eq!(c.commit, Commit::Immediate);
+        assert_eq!(c.durability, Durability::Immediate);
+    }
+
+    #[test]
+    fn durability_is_immediate_unless_asked_otherwise() {
+        // The same rule as `commit`: nobody loses a write they did not ask to
+        // risk. `Eventual` must be typed out.
+        assert_eq!(Durability::default(), Durability::Immediate);
+        assert!(!LockerConfig::default().is_eventual());
+        let c = LockerConfig::default().with_durability(Durability::Eventual);
+        assert_eq!(c.durability, Durability::Eventual);
+        assert!(c.is_eventual());
     }
 
     #[test]
@@ -231,8 +285,10 @@ mod tests {
             .with_eager_budget(2048)
             .with_policy(Policy::Evictable { max_bytes: 4096 })
             .with_on_corrupt(OnCorrupt::Skip)
-            .with_chunk_size(64);
+            .with_chunk_size(64)
+            .with_durability(Durability::Eventual);
         assert_eq!(c.on_corrupt, OnCorrupt::Skip);
+        assert_eq!(c.durability, Durability::Eventual);
         assert_eq!(c.max_inline, 1024);
         assert_eq!(c.eager_budget, 2048);
         assert_eq!(c.policy, Policy::Evictable { max_bytes: 4096 });

@@ -129,6 +129,43 @@ fn a_transaction_killed_before_commit_leaves_nothing_behind() {
 }
 
 #[test]
+fn an_eventual_write_survives_the_process_dying_once_flushed() {
+    // The `Durability::Eventual` bargain, proven rather than asserted: the
+    // commit itself skips the fsync, so only the explicit `flush` can be what
+    // puts these bytes on the disk. Kill the process one instruction after it
+    // and the write must still be there.
+    //
+    // Note what this deliberately does NOT claim: nothing here says an
+    // *unflushed* eventual write is lost. `abort()` leaves the page cache
+    // intact, so the operating system would very likely hand it back anyway —
+    // asserting its absence would be a test of the kernel, not of crossbank.
+    let (_dir, db) = fixture();
+
+    assert!(
+        !run_child(&db, "eventual-flush-then-die"),
+        "the child was supposed to abort, not exit cleanly"
+    );
+
+    let entries = block_on(async {
+        let backend = Arc::new(RedbBackend::open(&db).expect("reopen failed"));
+        let bank = Bank::with_backend(backend)
+            .await
+            .expect("bank reopen failed");
+        let locker = bank
+            .lazy_locker::<String>("eventual")
+            .await
+            .expect("locker reopen failed");
+        locker.range(..).await.expect("read failed")
+    });
+
+    assert_eq!(
+        entries,
+        vec![("flushed".to_string(), "survives".to_string())],
+        "a flushed eventual write was lost when the process died"
+    );
+}
+
+#[test]
 fn a_database_reopens_cleanly_after_a_crash() {
     // Not just "the data is right" but "opening it works at all". A corrupt
     // header or a stranded lock file would fail here rather than showing up

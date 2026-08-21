@@ -218,8 +218,14 @@ where
     /// caller can fix the cause — a full disk, a quota — and retry here. That
     /// is the one operation a closed lazy locker still accepts; every write
     /// reports [`Error::Closed`].
+    ///
+    /// Under [`crate::Durability::Eventual`] this also forces the backend
+    /// fsync, so one `flush` is the whole durability contract regardless of
+    /// which of the two knobs the locker turned.
     pub async fn flush(&self) -> Result<()> {
-        self.res.flush().await
+        let staged = self.res.flush().await;
+        let forced = self.inner.flush_backend().await;
+        staged.and(forced)
     }
 
     /// How many writes are staged and not yet committed.
@@ -796,9 +802,13 @@ impl<T> LazyLocker<T> {
         if flushed.is_ok() {
             self.res.discard_staged();
         }
+        // Separate from the staged flush on purpose: the discard above must
+        // key off whether the *batch* landed, not off whether a later fsync
+        // succeeded, or a retry would write it twice.
+        let forced = self.inner.flush_backend().await;
         self.inner.mark_closed();
         self.res.touch_index(|index| index.clear());
-        flushed
+        flushed.and(forced)
     }
 
     /// Whether [`LazyLocker::close`] has been called.

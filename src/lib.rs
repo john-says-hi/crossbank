@@ -77,7 +77,8 @@ pub use bank::{delete_bank, Bank, BankConfig, Location};
 pub use codec::{Filter, FilterChain};
 pub use error::{Error, Result};
 pub use locker::{
-    Commit, LazyLocker, Locker, LockerConfig, OnCorrupt, Policy, Reader, Transaction, Writer,
+    Commit, Durability, LazyLocker, Locker, LockerConfig, OnCorrupt, Policy, Reader, Transaction,
+    Writer,
 };
 pub use remote::RemoteBank;
 pub use watch::{Event, EventStream};

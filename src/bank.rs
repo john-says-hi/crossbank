@@ -437,13 +437,27 @@ impl Bank {
             return Ok(id);
         }
 
-        if let Some(raw) = self.backend.get(Table::Meta, &locker_key(name)).await? {
+        // One round trip, not two. The registration and the id counter are
+        // both `meta` keys, so a single `get_many` answers "is this name
+        // known?" and "what is the next free id?" together — and on IndexedDB
+        // each of those gets would otherwise be its own transaction.
+        let mut found = self
+            .backend
+            .get_many(
+                Table::Meta,
+                vec![locker_key(name), META_NEXT_LOCKER_ID.to_vec()],
+            )
+            .await?;
+        let next_raw = found.pop().flatten();
+        let registered = found.pop().flatten();
+
+        if let Some(raw) = registered {
             let id = u32_from(&raw, "locker id")?;
             self.cache(name, id);
             return Ok(id);
         }
 
-        let next = match self.backend.get(Table::Meta, META_NEXT_LOCKER_ID).await? {
+        let next = match next_raw {
             Some(raw) => u32_from(&raw, "next locker id")?,
             None => 0,
         };

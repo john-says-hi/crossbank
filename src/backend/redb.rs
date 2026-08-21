@@ -124,7 +124,15 @@ impl RedbBackend {
     /// that into "empty". Creating them once at open keeps the read paths
     /// honest and matches the fixed-table layout the web backend must use
     /// anyway.
+    /// Called on **every** open, so the common case — an existing database
+    /// whose tables are all there — must not cost a write transaction. It used
+    /// to: an unconditional `begin_write` plus commit is a full fsync paid on
+    /// every reopen for the privilege of creating three tables that already
+    /// existed. A read transaction answers the question for free.
     fn create_tables(&self) -> Result<()> {
+        if !self.any_table_missing()? {
+            return Ok(());
+        }
         self.with_db(|db| {
             let txn = db
                 .begin_write()
@@ -137,6 +145,28 @@ impl RedbBackend {
             }
             txn.commit()
                 .map_err(|e| backend_err("committing table creation", e))
+        })
+    }
+
+    /// Whether any of the three fixed tables has yet to be created.
+    ///
+    /// A read transaction, so it writes nothing and forces no fsync. Anything
+    /// other than a clean "does not exist" is propagated rather than treated
+    /// as absence — creating a table over a real error would be the wrong
+    /// recovery.
+    fn any_table_missing(&self) -> Result<bool> {
+        self.with_db(|db| {
+            let txn = db
+                .begin_read()
+                .map_err(|e| backend_err("beginning the table probe", e))?;
+            for table in Table::ALL {
+                match txn.open_table(definition(table)) {
+                    Ok(_) => {}
+                    Err(TableError::TableDoesNotExist(_)) => return Ok(true),
+                    Err(e) => return Err(backend_err("probing for a table", e)),
+                }
+            }
+            Ok(false)
         })
     }
 
@@ -501,6 +531,27 @@ mod tests {
             Some(b"record".to_vec())
         );
         assert_eq!(block_on(b.get(Table::Chunks, b"k")).unwrap(), None);
+    }
+
+    #[test]
+    fn reopening_creates_no_tables_and_writes_nothing() {
+        // The reopen cost fix, asserted rather than assumed. A second open
+        // must find every table already there — so it takes the read-only
+        // probe and never the write transaction.
+        let dir = TempDir::new().unwrap();
+        {
+            let b = backend(&dir);
+            assert!(
+                !b.any_table_missing().unwrap(),
+                "the first open must have created all three tables"
+            );
+        }
+
+        let b = backend(&dir);
+        assert!(
+            !b.any_table_missing().unwrap(),
+            "a reopened database must not need its tables creating again"
+        );
     }
 
     #[test]

@@ -255,6 +255,24 @@ fn reopen(c: &mut Criterion) {
             criterion::black_box(wait(locker.get("k")).unwrap());
         });
     });
+    // The same reopen with the create-and-write half hoisted out, because the
+    // combined number is dominated by redb creating and validating a fresh
+    // file twice. This arm is the one that describes an application start:
+    // open an existing bank, open a locker, read a key.
+    group.bench_function("redb_warm", |b| {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bank.redb");
+        {
+            let bank = wait(Bank::open(BankConfig::at(&path))).unwrap();
+            let locker = wait(bank.lazy_locker::<Vec<u8>>("l")).unwrap();
+            wait(locker.put("k", &payload(1024, 1))).unwrap();
+        }
+        b.iter(|| {
+            let bank = wait(Bank::open(BankConfig::at(&path))).unwrap();
+            let locker = wait(bank.lazy_locker::<Vec<u8>>("l")).unwrap();
+            criterion::black_box(wait(locker.get("k")).unwrap());
+        });
+    });
     group.finish();
 }
 

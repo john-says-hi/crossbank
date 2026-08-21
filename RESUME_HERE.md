@@ -156,7 +156,9 @@ the persistence case was negative-controlled. **Data persists on the web.**
 sealed on its own), streaming `Writer`/`Reader` for `LazyLocker<Vec<u8>>`, orphan-chunk GC on
 overwrite/delete/clear/abort, and a Linux `VmHWM` test proving peak RSS is bounded by the chunk
 size rather than the value. Four new conformance cases (22 total) run on every backend. Benches
-fixed the chunk-size default at **256 KiB** and showed LZ4 is free on f64 candle data.
+fixed the chunk-size default at **256 KiB** and showed LZ4 is free on f64 candle data. A Hive CE
+comparison on identical byte workloads is recorded in `PLAN.md` → Performance: crossbank reads
+and big values win, Hive's non-fsync puts win, `transact` is the answer for bulk writes.
 
 **192 tests native. 22-case suite × 3 backends in browsers on both wasm lanes.**
 
@@ -178,6 +180,7 @@ cargo test --doc --workspace           # nextest does NOT run doctests
 cargo bench --bench kv                 # native Criterion; not a CI gate
 ci/bench.sh                            # same, plus optional --web --firefox
 cargo bench --bench kv -- "chunk_sweep|lz4_f64"   # the M4 sizing benches only
+ci/bench.sh --hive                     # + Hive CE comparison (bench/hive_ce, needs dart)
 
 # Real browsers. Both lanes must pass.
 export CROSSBANK_WBG_RUNNER=<path to a wasm-bindgen-test-runner matching Cargo.lock>

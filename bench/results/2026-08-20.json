@@ -1,0 +1,200 @@
+{
+  "date_utc": "2026-08-20",
+  "machine": "12th Gen Intel Core i9-12900HK, Linux 7.0.11 x86_64, NVMe",
+  "notes": [
+    "crossbank rows are Criterion point estimates (p50_ms \u2248 mean of the sampled iteration); p99 not reported by Criterion summaries.",
+    "hive_ce rows are a true median/p99 over 20 iterations from bench/hive_ce.",
+    "Every crossbank put on redb is a durable commit. Hive CE appends to its log without fsync."
+  ],
+  "samples": [
+    {
+      "workload": "settings_eager",
+      "backend": "crossbank_memory",
+      "n": 1,
+      "bytes": 1024,
+      "p50_ms": 0.000257,
+      "p99_ms": null,
+      "ops_per_s": 3891050.6
+    },
+    {
+      "workload": "settings_eager",
+      "backend": "crossbank_redb",
+      "n": 1,
+      "bytes": 1024,
+      "p50_ms": 0.0461,
+      "p99_ms": null,
+      "ops_per_s": 21692.0
+    },
+    {
+      "workload": "bulk_lazy_put",
+      "backend": "crossbank_memory",
+      "n": 2000,
+      "bytes": 512000,
+      "p50_ms": 3.295,
+      "p99_ms": null,
+      "ops_per_s": 606980.3
+    },
+    {
+      "workload": "bulk_lazy_put",
+      "backend": "crossbank_redb",
+      "n": 2000,
+      "bytes": 512000,
+      "p50_ms": 956.3,
+      "p99_ms": null,
+      "ops_per_s": 2091.4
+    },
+    {
+      "workload": "bulk_lazy_get",
+      "backend": "crossbank_memory",
+      "n": 1,
+      "bytes": 256,
+      "p50_ms": 0.000456,
+      "p99_ms": null,
+      "ops_per_s": 2192982.5
+    },
+    {
+      "workload": "bulk_lazy_get",
+      "backend": "crossbank_redb",
+      "n": 1,
+      "bytes": 256,
+      "p50_ms": 0.001113,
+      "p99_ms": null,
+      "ops_per_s": 898472.6
+    },
+    {
+      "workload": "prefix_scan",
+      "backend": "crossbank_memory",
+      "n": 1,
+      "bytes": 0,
+      "p50_ms": 0.0371,
+      "p99_ms": null,
+      "ops_per_s": 26954.2
+    },
+    {
+      "workload": "prefix_scan",
+      "backend": "crossbank_redb",
+      "n": 1,
+      "bytes": 0,
+      "p50_ms": 0.0392,
+      "p99_ms": null,
+      "ops_per_s": 25510.2
+    },
+    {
+      "workload": "txn_batch",
+      "backend": "crossbank_memory",
+      "n": 100,
+      "bytes": 6400,
+      "p50_ms": 0.1015,
+      "p99_ms": null,
+      "ops_per_s": 985221.7
+    },
+    {
+      "workload": "txn_batch",
+      "backend": "crossbank_redb",
+      "n": 100,
+      "bytes": 6400,
+      "p50_ms": 1.047,
+      "p99_ms": null,
+      "ops_per_s": 95511.0
+    },
+    {
+      "workload": "reopen",
+      "backend": "crossbank_redb",
+      "n": 1,
+      "bytes": 1024,
+      "p50_ms": 11.47,
+      "p99_ms": null,
+      "ops_per_s": 87.2
+    },
+    {
+      "workload": "envelope_tax",
+      "backend": "crossbank_redb",
+      "n": 200,
+      "bytes": 204800,
+      "p50_ms": 97.87,
+      "p99_ms": null,
+      "ops_per_s": 2043.5
+    },
+    {
+      "workload": "envelope_tax",
+      "backend": "crossbank_redb_raw_chain",
+      "n": 200,
+      "bytes": 204800,
+      "p50_ms": 117.6,
+      "p99_ms": null,
+      "ops_per_s": 1700.7
+    },
+    {
+      "workload": "envelope_tax",
+      "backend": "raw_redb",
+      "n": 200,
+      "bytes": 204800,
+      "p50_ms": 2.97,
+      "p99_ms": null,
+      "ops_per_s": 67340.1
+    },
+    {
+      "workload": "big_value_put_get",
+      "backend": "crossbank_redb",
+      "n": 1,
+      "bytes": 8388608,
+      "p50_ms": 15.78,
+      "p99_ms": null,
+      "ops_per_s": 63.4
+    },
+    {
+      "workload": "settings_eager",
+      "backend": "hive_ce_file",
+      "n": 1000,
+      "bytes": 1024,
+      "p50_ms": 4.027,
+      "p99_ms": 6.826,
+      "ops_per_s": 248323.81425378693
+    },
+    {
+      "workload": "bulk_lazy_put",
+      "backend": "hive_ce_file",
+      "n": 2000,
+      "bytes": 512000,
+      "p50_ms": 27.399,
+      "p99_ms": 45.149,
+      "ops_per_s": 72995.36479433556
+    },
+    {
+      "workload": "bulk_lazy_get",
+      "backend": "hive_ce_file",
+      "n": 1000,
+      "bytes": 256,
+      "p50_ms": 19.299,
+      "p99_ms": 26.835,
+      "ops_per_s": 51816.156277527334
+    },
+    {
+      "workload": "txn_batch",
+      "backend": "hive_ce_file",
+      "n": 100,
+      "bytes": 6400,
+      "p50_ms": 0.113,
+      "p99_ms": 0.15,
+      "ops_per_s": 884955.7522123894
+    },
+    {
+      "workload": "reopen",
+      "backend": "hive_ce_file",
+      "n": 1,
+      "bytes": 1024,
+      "p50_ms": 1.254,
+      "p99_ms": 1.685,
+      "ops_per_s": 797.4481658692185
+    },
+    {
+      "workload": "big_value_put_get",
+      "backend": "hive_ce_file",
+      "n": 1,
+      "bytes": 8388608,
+      "p50_ms": 49.803,
+      "p99_ms": 60.608,
+      "ops_per_s": 20.079111700098387
+    }
+  ]
+}

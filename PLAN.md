@@ -314,7 +314,7 @@ Eager lockers still refuse oversized values.
 
 **M5 — Quota, eviction, coherence.** `persist()` (explicit, never automatic), quota API,
 byte-budget LRU on a logical counter, BroadcastChannel coherence carrying small values
-inline. Native coherence is in-process only — redb takes an exclusive file lock, so a second
+inline, and an opt-in write-coalescing policy for eager lockers (see Performance → Hive CE). Native coherence is in-process only — redb takes an exclusive file lock, so a second
 process cannot open the database at all.
 
 **M6 — Consumer readiness.** Docs, worked example, publish. Shrinks to prose because the
@@ -389,7 +389,51 @@ a known-incompressible workload can open its bank with `FilterChain::raw()`; mak
 selectable per locker rather than per bank is noted as an M6 ergonomics item, not a default
 change.
 
-Reproduce: `cargo bench --bench kv -- "chunk_sweep|lz4_f64"`.
+Reproduce: `cargo bench --bench kv -- "chunk_sweep|lz4_f64"`. A second full run put the 8 MiB
+chunk at 17.5 ms; the ordering never changed.
+
+### Hive CE comparison (2026-08-20, same machine, `bench/hive_ce`)
+
+Hive CE (pure Dart, file backend, Bitcask-style append log) on the **same named workloads with
+the same byte payloads**, via a tiny non-Flutter Dart tool. Raw JSON: `bench/results/2026-08-20.json`.
+
+| Workload | Hive CE (file) | crossbank redb | crossbank memory |
+|---|---|---|---|
+| `settings_eager` — per op, 90/10 get/put, 1 KiB | 4.0 µs | 46 µs | 0.26 µs |
+| `bulk_lazy_put` — 2 000 × 256 B, one put each | 27 ms (73 k/s) | **956 ms (2.1 k/s)** | 3.3 ms |
+| `bulk_lazy_get` — per random get | 19 µs | 1.1 µs | 0.46 µs |
+| `txn_batch` — 100 puts, one `putAll` / `transact` | 0.11 ms | 1.05 ms | 0.10 ms |
+| `reopen` — write 1 KiB, close, reopen, read | 1.3 ms | 11.5 ms | — |
+| `big_value_put_get` — one 8 MiB value | 50 ms | **15.8 ms** | — |
+
+**Read the durability column before the speed column.** Every crossbank `put` on redb is a
+*durable* commit — the data is on disk when the future resolves, which is what the
+crash-recovery tests prove. Hive CE's `put` appends a frame to its log and returns; there is no
+`fsync`, so a power cut can lose the last writes and a torn frame is dropped at next open. That
+single difference is most of the 35× gap on `bulk_lazy_put` and the 10× on `settings_eager`
+writes. It is the same per-commit cost that `envelope_tax` already isolates (≈0.5 ms/commit).
+The honest crossbank answer to "many small puts" is `transact` — `txn_batch` is within 10× of
+Hive's non-durable `putAll`, and that is the shape a candle-cache fill or manifest update should use.
+
+Where crossbank is ahead it is structural, not tuning: lazy reads are **17×** faster (redb
+B-tree page reads vs Hive's seek-and-parse on the log) and an 8 MiB value is **3×** faster
+end-to-end despite LZ4+CRC on every chunk, because it never builds one contiguous 8 MiB
+frame. `reopen` is slower (11 ms vs 1.3 ms) — redb opens and validates a real database
+file, Hive opens an empty-ish log; this will matter for a bank opened once per app start, not
+per operation.
+
+Caveats that make this a comparison of *engines on identical byte workloads*, not of apps:
+different languages and runtimes (Dart GC vs none), `Uint8List` vs `Vec<u8>` through postcard,
+Hive `TypeAdapter`s are bypassed, and Hive's eager `Box.get` is a `Map` lookup exactly as
+crossbank's `Locker::get` is. Web Hive (IndexedDB) vs crossbank IndexedDB was not run: the
+Dart-web compile is a time sink and the native comparison already answers the design question.
+It stays a follow-up.
+
+**What the numbers change in the plan:** nothing in the design; one item in the roadmap.
+The durable-per-put cost is real for the `settings_eager` shape (Hive `Box`-style UI settings
+written on every toggle). M5 gains a small, explicit item: a *write-coalescing* option for
+eager lockers (`Policy`-level, off by default) so a burst of settings writes can share one
+commit without giving up durability-on-return for callers that want it.
 
 ---
 

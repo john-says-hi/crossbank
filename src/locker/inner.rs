@@ -31,6 +31,13 @@ use crate::watch::{Event, Watchers};
 /// see [`crate::backend::api::Backend::scan_page_size`].
 pub(crate) use crate::backend::api::DEFAULT_SCAN_PAGE as SCAN_PAGE;
 
+/// How many chunks one `get_many` asks for while reassembling a value.
+///
+/// A whole-value read is one *snapshot* per group rather than one for the
+/// whole value; that is still enough to keep a group internally consistent,
+/// and the final `total_len` check catches a value overwritten mid-read.
+const CHUNK_FETCH_GROUP: u32 = 64;
+
 /// What every locker a bank opens shares with it.
 ///
 /// Bundled into one handle rather than passed separately so that adding a
@@ -56,9 +63,24 @@ pub(crate) struct Shared {
 ///
 /// The asymmetry is the point: a wrong `Unknown` costs a read, a wrong
 /// `Absent` or `Inline` **orphans chunks forever**. So every producer of this
-/// type errs towards `Unknown`, and anything that could make the index
-/// over-claim absence — a staged deferred batch, another tab's write — forces
-/// it back to `Unknown`. See [`super::resident::Resident::prior`].
+/// type errs towards `Unknown`.
+///
+/// A RAM index can only answer for the handle that owns it, and it is only
+/// the whole truth when this handle is the only writer. Three things make it
+/// not the whole truth, and each of them forces `Unknown`:
+///
+/// * a staged [`super::policy::Commit::Deferred`] batch, whose delete has
+///   already left the index while the record is still stored;
+/// * **a second live handle on the same locker name**, which is legal (see
+///   [`crate::Bank::locker_with`]) and never syncs its index with this one, so
+///   a key this handle believes absent may be a chunked record the other
+///   handle wrote;
+/// * on wasm, cross-tab coherence being off, because another tab may have
+///   chunk-written the very key this tab is about to overwrite and nothing
+///   will ever tell us.
+///
+/// See [`Inner::index_is_authoritative`] and
+/// [`super::resident::Resident::prior`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Prior {
     /// Nothing is known. Read before writing.
@@ -106,6 +128,14 @@ pub(crate) struct Inner {
     /// Only ever written when coherence is on, because it is filled from the
     /// announcement a commit produced and there is none otherwise.
     pub(crate) epochs: Epochs,
+    /// Set once a second live handle has existed on this locker's name, and
+    /// **never cleared**.
+    ///
+    /// Two handles on one name are legal and keep entirely separate RAM
+    /// indexes. Once that has happened this handle's index can no longer prove
+    /// a key absent, and closing the other handle does not undo what it wrote
+    /// — so the flag is one-way on purpose. See [`Prior`].
+    pub(crate) name_shared: AtomicBool,
 }
 
 /// Per-locker epoch bookkeeping for cross-tab coherence.
@@ -190,6 +220,29 @@ impl Inner {
             return Err(Error::Closed);
         }
         Ok(())
+    }
+
+    /// Note that another handle is, or has been, live on this locker's name.
+    pub(crate) fn mark_name_shared(&self) {
+        self.name_shared.store(true, Ordering::Release);
+    }
+
+    /// Whether this handle's RAM index is allowed to prove a key *absent*.
+    ///
+    /// False as soon as anyone else could have written the locker without
+    /// this index hearing about it. See [`Prior`] for why the answer is
+    /// asymmetric.
+    pub(crate) fn index_is_authoritative(&self) -> bool {
+        if self.name_shared.load(Ordering::Acquire) {
+            return false;
+        }
+        // Natively there are no other tabs, so a single handle is the whole
+        // story. On the web another tab may be writing this same locker, and
+        // only coherence tells us when it does.
+        if cfg!(target_arch = "wasm32") && !self.shared.coherence.is_enabled() {
+            return false;
+        }
+        true
     }
 
     pub(crate) fn encode_key(&self, key: &[u8]) -> Vec<u8> {
@@ -311,17 +364,32 @@ impl Inner {
     /// deliberately keeps fetching a chunk at a time, because holding the
     /// value's worth of pieces at once is precisely what it exists to avoid.
     pub(crate) async fn read_chunks(&self, pointer: &ChunkPointer) -> Result<Vec<u8>> {
+        // `total_len` is bounded by `ChunkPointer::parse`, so this capacity is
+        // as large as a legal value and no larger.
         let mut out = Vec::with_capacity(pointer.total_len as usize);
-        let keys: Vec<Vec<u8>> = (0..pointer.n_chunks)
-            .map(|seq| chunk_key(pointer.value_id, seq))
-            .collect();
-        let sealed_pieces = self.backend.get_many(Table::Chunks, keys).await?;
-        for (seq, sealed) in sealed_pieces.into_iter().enumerate() {
-            let sealed = sealed.ok_or_else(|| {
-                Error::Corrupt(format!("missing chunk {seq} of {}", pointer.value_id))
-            })?;
-            let piece = self.chain.open(&sealed)?;
-            out.extend_from_slice(&piece);
+        let mut seq = 0u32;
+        while seq < pointer.n_chunks {
+            // Fixed-size groups rather than one `get_many` over every chunk:
+            // a 256 MiB value at the 256 KiB default is a thousand chunks, and
+            // asking a backend for all of them at once builds a key list and a
+            // reply vector sized by data rather than by anything bounded.
+            let upto = seq.saturating_add(CHUNK_FETCH_GROUP).min(pointer.n_chunks);
+            let keys: Vec<Vec<u8>> = (seq..upto)
+                .map(|s| chunk_key(pointer.value_id, s))
+                .collect();
+            let sealed_pieces = self.backend.get_many(Table::Chunks, keys).await?;
+            for (offset, sealed) in sealed_pieces.into_iter().enumerate() {
+                let sealed = sealed.ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "missing chunk {} of {}",
+                        seq as usize + offset,
+                        pointer.value_id
+                    ))
+                })?;
+                let piece = self.chain.open(&sealed)?;
+                out.extend_from_slice(&piece);
+            }
+            seq = upto;
         }
         if out.len() as u64 != pointer.total_len {
             return Err(Error::Corrupt(format!(

@@ -435,6 +435,59 @@ fn two_immediate_handles_on_one_name_are_still_allowed() {
     });
 }
 
+/// Two handles on one name never sync their key indexes, so neither may use
+/// its own index to prove a key absent.
+///
+/// Handle A chunk-writes `k`; handle B, which has never heard of `k`, puts a
+/// small value over it. If B trusts its index it skips the read that finds
+/// A's chunks, and they are orphaned in the `chunks` table forever — nothing
+/// points at them and nothing will ever collect them.
+///
+/// Negative control: delete the `index_is_authoritative` guard in
+/// `Resident::prior` and this goes red with A's eight chunks still stored.
+#[test]
+fn a_second_handle_overwriting_a_chunked_key_leaves_no_orphan_chunks() {
+    block_on(async {
+        let backend = Arc::new(MemoryBackend::new());
+        let bank = Bank::with_backend(backend.clone()).await.expect("bank");
+        let config = LockerConfig::default().with_chunk_size(256);
+
+        let a = bank
+            .lazy_locker_with::<Vec<u8>>("twohanded", config)
+            .await
+            .expect("first handle");
+        let b = bank
+            .lazy_locker_with::<Vec<u8>>("twohanded", config)
+            .await
+            .expect("second handle");
+
+        // A stores a chunked value. B's index has never seen the key.
+        a.put("k", &vec![9u8; 4096]).await.expect("chunked put");
+        assert!(
+            !b.contains_key("k"),
+            "the second handle's index must be the stale one this test needs"
+        );
+        assert_no_orphan_chunks(backend.as_ref()).await;
+
+        // B overwrites it with a value small enough to store inline. Every
+        // chunk A wrote is now dead.
+        b.put("k", &vec![1u8; 8]).await.expect("overwrite");
+        assert_no_orphan_chunks(backend.as_ref()).await;
+        assert_eq!(b.get("k").await.expect("read"), Some(vec![1u8; 8]));
+
+        // And the same for a delete, which takes the other branch. `b` writes
+        // it chunked; `a` has never heard of the key and deletes it.
+        b.put("big", &vec![3u8; 4096]).await.expect("chunked put");
+        assert!(
+            !a.contains_key("big"),
+            "the deleting handle's index must be the stale one this test needs"
+        );
+        a.delete("big").await.expect("delete");
+        assert_eq!(b.get("big").await.expect("read"), None);
+        assert_no_orphan_chunks(backend.as_ref()).await;
+    });
+}
+
 /// A degenerate `Deferred` is `Immediate` with extra steps, and must not
 /// inherit the one-handle restriction.
 #[test]

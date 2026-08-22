@@ -96,6 +96,7 @@ where
             watchers: Default::default(),
             closed: AtomicBool::new(false),
             epochs: Default::default(),
+            name_shared: AtomicBool::new(false),
         });
 
         let mut values = BTreeMap::new();
@@ -929,13 +930,12 @@ mod tests {
         let id = l.inner.id;
         // Natively no announcement is produced, so record the marker the way
         // a commit under coherence would.
-        l.inner
-            .epochs
-            .note_local([b"k".to_vec()].into_iter(), 7);
+        l.inner.epochs.note_local([b"k".to_vec()].into_iter(), 7);
         block_on(l.put("k", "mine".into())).unwrap();
 
         let theirs = l.inner.seal(&"theirs".to_string()).unwrap();
-        l.sink().apply(&one_change(id, 7, b"k", Some(theirs.clone())));
+        l.sink()
+            .apply(&one_change(id, 7, b"k", Some(theirs.clone())));
         assert_eq!(
             l.get("k").as_deref(),
             Some(&"mine".to_string()),

@@ -120,12 +120,20 @@ impl Resident {
     ///   never writes chunks and has its own resident map);
     /// * nothing is staged. A staged delete drops the key from the index while
     ///   the record is still stored, so a staged batch makes the index
-    ///   over-claim *absence* — the one direction that loses data.
+    ///   over-claim *absence* — the one direction that loses data;
+    /// * this handle's index is authoritative — no second handle has been live
+    ///   on the name, and on the web cross-tab coherence is on. Both of those
+    ///   let someone else write a chunked record this index has never heard of,
+    ///   whose chunks would then be orphaned forever. See
+    ///   [`Inner::index_is_authoritative`].
     ///
     /// `Inline` additionally requires that this handle wrote the record and
     /// nothing has since invalidated that. See [`Resident::note_inline`].
     pub(crate) fn prior(&self, key: &[u8]) -> Prior {
         if self.pending_len().unwrap_or(usize::MAX) != 0 {
+            return Prior::Unknown;
+        }
+        if !self.inner.index_is_authoritative() {
             return Prior::Unknown;
         }
         let Some(present) = self.read_index(|index| index.contains(key)) else {
@@ -595,6 +603,7 @@ mod tests {
             watchers: Default::default(),
             closed: std::sync::atomic::AtomicBool::new(false),
             epochs: Default::default(),
+            name_shared: std::sync::atomic::AtomicBool::new(false),
         });
         Resident::new(inner, TxMode::Lazy, Some(BTreeSet::new()), None)
     }

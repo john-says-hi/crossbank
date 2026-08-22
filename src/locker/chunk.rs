@@ -6,6 +6,7 @@
 //! O(chunk_size) on the read path.
 
 use crate::backend::api::{Backend, KeyRange, Op, Table};
+use crate::codec::MAX_DECODED_BYTES;
 use crate::error::{Error, Result};
 
 /// Magic for a chunk pointer stored in `records`. Distinct from the inline
@@ -51,11 +52,37 @@ impl ChunkPointer {
                 supported: POINTER_VERSION,
             });
         }
+        let n_chunks = u32::from_be_bytes(raw[14..18].try_into().expect("length checked above"));
+        let total_len = u64::from_be_bytes(raw[18..26].try_into().expect("length checked above"));
+        // Both numbers are read straight off storage and both size an
+        // allocation on the read path — the reassembly buffer from
+        // `total_len`, the key list from `n_chunks`. A corrupt or hostile
+        // pointer claiming `u32::MAX` chunks would ask for gigabytes, and a
+        // wasm release build is `panic=abort`, so the allocation failure is an
+        // unrecoverable app kill rather than an error a caller can see.
+        //
+        // The chunk size is not in the pointer, so it cannot be checked
+        // exactly. Two bounds hold regardless of it: the value cannot decode
+        // past the envelope's own ceiling, and every chunk holds at least one
+        // byte. `n_chunks == 0` stays legal because a `Writer` closed without
+        // a single `write` stores exactly that.
+        if total_len > MAX_DECODED_BYTES as u64 {
+            return Err(Error::Corrupt(format!(
+                "chunk pointer declares {total_len} bytes, over the \
+                 {MAX_DECODED_BYTES} byte limit"
+            )));
+        }
+        if u64::from(n_chunks) > total_len {
+            return Err(Error::Corrupt(format!(
+                "chunk pointer declares {n_chunks} chunks for {total_len} bytes; \
+                 a chunk holds at least one byte"
+            )));
+        }
         Ok(Self {
             flags: raw[5],
             value_id: u64::from_be_bytes(raw[6..14].try_into().expect("length checked above")),
-            n_chunks: u32::from_be_bytes(raw[14..18].try_into().expect("length checked above")),
-            total_len: u64::from_be_bytes(raw[18..26].try_into().expect("length checked above")),
+            n_chunks,
+            total_len,
         })
     }
 }
@@ -194,6 +221,47 @@ mod tests {
         assert_eq!(encoded.len(), POINTER_LEN);
         assert!(is_pointer(&encoded));
         assert_eq!(ChunkPointer::parse(&encoded).unwrap(), p);
+    }
+
+    /// A pointer is read straight off storage, and both of its numbers size
+    /// an allocation. A corrupt one claiming `u32::MAX` chunks must be
+    /// refused before anything is reserved — on wasm the allocation failure
+    /// would be a `panic=abort` app kill, not an error anyone can catch.
+    #[test]
+    fn an_absurd_chunk_count_is_refused() {
+        let raw = ChunkPointer {
+            value_id: 42,
+            n_chunks: u32::MAX,
+            total_len: 1000,
+            flags: FLAG_POSTCARD,
+        }
+        .encode();
+        assert!(matches!(ChunkPointer::parse(&raw), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn a_length_past_the_envelope_ceiling_is_refused() {
+        let raw = ChunkPointer {
+            value_id: 42,
+            n_chunks: 1,
+            total_len: MAX_DECODED_BYTES as u64 + 1,
+            flags: FLAG_POSTCARD,
+        }
+        .encode();
+        assert!(matches!(ChunkPointer::parse(&raw), Err(Error::Corrupt(_))));
+    }
+
+    /// A `Writer` closed without a single `write` stores exactly this, so it
+    /// must stay legal.
+    #[test]
+    fn an_empty_streamed_value_is_still_a_legal_pointer() {
+        let p = ChunkPointer {
+            value_id: 7,
+            n_chunks: 0,
+            total_len: 0,
+            flags: FLAG_RAW,
+        };
+        assert_eq!(ChunkPointer::parse(&p.encode()).unwrap(), p);
     }
 
     #[test]

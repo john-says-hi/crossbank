@@ -75,6 +75,7 @@ where
             watchers: Default::default(),
             closed: AtomicBool::new(false),
             epochs: Default::default(),
+            name_shared: AtomicBool::new(false),
         });
 
         // Keys only. Reading values here would defeat the entire point.
@@ -276,7 +277,10 @@ where
             return Ok(());
         }
 
-        let mut ops = self.inner.delete_value_ops(key, self.res.prior(key)).await?;
+        let mut ops = self
+            .inner
+            .delete_value_ops(key, self.res.prior(key))
+            .await?;
         let budget = self
             .res
             .budget_ops(&mut ops, Vec::new(), vec![key.to_vec()], false, &[])
@@ -411,13 +415,14 @@ where
         let staged_before = self.res.take_staged()?;
         let merged = merge_batches(&staged_before, &entries);
 
-        let mut ops = match super::transaction::ops_for_pending(&self.inner, &merged, TxMode::Lazy).await {
-            Ok(ops) => ops,
-            Err(e) => {
-                self.res.restage(staged_before);
-                return Err(e);
-            }
-        };
+        let mut ops =
+            match super::transaction::ops_for_pending(&self.inner, &merged, TxMode::Lazy).await {
+                Ok(ops) => ops,
+                Err(e) => {
+                    self.res.restage(staged_before);
+                    return Err(e);
+                }
+            };
 
         // One transaction is one moment: every key it wrote is equally recent,
         // so they share a tick rather than being ordered by staging order.

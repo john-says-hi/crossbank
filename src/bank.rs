@@ -751,6 +751,10 @@ impl Bank {
             watchers: Default::default(),
             closed: std::sync::atomic::AtomicBool::new(false),
             epochs: Default::default(),
+            // A maintenance handle is a second view onto a name by
+            // definition, and keeps no index at all. Nothing here may prove a
+            // key absent.
+            name_shared: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -1126,10 +1130,20 @@ impl Bank {
     fn register_open(&self, name: &str, inner: &Arc<Inner>) {
         if let Ok(mut guard) = self.open_lockers.lock() {
             Self::prune(&mut guard);
-            guard
-                .entry(name.to_string())
-                .or_default()
-                .push(Arc::downgrade(inner));
+            let handles = guard.entry(name.to_string()).or_default();
+            handles.push(Arc::downgrade(inner));
+            // A second live handle on one name means neither handle's RAM
+            // index can prove a key absent any more: they never sync, so a
+            // chunked record one of them wrote is invisible to the other, and
+            // overwriting it from the wrong side would orphan its chunks
+            // forever. Mark every live handle, including this one, and never
+            // unmark — closing the other handle does not unwrite what it
+            // wrote. See `Inner::index_is_authoritative`.
+            if handles.len() > 1 {
+                for live in handles.iter().filter_map(Weak::upgrade) {
+                    live.mark_name_shared();
+                }
+            }
         }
     }
 

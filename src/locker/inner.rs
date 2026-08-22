@@ -421,8 +421,18 @@ impl Inner {
         Ok(out)
     }
 
-    pub(crate) async fn next_value_id(&self) -> Result<(u64, Op)> {
+    pub(crate) async fn next_value_id(&self) -> Result<u64> {
         self.shared.values.allocate(self.backend.as_ref()).await
+    }
+
+    /// The op that persists the value-id cursor's current high-water mark.
+    ///
+    /// Every commit that allocated an id must carry one, and it must be built
+    /// **here**, as late as possible in the commit's op list — not back where
+    /// the id was taken. See [`super::chunk::ValueIds`] for what persisting
+    /// the allocation-time number cost.
+    pub(crate) fn value_counter_op(&self) -> Result<Op> {
+        self.shared.values.counter_op()
     }
 
     /// Ops to store `postcard` bytes at `key`, chunking when needed, and to
@@ -455,8 +465,7 @@ impl Inner {
             return Ok(ops);
         }
 
-        let (value_id, bump) = self.next_value_id().await?;
-        ops.push(bump);
+        let value_id = self.next_value_id().await?;
 
         let chunk_size = self.config.chunk_size;
         let mut seq = 0u32;
@@ -482,6 +491,11 @@ impl Inner {
             key: self.encode_key(key),
             value: pointer.encode(),
         });
+        // Last, so that in a multi-key commit the *latest* reading of the
+        // cursor is the one the backend applies. A commit builder that calls
+        // this for several keys pushes several of these; ops land in order, so
+        // the highest wins.
+        ops.push(self.value_counter_op()?);
         Ok(ops)
     }
 

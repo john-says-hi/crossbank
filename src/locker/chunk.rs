@@ -5,7 +5,7 @@
 //! piece is sealed through the filter chain independently so peak memory is
 //! O(chunk_size) on the read path.
 
-use crate::backend::api::{Backend, KeyRange, Op, Table};
+use crate::backend::api::{Backend, KeyRange, Op, ScanRequest, Table};
 use crate::codec::MAX_DECODED_BYTES;
 use crate::error::{Error, Result};
 
@@ -107,17 +107,13 @@ pub fn next_value_id_key() -> &'static [u8] {
     META_NEXT_VALUE_ID
 }
 
-pub fn bump_counter_ops(current: u64) -> Result<(u64, Op)> {
-    let id = current;
-    let next = current
-        .checked_add(1)
-        .ok_or_else(|| Error::backend("value id space is exhausted"))?;
-    let op = Op::Put {
+/// The op that persists `next` as the stored high-water mark.
+fn counter_op_for(next: u64) -> Op {
+    Op::Put {
         table: Table::Meta,
         key: META_NEXT_VALUE_ID.to_vec(),
         value: next.to_be_bytes().to_vec(),
-    };
-    Ok((id, op))
+    }
 }
 
 pub fn parse_counter(raw: Option<&[u8]>) -> Result<u64> {
@@ -137,13 +133,36 @@ pub fn parse_counter(raw: Option<&[u8]>) -> Result<u64> {
 /// counter and bumping it used to be two separate awaits per locker, which is
 /// exactly the interleaving that produced duplicate ids.
 ///
-/// The cursor is seeded from `meta` on first use and then lives in RAM. The
-/// lock is a `std` mutex and is **never** held across an await: allocation is
-/// pure arithmetic, and the returned `Op` persists the new high-water mark
-/// with whatever commit the caller is already building.
+/// The cursor is seeded on first use and then lives in RAM. The lock is a
+/// `std` mutex and is **never** held across an await: allocation is pure
+/// arithmetic.
+///
+/// # Why allocation does not hand back its own counter op
+///
+/// It used to: `allocate` returned `(id, Op::Put(next_value_id, id + 1))`, and
+/// that op rode whatever commit the caller was building. On a backend whose
+/// awaits genuinely suspend — IndexedDB — that is a lost update. One
+/// transaction allocates id `N` and then awaits a read for its next key; a
+/// second writer on the same bank allocates `N + 1` and commits (stored next
+/// = `N + 2`); the first transaction then lands its own, older op, putting the
+/// stored counter back to `N + 1`. After a reopen `N + 1` is handed out again
+/// while it is still live, two values' pieces interleave under one `chunks`
+/// prefix, and the first GC by prefix deletes both.
+///
+/// So the counter op is built at **commit-build** time from the RAM cursor's
+/// current high-water mark ([`ValueIds::counter_op`]) rather than from the id
+/// one caller happened to take, exactly as [`super::lru::Ticks::counter_op`]
+/// does. Every commit that allocates must carry one.
+///
+/// That shrinks the window to the commit itself rather than closing it, so
+/// [`ValueIds::allocate`]'s seeding is the belt to that pair of braces: the
+/// cursor starts at the larger of the stored counter and one past the
+/// highest id present in the `chunks` table, which
+/// is derived from the data rather than from bookkeeping that a racing commit
+/// can walk backwards.
 #[derive(Debug, Default)]
 pub struct ValueIds {
-    /// The next id to hand out. `None` until seeded from `meta`.
+    /// The next id to hand out. `None` until seeded from the store.
     next: std::sync::Mutex<Option<u64>>,
 }
 
@@ -181,16 +200,74 @@ impl ValueIds {
         Ok(id)
     }
 
-    /// Allocate one id, plus the op that persists the new counter.
-    pub async fn allocate(&self, backend: &dyn Backend) -> Result<(u64, Op)> {
+    /// Allocate one id.
+    ///
+    /// Every commit carrying an id allocated here must also carry
+    /// [`ValueIds::counter_op`], or a reopen would re-issue an id whose chunks
+    /// are still stored.
+    pub async fn allocate(&self, backend: &dyn Backend) -> Result<u64> {
         if let Some(id) = self.take()? {
-            return bump_counter_ops(id);
+            return Ok(id);
         }
-        let raw = backend.get(Table::Meta, META_NEXT_VALUE_ID).await?;
-        let stored = parse_counter(raw.as_deref())?;
-        let id = self.seed_and_take(stored)?;
-        bump_counter_ops(id)
+        let floor = seed_floor(backend).await?;
+        self.seed_and_take(floor)
     }
+
+    /// Persist the current high-water mark. Belongs in every allocating commit.
+    pub(crate) fn counter_op(&self) -> Result<Op> {
+        let guard = self
+            .next
+            .lock()
+            .map_err(|_| Error::backend("value id cursor was poisoned"))?;
+        Ok(counter_op_for(guard.unwrap_or(0)))
+    }
+}
+
+/// Where a fresh cursor must start.
+///
+/// One past the highest id present in `chunks`, or the stored
+/// `next_value_id`, whichever is larger. The stored counter alone is
+/// bookkeeping, and a commit that raced another one may have
+/// written a stale value over a newer one; the `chunks` table is the data
+/// itself and cannot lie about which ids are in use. Taking the larger of the
+/// two means a reopen never hands out an id that something still points at,
+/// and never rewinds past a counter that ran ahead of the data (a `Writer`
+/// that allocated and stored nothing, say).
+///
+/// Two backend calls, once per bank, on the first chunked write — not per
+/// allocation.
+async fn seed_floor(backend: &dyn Backend) -> Result<u64> {
+    let raw = backend.get(Table::Meta, META_NEXT_VALUE_ID).await?;
+    let stored = parse_counter(raw.as_deref())?;
+    match highest_stored_id(backend).await? {
+        Some(id) => Ok(stored.max(advance(id)?)),
+        None => Ok(stored),
+    }
+}
+
+/// The highest `value_id` any stored chunk belongs to.
+///
+/// A chunk key is `value_id BE || seq BE`, so the ids sort ahead of the
+/// sequence numbers and one reverse scan of a single record over the whole
+/// table answers it.
+async fn highest_stored_id(backend: &dyn Backend) -> Result<Option<u64>> {
+    let page = backend
+        .scan(ScanRequest {
+            table: Table::Chunks,
+            range: KeyRange::all(),
+            reverse: true,
+            limit: 1,
+            want_values: false,
+        })
+        .await?;
+    let Some((key, _)) = page.items.first() else {
+        return Ok(None);
+    };
+    let head: [u8; 8] = key
+        .get(0..8)
+        .and_then(|head| head.try_into().ok())
+        .ok_or_else(|| Error::Corrupt("a chunk key is shorter than a value id".into()))?;
+    Ok(Some(u64::from_be_bytes(head)))
 }
 
 fn advance(id: u64) -> Result<u64> {

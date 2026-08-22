@@ -71,8 +71,8 @@ impl std::fmt::Debug for Writer {
 
 impl Writer {
     pub(crate) async fn start(inner: Arc<Inner>, res: Arc<Resident>, key: String) -> Result<Self> {
-        let (value_id, bump) = inner.next_value_id().await?;
-        inner.commit(vec![bump]).await?;
+        let value_id = inner.next_value_id().await?;
+        inner.commit(vec![inner.value_counter_op()?]).await?;
         Ok(Self {
             inner,
             res,

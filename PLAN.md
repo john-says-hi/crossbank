@@ -761,15 +761,25 @@ a cost we have chosen to carry. None of them loses data.
 - **The eager size limit moves to flush time under `Commit::Deferred`.** A
   `put` still seals the value to check it, but a batch is re-sealed as one
   write-set, so a `ValueTooLarge` from a staged write surfaces from `flush`.
-- **The value-id counter persists its high-water mark per commit.** If two
-  chunk allocations commit out of order, the stored `next_value_id` can land
-  one lower than the highest id actually handed out. Within a process the RAM
-  cursor covers it; only a reopen immediately after such an interleaving could
-  re-hand an id in use. Making that durable-monotonic against out-of-order
-  commits needs a compare-and-set the `Backend` trait does not have, so it is
-  still open. The M5 tick counter no longer carries that caveat: the open-time
-  scan of the `lru::` rows now seeds the clock above the highest tick they
-  hold, so a reopen is monotonic whatever the stored counter says.
+- **The value-id counter is now seeded from the data, not only from its own
+  bookkeeping.** It used to persist `current + 1` at *allocation* time, and
+  that op rode whatever commit the caller was still building. A commit that
+  landed behind a newer one therefore wrote the stored `next_value_id` back
+  below an id that was still live, and a reopen handed that id out again — two
+  values' pieces interleaved under one `chunks` prefix, where a GC by prefix
+  takes both. Only IndexedDB's awaits suspend, so only the web could reach it.
+  Two changes answer it. The counter op is built at commit-build time from the
+  RAM cursor's current high-water mark (`ValueIds::counter_op`, the shape
+  `Ticks::counter_op` already used), which narrows the window to the commit
+  itself; and a fresh cursor starts at the larger of the stored
+  `next_value_id` and one past the highest id present in `chunks` — one
+  reverse scan of a single record — which closes it, because the `chunks`
+  table is the data and no racing commit can walk it backwards. A
+  compare-and-set the `Backend` trait does not have would let the first half
+  stand alone; the second half means it does not need to.
+  `a_late_commit_cannot_re_issue_a_live_value_id` in the conformance suite
+  fails without the fix on every backend. Ticks: the LRU clock got the
+  same shape of fix — see the `fix(lru)` entry in `CHANGELOG.md`.
 - **Corrupt bytes and an oversized value look the same at the eager sink.**
   A coherence message either carries a value or does not. When it does not —
   because the write was past the inline limit, or was chunked — and when it

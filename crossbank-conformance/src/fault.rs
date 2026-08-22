@@ -275,3 +275,142 @@ impl Backend for Shared {
 
 /// The shape a harness hands to a case: usable as a backend, and armable.
 pub type SharedFault = Fault<Shared>;
+
+/// A decorator that catches one commit and holds it until the case says go.
+///
+/// # Why a suite needs this
+///
+/// Several crossbank invariants are about *commit order* under genuinely
+/// suspending awaits — the shape only IndexedDB has natively, and the shape
+/// `redb` and the memory backend can never produce on their own because every
+/// future they return is ready on its first poll. [`Fault`] answers "what if
+/// the write does not land"; this answers "what if another writer lands
+/// first".
+///
+/// Deterministic on every backend, because the case drives it rather than
+/// racing it: [`Hold::arm`] hands back a future that resolves when a commit
+/// has been caught, and nothing else is started until it has.
+///
+/// One-shot, like a fault plan. The caught commit is released by
+/// [`Hold::release`]; every later commit passes straight through.
+pub struct Hold<B: Backend> {
+    inner: B,
+    state: Mutex<HoldState>,
+}
+
+#[derive(Default)]
+struct HoldState {
+    /// Fires the moment a commit is caught.
+    caught: Option<futures::channel::oneshot::Sender<()>>,
+    /// What the caught commit waits on.
+    gate: Option<futures::channel::oneshot::Receiver<()>>,
+    /// What opens that gate.
+    key: Option<futures::channel::oneshot::Sender<()>>,
+}
+
+impl<B: Backend> Hold<B> {
+    pub fn new(inner: B) -> Self {
+        Self {
+            inner,
+            state: Mutex::new(HoldState::default()),
+        }
+    }
+
+    /// Catch the next commit. The returned future resolves once one is held.
+    pub fn arm(&self) -> Result<futures::channel::oneshot::Receiver<()>> {
+        let (caught, arrived) = futures::channel::oneshot::channel();
+        let (key, gate) = futures::channel::oneshot::channel();
+        let mut guard = self.lock()?;
+        guard.caught = Some(caught);
+        guard.gate = Some(gate);
+        guard.key = Some(key);
+        Ok(arrived)
+    }
+
+    /// Let the held commit through.
+    pub fn release(&self) -> Result<()> {
+        if let Some(key) = self.lock()?.key.take() {
+            // A send failure means the commit is gone already, which is not a
+            // problem the case needs to hear about.
+            let _ = key.send(());
+        }
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, HoldState>> {
+        self.state
+            .lock()
+            .map_err(|_| Error::backend("the hold lock was poisoned"))
+    }
+
+    /// Claim the gate if one is armed. Never awaits, never holds the lock past
+    /// its own return.
+    #[allow(clippy::type_complexity)]
+    fn claim(
+        &self,
+    ) -> Result<
+        Option<(
+            futures::channel::oneshot::Sender<()>,
+            futures::channel::oneshot::Receiver<()>,
+        )>,
+    > {
+        let mut guard = self.lock()?;
+        match (guard.caught.take(), guard.gate.take()) {
+            (Some(caught), Some(gate)) => Ok(Some((caught, gate))),
+            // Disarmed, or already fired: put back whatever half was there so
+            // an arm/claim mismatch cannot half-arm the next commit.
+            (caught, gate) => {
+                guard.caught = caught;
+                guard.gate = gate;
+                Ok(None)
+            }
+        }
+    }
+}
+
+impl<B: Backend> Backend for Hold<B> {
+    fn get<'a>(&'a self, table: Table, key: &'a [u8]) -> BFut<'a, Option<Vec<u8>>> {
+        self.inner.get(table, key)
+    }
+
+    fn get_many<'a>(&'a self, table: Table, keys: Vec<Vec<u8>>) -> BFut<'a, Vec<Option<Vec<u8>>>> {
+        self.inner.get_many(table, keys)
+    }
+
+    fn scan(&self, request: ScanRequest) -> BFut<'_, ScanPage> {
+        self.inner.scan(request)
+    }
+
+    fn scan_page_size(&self) -> usize {
+        self.inner.scan_page_size()
+    }
+
+    fn commit(&self, ops: Vec<Op>) -> BFut<'_, ()> {
+        self.commit_with(ops, CommitOptions::default())
+    }
+
+    fn commit_with(&self, ops: Vec<Op>, options: CommitOptions) -> BFut<'_, ()> {
+        let claimed = self.claim();
+        Box::pin(async move {
+            if let Some((caught, gate)) = claimed? {
+                let _ = caught.send(());
+                // A cancelled gate means the case gave up; letting the commit
+                // through is the harmless answer.
+                let _ = gate.await;
+            }
+            self.inner.commit_with(ops, options).await
+        })
+    }
+
+    fn usage(&self) -> BFut<'_, Option<Usage>> {
+        self.inner.usage()
+    }
+
+    fn flush(&self) -> BFut<'_, ()> {
+        self.inner.flush()
+    }
+
+    fn close(&self) -> BFut<'_, ()> {
+        self.inner.close()
+    }
+}

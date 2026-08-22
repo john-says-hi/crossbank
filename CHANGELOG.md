@@ -84,6 +84,15 @@ because Hive's `get(key, defaultValue:)` is used on a `LazyBox` as readily as on
   bank never re-issues a tick already recorded against a key and the byte budget cannot shed
   the wrong one.
 
+- Two large values can no longer end up sharing one set of chunks. The counter behind chunked
+  values used to be saved from the number a writer took, not from the number the bank had
+  reached, so a write that finished behind a newer one could push it backwards — and after
+  the store was reopened the same id was handed out twice. The pieces of two different values
+  then landed under one id, and deleting either one deleted both. The counter is now saved at
+  the moment the write is assembled, and a reopened bank starts it above the highest id its
+  stored chunks actually use, so an id in use is never handed out again. Reachable on the web
+  (IndexedDB), where a write really does pause mid-flight; not on desktop or mobile.
+
 ### Notes
 
 - Hive's on-disk format is *not* read. There is no migration, by decision.

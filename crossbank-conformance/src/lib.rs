@@ -92,7 +92,7 @@ pub trait Harness {
 }
 
 /// Number of cases in the spec. The arity guard compares against this.
-pub const CASE_COUNT: usize = 51;
+pub const CASE_COUNT: usize = 52;
 
 /// Run `block_on` without pulling in an async runtime.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -161,6 +161,7 @@ macro_rules! __for_each_case {
         $crate::__emit!(a_torn_commit_leaves_the_previous_state, $make);
         $crate::__emit!(quota_exhaustion_mid_batch_writes_nothing, $make);
         $crate::__emit!(a_truncated_chunk_is_reported_as_corrupt, $make);
+        $crate::__emit!(a_late_commit_cannot_re_issue_a_live_value_id, $make);
     };
 }
 
@@ -304,5 +305,6 @@ macro_rules! __count_cases {
         $counter!(a_torn_commit_leaves_the_previous_state, ());
         $counter!(quota_exhaustion_mid_batch_writes_nothing, ());
         $counter!(a_truncated_chunk_is_reported_as_corrupt, ());
+        $counter!(a_late_commit_cannot_re_issue_a_live_value_id, ());
     };
 }

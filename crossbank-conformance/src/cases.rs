@@ -1823,9 +1823,9 @@ pub async fn a_truncated_chunk_is_reported_as_corrupt<H: Harness>(h: &H) -> Resu
         .lazy_locker_with::<Vec<u8>>("chunked", tiny_chunks())
         .await?;
 
-    // A chunked put commits, in order: the value-id counter, then one put per
-    // chunk, then the record's pointer. Op 1 is therefore the first chunk —
-    // damaging the counter or the pointer would be a different test.
+    // A chunked put commits, in order: one put per chunk, then the record's
+    // pointer, then the value-id counter. Op 1 is therefore a chunk —
+    // damaging the pointer or the counter would be a different test.
     faulty.arm(crate::fault::FaultPlan::new(
         1,
         crate::fault::Injection::Truncate { keep: 4 },
@@ -1877,6 +1877,135 @@ pub async fn a_truncated_chunk_is_reported_as_corrupt<H: Harness>(h: &H) -> Resu
     // And the damage is confined: an undamaged key alongside it still reads.
     locker.put("small", &vec![7u8; 8]).await?;
     assert_eq!(locker.get("small").await?, Some(vec![7u8; 8]));
+
+    bank.close().await?;
+    Ok(())
+}
+
+/// A commit that lands behind a newer one cannot make a reopened bank
+/// re-issue a value id that is still in use.
+///
+/// The failure this pins is silent data corruption, and it needs three things
+/// at once, which is why it took a decorator to reproduce: an await that
+/// genuinely suspends between allocating a chunk value id and committing it
+/// (IndexedDB has them; `redb` and the memory backend never do), a second
+/// writer on the same bank that allocates a *higher* id and commits first, and
+/// a reopen.
+///
+/// The stored `next_value_id` was written from the id the first writer took,
+/// so its late commit put the counter back below the second writer's live id.
+/// A reopened bank then handed that id out again, two values' pieces
+/// interleaved under one `chunks` prefix, and because chunk GC deletes by
+/// prefix, dropping either value took both.
+///
+/// [`crate::fault::Hold`] makes the interleaving deterministic on every
+/// backend rather than hoping a race shows up.
+pub async fn a_late_commit_cannot_re_issue_a_live_value_id<H: Harness>(h: &H) -> Result<()> {
+    use crossbank::backend::{Backend, KeyRange, ScanRequest, Table};
+    use std::sync::Arc;
+
+    let held = Arc::new(crate::fault::Hold::new(crate::fault::Shared(
+        h.open().await?,
+    )));
+    let backend: Arc<dyn Backend> = held.clone();
+
+    let first = v(&"1".repeat(200));
+    let second = v(&"2".repeat(200));
+    let third = v(&"3".repeat(200));
+
+    {
+        let bank = Bank::with_backend(backend.clone()).await?;
+        let a = bank.lazy_locker_with::<V>("a", tiny_chunks()).await?;
+        let b = bank.lazy_locker_with::<V>("b", tiny_chunks()).await?;
+
+        // Arm after both lockers exist, so no registration commit is caught.
+        let caught = held.arm()?;
+
+        let put_a = a.put("k", &first);
+        futures::pin_mut!(put_a);
+        match futures::future::select(put_a.as_mut(), caught).await {
+            futures::future::Either::Left((done, _)) => {
+                done?;
+                return Err(Error::backend(
+                    "the first writer's commit was never caught by the gate",
+                ));
+            }
+            futures::future::Either::Right((arrived, _)) => {
+                arrived.map_err(|_| Error::backend("the gate was dropped"))?;
+            }
+        }
+
+        // Writer A is parked with its ops already built. Writer B allocates
+        // the next id and lands ahead of it.
+        b.put("k", &second).await?;
+        held.release()?;
+        put_a.await?;
+
+        assert_eq!(a.get("k").await?, Some(first.clone()));
+        assert_eq!(b.get("k").await?, Some(second.clone()));
+    }
+
+    // Reopen: a new bank over the same store, so its id cursor is rebuilt from
+    // what is persisted. Not `close()` then `h.open()` — that would ask the
+    // memory backend to persist, which it does not claim to do, and this case
+    // is about every backend's cursor, not about durability.
+    let bank = Bank::with_backend(backend.clone()).await?;
+    let a = bank.lazy_locker_with::<V>("a", tiny_chunks()).await?;
+    let b = bank.lazy_locker_with::<V>("b", tiny_chunks()).await?;
+    let c = bank.lazy_locker_with::<V>("c", tiny_chunks()).await?;
+    c.put("k", &third).await?;
+
+    // Every stored chunk belongs to exactly one of the three values, and the
+    // three sets are disjoint. A chunk key is `value_id BE || seq BE`.
+    let mut ids: Vec<u64> = Vec::new();
+    let mut rows = 0usize;
+    let mut range = KeyRange::all();
+    loop {
+        let page = bank
+            .backend()
+            .scan(ScanRequest {
+                table: Table::Chunks,
+                range: range.clone(),
+                reverse: false,
+                limit: 64,
+                want_values: false,
+            })
+            .await?;
+        rows += page.items.len();
+        for (key, _) in &page.items {
+            let head: [u8; 8] = key[0..8]
+                .try_into()
+                .expect("a chunk key carries a value id");
+            let id = u64::from_be_bytes(head);
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        match page.resume {
+            Some(last) => range.start = std::ops::Bound::Excluded(last),
+            None => break,
+        }
+    }
+
+    assert_eq!(
+        ids.len(),
+        3,
+        "three chunked values must own three distinct value ids, saw {ids:?}"
+    );
+    assert_eq!(
+        rows % 3,
+        0,
+        "the three values are the same size, so their chunk counts must be too"
+    );
+    assert!(rows >= 6, "the setup must actually have chunked");
+
+    assert_eq!(a.get("k").await?, Some(first));
+    assert_eq!(
+        b.get("k").await?,
+        Some(second),
+        "a value written by the writer that committed first must survive"
+    );
+    assert_eq!(c.get("k").await?, Some(third));
 
     bank.close().await?;
     Ok(())

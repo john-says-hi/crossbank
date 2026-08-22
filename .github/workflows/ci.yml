@@ -216,11 +216,13 @@ jobs:
   # a WebDriver-driven Safari is unreliable, so an atomics lane here would be
   # flaky rather than informative.
   #
-  # Landing non-blocking (continue-on-error, and deliberately NOT in
-  # ci-green's needs) until John has seen one green run. See PLAN.md.
+  # REQUIRED since 2026-08-21. It landed non-blocking, was observed RED on its
+  # very first run (bash 3.2 on the macOS runner aborts on an empty array under
+  # `set -u` — trap 40) and GREEN on the next one after the fix, which is the
+  # standing rule for trusting a lane (trap 3). It now blocks: no
+  # `continue-on-error`, and `ci-green` needs it.
   wasm-safari:
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
@@ -334,7 +336,7 @@ jobs:
   # Single required status check for branch protection.
   ci-green:
     if: always()
-    needs: [lint, msrv, native, mobile-check, wasm]
+    needs: [lint, msrv, native, mobile-check, wasm, wasm-safari]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any job did not succeed

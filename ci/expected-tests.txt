@@ -21,5 +21,6 @@ plain-firefox    154
 plain-chrome     154
 atomics-chrome   154
 atomics-firefox  154
-# Safari runs the same plain suite; the lane is new and non-blocking.
+# Safari runs the same plain suite; the lane is required as of 2026-08-21,
+# verified at 154.
 plain-safari     154

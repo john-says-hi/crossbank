@@ -539,8 +539,9 @@ Every one of these was hit and paid for already. Do not rediscover them.
    allowed, but they belong in `CHANGELOG.md` under `[Unreleased]`.
 4. Trap 8 still applies to any IndexedDB work: every backend method must be **one**
    `db.transaction(...).run(...)` awaiting only IDB requests.
-5. Safari CI now has a lane: `wasm-safari` on `macos-latest`, plain lane only, running
-   `ci/wasm-test.sh --plain --safari`. It is **non-blocking on purpose** —
-   `continue-on-error: true` and not in `ci-green`'s `needs` — until John has seen one
-   green run; see the follow-up in `PLAN.md`. Safari's ITP still deletes IndexedDB after
-   7 days without user interaction, which remains a product-level risk.
+5. Safari CI has a lane: `wasm-safari` on `macos-latest`, plain lane only, running
+   `ci/wasm-test.sh --plain --safari`. It is **required** as of 2026-08-21 — no
+   `continue-on-error`, and it is in `ci-green`'s `needs`. It earned that: it went red on
+   its first run (trap 40) and green on the next, which is the only way a lane becomes
+   trustworthy green (trap 3). Safari's ITP still deletes IndexedDB after 7 days without
+   user interaction, which remains a product-level risk.

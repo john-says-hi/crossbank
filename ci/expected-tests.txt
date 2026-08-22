@@ -11,10 +11,10 @@
 # WHEN YOU ADD TEST CASES YOU MUST BUMP THESE NUMBERS. Run the lane, take the
 # "OK: N test(s) actually ran and passed." number, and write N here.
 #
-# Last verified: 2026-08-21, Phase 4d (fault injection): 51 conformance cases.
-plain-firefox    118
-plain-chrome     118
-atomics-chrome   118
-atomics-firefox  118
+# Last verified: 2026-08-21, M6 closeout (0.1.0 candidate): 131 tests per lane.
+plain-firefox    131
+plain-chrome     131
+atomics-chrome   131
+atomics-firefox  131
 # Safari runs the same plain suite; the lane is new and non-blocking.
-plain-safari     118
+plain-safari     131

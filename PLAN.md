@@ -255,6 +255,21 @@ exhaustion, truncation and corruption at every op index; native crash-and-reopen
 child process; and property tests using the memory backend as oracle. Quota is tested with an
 injected budget per PR and a real 10 MB Firefox pref nightly.
 
+`Fault<B>` **landed** (`crossbank-conformance/src/fault.rs`) and carries three cases of its
+own. It is one-shot and aimed at an index into the op stream counted from `arm()`, which is
+why a case arms it *after* opening its bank and locker — registration commits would otherwise
+shift the index. `Brittle` in `tests/deferred_batches.rs` stays as it is: a backend that stays
+broken across many commits is a different question.
+
+**What `wasm_bindgen_test` structurally cannot cover.** That lane owns one page that never
+navigates, so two claims are invisible to it: a real reload (a fresh wasm instance and heap
+reading bytes an earlier instance wrote — reopening a `Bank` inside one page is a weaker
+claim), and a `BroadcastChannel` message crossing between two *documents* rather than between
+two `Bank`s in one. `examples/web_e2e_page.rs` plus `ci/web-e2e.sh` cover both with Playwright
+on all three engines, nightly. `tests/web_multi_tab.rs` was deliberately **not** written:
+`tests/web_coherence.rs` already covers the two-Banks-in-one-page half completely, and a
+second file saying the same thing would be duplication rather than coverage.
+
 ### CI
 
 Public repos get free unmetered runners on every OS — which is exactly why this is affordable
@@ -270,6 +285,8 @@ every workflow is `workflow_dispatch`-only.
 | mobile-check | Android ×3, iOS ×2 `cargo check` | per PR |
 | mobile persistence | write, kill, reopen on emulator/simulator | nightly |
 | torture, crash, proptest | multi-GB, quota, fault matrix | nightly |
+| scale | 100k keys, write / reopen / range, `CROSSBANK_SCALE=1` | nightly |
+| web-e2e | real reload + two real tabs, chromium/firefox/webkit | nightly |
 
 Edge is Chromium — same Blink, V8, and IndexedDB implementation — so the Chrome lane covers
 it and no `msedgedriver` lane is warranted. Safari/WebKit is the only other engine, hence its
@@ -578,6 +595,34 @@ rows now carry a `browser` field, so Chrome and Firefox coexist in one results f
 also tears its database down *before* it logs, which was the cause of the runner exiting
 non-zero on a run that had already produced its numbers; `ci/bench.sh --web --chrome` and
 `--firefox` both exit 0.
+
+### Native re-run (2026-08-21, after Phase 3) — `cargo bench --bench kv`
+
+Raw JSON: `bench/results/2026-08-21.json`. Same machine as 2026-08-20.
+
+| Workload | crossbank redb | redb, `Eventual` + `flush` | crossbank memory | Hive CE (file, 2026-08-20) |
+|---|---|---|---|---|
+| `settings_eager` — per op, 90/10, 1 KiB | 41.2 µs | **1.00 µs** | 0.25 µs | 4.0 µs |
+| `bulk_lazy_put` — 2 000 × 256 B | 948 ms | **27.8 ms** | 3.23 ms | 27 ms |
+| `bulk_lazy_get` — per random get | 1.30 µs | — | 0.51 µs | 19 µs |
+| `txn_batch` — 100 puts, one `transact` | 1.24 ms | — | 0.19 ms | 0.11 ms |
+| `reopen` — open an existing bank, read a key | **2.91 ms** | — | — | 1.3 ms |
+| `reopen_warm` — same file, already opened once | 1.41 ms | — | — | — |
+| `index_open` — open a locker holding 2 000 keys | 1.91 ms | — | — | — |
+| `envelope_tax` — 200 × 1 KiB, one put each | 95.6 ms | — | — | — |
+| `chunk_sweep` — 8 MiB value, 256 KiB chunks | 16.0 ms | — | — | 50 ms |
+
+`reopen/redb` **changed meaning** in this run and the old number should not be compared
+against it. It used to create a fresh redb file, write to it, close it and reopen it, all
+inside the timed closure — so it was measuring a create *and* an open against Hive's open.
+The create-and-write half now lives in `iter_batched` setup, and only `Bank::open` +
+`lazy_locker` + one `get` is timed. That is 2.91 ms against Hive's 1.3 ms, not the 10.0 ms
+the Phase 3 table records for the old shape.
+
+The `Eventual` column is the Phase 3 durability knob with its `flush` paid for, and it is
+the row to read beside Hive CE: Hive's puts are not fsync-durable either, and on that
+footing crossbank is **4× faster** on the settings shape and level on bulk put. The
+default column still pays an fsync per put and is still the default.
 
 ### Phase 3 — performance (2026-08-21, same machine)
 

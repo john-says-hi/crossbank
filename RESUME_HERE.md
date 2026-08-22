@@ -394,6 +394,20 @@ Every one of these was hit and paid for already. Do not rediscover them.
     simply no code blocks in the crate. If you add a doc example, run
     `cargo test --doc` and check the *count* went up, not just that it passed.
 
+34. **Two CI lanes that look green on paper and are not.** First: `cargo check
+    --workspace` compiles `src/bin/` but *not* dev targets, so it builds
+    `crash_child` without the `futures` `executor` feature the dev-dependency
+    turns on — and resolver 2 does not unify that feature in from the dev
+    side. The mobile Android/iOS lanes would have failed to compile for that
+    reason alone; any lane that does not build dev targets needs `--lib`. This
+    is trap 32 reached from the check side instead of the packaging side.
+    Second: `cargo-semver-checks` has no baseline until the first
+    `cargo publish`, and with nothing to diff against it **errors** rather
+    than no-opping — so it would have failed `lint`, and `ci-green`'s `needs`
+    would have failed the whole first push. It runs `continue-on-error: true`
+    until 0.1.0 is on crates.io; drop that in the commit right after the first
+    publish.
+
 ## 8. Where the detail lives
 
 - **`PLAN.md`** — the full technical plan: all 25 decisions with rationale, architecture, the

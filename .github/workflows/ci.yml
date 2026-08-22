@@ -42,11 +42,14 @@ jobs:
       # dev-only feature was caught (trap 32). Catch that on every PR rather
       # than on publish day.
       - run: cargo publish --dry-run
-      # A no-op until 0.1.0 is actually on crates.io: with no published
-      # baseline to diff against, the action has nothing to compare and
-      # passes. It starts earning its keep on the first post-0.1.0 change,
-      # which is exactly when a silent API break would otherwise ship.
+      # The crate is not on crates.io yet, so there is no published baseline to
+      # diff against — and cargo-semver-checks *errors* in that situation, it
+      # does not pass. `continue-on-error` keeps that from turning `lint` red
+      # and, through `ci-green`'s `needs`, the whole first push red. Remove
+      # `continue-on-error` in the same commit that follows the first
+      # `cargo publish`, which is when this step starts earning its keep.
       - uses: obi1kenobi/cargo-semver-checks-action@v2
+        continue-on-error: true
 
   native:
     strategy:
@@ -89,7 +92,10 @@ jobs:
           for t in ${{ matrix.targets }}; do
             rustup target add "$t"
             echo "==> $t"
-            cargo check --workspace --target "$t" --all-features
+            # --lib because a bare `cargo check --workspace` also builds
+            # `src/bin/crash_child.rs`, which needs `futures`' `executor`
+            # feature that only the dev-dependency turns on (trap 32).
+            cargo check --workspace --lib --target "$t" --all-features
           done
 
   wasm:

@@ -443,6 +443,21 @@ Every one of these was hit and paid for already. Do not rediscover them.
     Whenever shared state starts owning something that points back at it, check
     which way the `Arc`s run.
 
+36. **The declared MSRV was a number nobody had ever run.** `Cargo.toml` said
+    `rust-version = "1.85"` from the first commit, and no lane had ever built
+    on 1.85, so the manifest was promising a toolchain that cannot compile the
+    crate. The first `cargo +1.85 check` did not fail on our code at all — it
+    failed at *resolve* time, before compiling a line, with `redb@4.2.0
+    requires rustc 1.90`. That is the part worth remembering: cargo enforces
+    every **dependency's** own `rust-version`, so the floor is the maximum of
+    ours and theirs, and a dependency can raise it in a patch release without
+    touching anything we wrote. 1.90.0 is the lowest toolchain that passes, so
+    that is now the declared number. The `msrv` CI job pins the same version
+    and runs `cargo check --workspace --lib --all-features` on every push, so
+    the manifest and the truth cannot drift apart in silence again — if a
+    future dependency lifts the floor, that lane goes red and tells you the
+    new number instead of leaving it for a consumer to discover.
+
 ## 8. Where the detail lives
 
 - **`PLAN.md`** — the full technical plan: all 25 decisions with rationale, architecture, the

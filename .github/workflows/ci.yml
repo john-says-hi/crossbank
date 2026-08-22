@@ -51,15 +51,19 @@ jobs:
       - uses: obi1kenobi/cargo-semver-checks-action@v2
         continue-on-error: true
 
-  # Cargo.toml declares `rust-version = "1.85"`, and nothing checked it until
-  # this job existed. Pinned to the declared version on purpose: if the floor
-  # has really moved, this lane says so instead of the manifest quietly
-  # promising a toolchain that cannot build the crate.
+  # Cargo.toml declares `rust-version = "1.90"`, and nothing checked it until
+  # this job existed — the first run of this lane is what proved the old
+  # `1.85` was fiction. The floor is not ours to pick: cargo enforces every
+  # dependency's own `rust-version` at resolve time, and `redb 4` requires
+  # 1.90, so 1.90 is the lowest toolchain that resolves at all. Pinned to the
+  # declared version on purpose: if the floor moves again, this lane says so
+  # instead of the manifest quietly promising a toolchain that cannot build
+  # the crate.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.90
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv

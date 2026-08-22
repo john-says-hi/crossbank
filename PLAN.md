@@ -419,7 +419,7 @@ ramp, not IEEE floats. Do not drop LZ4 from the default chain on this evidence.
 
 Web timings (`tests/bench_web.rs`, ignored) land the same named workloads
 against IndexedDB; they are not in this table, but they are paired against
-Hive CE on IndexedDB under **Web comparison (2026-08-21)** below.
+Hive CE on IndexedDB under **Web comparison (2026-08-21, re-run after Phase 3)** below.
 
 ### M4 numbers (2026-08-20, same machine)
 
@@ -496,66 +496,88 @@ written on every toggle). M5 gains a small, explicit item: a *write-coalescing* 
 eager lockers (`Policy`-level, off by default) so a burst of settings writes can share one
 commit without giving up durability-on-return for callers that want it.
 
-### Web comparison (2026-08-21) — Hive CE IndexedDB vs crossbank IndexedDB
+### Web comparison (2026-08-21, re-run after Phase 3) — Hive CE IndexedDB vs crossbank IndexedDB
 
-This is the comparison that decides "can crossbank replace Hive **on the web**", and until now
-it had never been run. Both halves drove the **same browser binary**: Google Chrome
-151.0.7922.108 — Playwright `executablePath` for the Hive half, chromedriver for the wasm half.
-Raw JSON: `bench/results/2026-08-21-web.json`. Reproduce with
-`ci/bench.sh --hive --web` (Hive half) and `ci/bench.sh --web` (crossbank half).
+This is the comparison that decides "can crossbank replace Hive **on the web**". It is now
+apples-to-apples in every respect that used to be a caveat: the same six named workloads over
+the same byte payloads, both halves sampled the same way — one un-timed warm-up plus **20 timed
+iterations**, median and p99, on `performance.now()` — in the **same two browsers**. Chrome is
+Google Chrome 151.0.7922.108 (Playwright `executablePath` for the Hive half, chromedriver for
+the wasm half, so it is literally one binary); Firefox is Playwright's Firefox 153.0 for Hive
+and geckodriver's Firefox for the wasm half. Raw JSON: `bench/results/2026-08-21-web.json`.
+The pre-Phase-3 snapshot is kept verbatim in `bench/results/2026-08-21-web-prephase3.json`.
+
+Reproduce: `ci/bench.sh --hive --web --no-native --chrome` and the same with `--firefox`.
 
 **Read the durability column first — and note that on the web there isn't one.** Natively,
-crossbank's advantage in the table above is bought with an fsync per put and Hive's speed is
-bought by not having one. On IndexedDB *neither* engine is fsync-durable: Chromium runs
-IndexedDB transactions in `"relaxed"` durability by default, so a resolved put means "the
-transaction committed to the browser's store", not "the bytes survive a power cut". Hive CE web
-puts are not fsync-durable, and crossbank's IndexedDB backend inherits exactly the same
-browser-dependent guarantee. So unlike the native table, this one really is speed vs speed.
+crossbank's advantage is bought with an fsync per put and Hive's speed is bought by not having
+one. On IndexedDB *neither* engine is fsync-durable: Chromium runs IndexedDB transactions in
+`"relaxed"` durability by default, so a resolved put means "the transaction committed to the
+browser's store", not "the bytes survive a power cut". Hive CE web puts are not fsync-durable,
+and crossbank's IndexedDB backend inherits exactly the same browser-dependent guarantee. So
+unlike the native table, this one really is speed vs speed.
 
-The apples-to-apples pair — `tests/bench_web.rs` shapes, mirrored byte-for-byte by
-`bench/hive_ce/web`:
+All figures are **milliseconds per timed iteration, p50 / p99**. Lower is better; the winning
+p50 of each pair is bold.
 
-| Workload (200 ops each) | Hive CE (IndexedDB) | crossbank (IndexedDB) |
-|---|---|---|
-| `settings_eager_web_small` — 50 × 1 KiB warm, 200 in-memory gets | 0.10 ms (0.5 µs/op) | < 1 ms — below `Date.now()` resolution |
-| `bulk_lazy_put_web_small` — 200 × 256 B, one put each | **21 ms** (p99 445 ms) | 41 ms (33–49 ms over three runs) |
-| `bulk_lazy_get_web_small` — 200 lazy gets | **14 ms** (p99 69 ms) | 26 ms (16–27 ms over three runs) |
+| Workload (per timed iteration) | Chrome — Hive CE | Chrome — crossbank | Firefox — Hive CE | Firefox — crossbank |
+|---|---|---|---|---|
+| `settings_eager` — 1 000 ops, 90/10 get/put, 1 KiB | 21.4 / 43.5 | **12.4** / 26.7 | **14.0** / 21.0 | 17.9 / 28.6 |
+| `bulk_lazy_put` — 2 000 × 256 B, one put each | 406 / 874 | **346** / 413 | **260** / 1 092 | 489 / 869 |
+| `bulk_lazy_get` — 1 000 scattered lazy gets | 119 / 443 | **52.3** / 79.6 | 132 / 555 | **94.0** / 564 |
+| `txn_batch` — 100 puts in one `putAll` / `transact` | **8.30** / 218 | 9.37 / 24.8 | **8.00** / 14.0 | 12.4 / 41.2 |
+| `reopen` — write 1 KiB, close, reopen, read | **0.60** / 0.70 | 0.85 / 3.01 | 4.00 / 7.00 | **3.36** / 15.3 |
+| `big_value_put_get` — one 8 MiB value | **17.3** / 121 | 22.7 / 32.6 | 56.0 / 86.0 | **55.2** / 67.5 |
 
-**The headline: crossbank is within ~2× of Hive CE on the web, on both puts and lazy gets, and
-ties on eager settings reads.** That is a completely different picture from the native table's
-35× put gap, and it is the expected one — on the web both engines are queueing work into the
-same IndexedDB, so the per-op cost is dominated by the browser, not by redb commits or Hive's
-append log. crossbank pays LZ4+CRC and a postcard envelope per value on top; ~2× is what that
-tax costs today, *before* any Phase 3 perf work. Hive's p99s are far worse than its medians
-(445 ms on puts vs a 21 ms median) — IndexedDB pauses hit it too, and the crossbank single-shot
-numbers cannot show that at all yet.
+The legacy small shapes (50 settings keys, 200 bulk ops) are still emitted by both tools, so the
+pre-Phase-3 rows have a like-for-like successor. They are secondary; the table above is the
+comparison.
 
-Hive CE web rows with no crossbank counterpart yet (the large native shapes), for the re-run
-after Phase 3 lands:
+| Workload | Chrome — Hive CE | Chrome — crossbank | Firefox — Hive CE | Firefox — crossbank |
+|---|---|---|---|---|
+| `settings_eager_web_small` — 200 in-memory gets | 0.10 / 0.20 | **0.015** / 0.025 | 0.00 / 1.00 † | **0.020** / 0.040 |
+| `bulk_lazy_put_web_small` — 200 × 256 B | 171 / 229 | **34.2** / 47.2 | **31.0** / 42.0 | 55.2 / 80.3 |
+| `bulk_lazy_get_web_small` — 200 lazy gets | 23.1 / 33.5 | **11.5** / 14.9 | 18.0 / 23.0 | **14.4** / 24.0 |
 
-| Workload | Hive CE web | Hive CE native file | web tax |
-|---|---|---|---|
-| `settings_eager` — 1000 ops, 90/10 | 10.9 ms | 4.0 ms | 2.7× |
-| `bulk_lazy_put` — 2000 × 256 B | 362 ms | 27 ms | 13× |
-| `bulk_lazy_get` — 1000 gets | 69 ms | 19 ms | 3.6× |
-| `txn_batch` — 100 in one `putAll` | 4.0 ms | 0.11 ms | 36× |
-| `reopen` | 0.30 ms | 1.25 ms | 0.24× (faster) |
-| `big_value_put_get` — 8 MiB | 14.3 ms | 50 ms | 0.29× (faster) |
+† Firefox clamps `performance.now()` to ~1 ms for privacy, which is why every Hive-on-Firefox
+figure is a whole number and a sub-millisecond loop reads as 0. crossbank's wasm half gets the
+finer clock, so the two Firefox columns are not comparable *below about 1 ms*. Above that they
+are, which covers every row that matters.
 
-**Method deviations, stated plainly.** The Hive half is a median/p99 over 20 iterations with a
-warm-up, timed with `performance.now()`. The crossbank half is `tests/bench_web.rs`: **one
-un-warmed shot**, timed with `Date.now()` (1 ms resolution), so it reports no p99 and a
-sub-millisecond loop reads as 0. The wasm build is `--release`; a debug build measured
-49 ms / 27 ms on the same two rows, which is why the lane defaults to release. The
-wasm-bindgen runner exits non-zero on this machine *after* printing its JSON (the browser is
-lost during the test's own database teardown); `ci/bench.sh` records the printed rows and warns,
-because a bench is not a gate.
+**The trigger for hand-rolled IndexedDB bindings is NOT hit.** The threshold PLAN set was
+">2× slower than Hive on `bulk_lazy_put`". Measured: Chrome **0.85×** (crossbank is *faster*,
+346 ms vs 406 ms), Firefox **1.88×** (489 ms vs 260 ms). Neither browser reaches 2×, and the
+Chrome number is on the right side of 1.0. **We keep the `indexed-db` crate and do not write
+raw bindings.** Revisit only if a later measurement puts a shipping browser past 2×.
 
-**The remaining Phase 5 item is unification.** `tests/bench_web.rs` runs the *small* shapes
-(50 settings keys, 200 bulk ops) while `benches/kv.rs` and `bench/hive_ce` run the large ones.
-`bench/hive_ce/web` emits both, which is how one honest pair exists today, but the real fix is
-to move `bench_web.rs` onto the large shapes with a warm-up and a median — then every row in
-the first table above gets a crossbank column.
+**How to read the rest of it.** crossbank wins both read shapes in both browsers — 2.3× on
+`bulk_lazy_get` in Chrome — which is the same structural win the native table shows: a keyed
+store read against Hive's in-memory frame index plus a fetch. Hive still wins `txn_batch` and
+`big_value_put_get` on Chrome by a small margin, and `reopen` on Chrome by 0.25 ms, which is a
+per-app-start cost, not a per-op one. crossbank pays LZ4+CRC and a postcard envelope on every
+value and is still level or ahead on four of six Chrome rows — a completely different picture
+from the pre-Phase-3 snapshot, where the honest summary was "within ~2×".
+
+crossbank's **p99s are consistently tighter than Hive's** where the medians are close: 24.8 ms
+against 218 ms on `txn_batch`/Chrome, 413 ms against 874 ms on `bulk_lazy_put`/Chrome, 47 ms
+against 229 ms on the small put row. Hive's tail is its append log meeting an IndexedDB pause;
+crossbank's chunked commits spread the same work more evenly. For a UI that must not jank, the
+p99 column is the one that decides.
+
+**Noise, stated plainly.** Repeated runs of *identical* code on this machine moved
+`bulk_lazy_put`/crossbank/Chrome between 200 ms and 362 ms, and Hive's
+`bulk_lazy_put_web_small`/Chrome between 22 ms and 171 ms. **Treat anything inside about 2× as a
+tie** and read the p99s; a single row of this table is not a result, the shape of the whole
+table is.
+
+**What is now unified** (the Phase 5 item that was outstanding): `tests/bench_web.rs` runs the
+same large shapes as `benches/kv.rs`, from shared constants in `benches/common/mod.rs` (the Rust
+twin of `bench/hive_ce/lib/workloads.dart`), warms up, samples 20 iterations, reports median and
+p99 from `performance.now()`, and emits the same JSON row schema the Hive web tool emits. The
+rows now carry a `browser` field, so Chrome and Firefox coexist in one results file. The lane
+also tears its database down *before* it logs, which was the cause of the runner exiting
+non-zero on a run that had already produced its numbers; `ci/bench.sh --web --chrome` and
+`--firefox` both exit 0.
 
 ### Phase 3 — performance (2026-08-21, same machine)
 

@@ -90,7 +90,9 @@ if [ "${WEB:-}" = 1 ]; then
     [ -n "${RUNNER}" ] || { echo "no wasm-bindgen-test-runner found" >&2; exit 2; }
     export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="${RUNNER}"
     export WASM_BINDGEN_USE_BROWSER=1
-    export WASM_BINDGEN_TEST_TIMEOUT="${WASM_BINDGEN_TEST_TIMEOUT:-180}"
+    # The bench runs every workload ITERATIONS times, including 2 000-put and
+    # 8 MiB rounds, so it needs far more headroom than a unit test.
+    export WASM_BINDGEN_TEST_TIMEOUT="${WASM_BINDGEN_TEST_TIMEOUT:-1800}"
     unset WASM_BINDGEN_TEST_NO_ORIGIN_ISOLATION WASM_BINDGEN_TEST_ONLY_WEB || true
     if [ "${BROWSER}" = chrome ]; then
         unset GECKODRIVER GECKODRIVER_REMOTE SAFARIDRIVER SAFARIDRIVER_REMOTE || true
@@ -107,16 +109,14 @@ if [ "${WEB:-}" = 1 ]; then
     OUT="$(mktemp)"
     trap 'rm -f "${OUT}"' EXIT
     set +e
-    cargo test "${WASM_PROFILE[@]}" --target wasm32-unknown-unknown --test bench_web -- --include-ignored \
+    cargo test "${WASM_PROFILE[@]}" --target wasm32-unknown-unknown --test bench_web -- --include-ignored --nocapture \
         2>&1 | tee "${OUT}"
     status="${PIPESTATUS[0]}"
     set -e
-    # bench_web.rs prints its JSON and THEN tears the database down; on this
-    # machine the wasm-bindgen runner sometimes loses the browser during that
-    # teardown and exits non-zero having already produced the numbers. This is
-    # a bench, not a gate, so we record whatever JSON reached the log and only
-    # fail if there was none. (Teardown lives in tests/bench_web.rs, which this
-    # lane deliberately does not edit.)
+    # bench_web.rs now tears its database down BEFORE printing, so a clean run
+    # exits 0 and the exit code means what it says. The tolerance below stays
+    # as a belt: a bench is not a gate, and rows that reached the log are worth
+    # recording even if the runner lost the browser on the way out.
     if ! "${NODE}" "${HERE}/web-bench/merge-crossbank.mjs" \
         --browser "${BROWSER}" --profile "${WASM_PROFILE[*]:-debug}" \
         "${BENCH_ARGS[@]}" < "${OUT}"; then

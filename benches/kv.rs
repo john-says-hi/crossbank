@@ -14,19 +14,13 @@ use futures::executor::block_on;
 use redb::{Database, TableDefinition};
 use tempfile::TempDir;
 
-const SETTINGS_N: usize = 200;
-const SETTINGS_BYTES: usize = 1024;
-const BULK_N: usize = 2_000;
-const BULK_BYTES: usize = 256;
-const TXN_N: usize = 100;
+/// Workload shapes shared with `tests/bench_web.rs` (and mirrored in
+/// `bench/hive_ce/lib/workloads.dart`), so the native and web lanes measure
+/// the same operation counts over the same bytes.
+#[path = "common/mod.rs"]
+mod common;
 
-fn payload(n: usize, seed: u8) -> Vec<u8> {
-    (0..n).map(|i| seed.wrapping_add(i as u8)).collect()
-}
-
-fn key(i: usize) -> String {
-    format!("k{i:06}")
-}
+use common::{key, payload, BULK_BYTES, BULK_N, SETTINGS_BYTES, SETTINGS_N, TXN_N};
 
 fn wait<T>(fut: impl std::future::Future<Output = T>) -> T {
     block_on(fut)
@@ -90,8 +84,16 @@ fn settings_eager(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(2));
 
     for (label, factory, durability) in [
-        ("memory", memory_bank as fn() -> NativeBank, Durability::Immediate),
-        ("redb", redb_bank as fn() -> NativeBank, Durability::Immediate),
+        (
+            "memory",
+            memory_bank as fn() -> NativeBank,
+            Durability::Immediate,
+        ),
+        (
+            "redb",
+            redb_bank as fn() -> NativeBank,
+            Durability::Immediate,
+        ),
         (
             "redb_eventual",
             redb_bank as fn() -> NativeBank,
@@ -100,8 +102,12 @@ fn settings_eager(c: &mut Criterion) {
     ] {
         group.bench_function(BenchmarkId::from_parameter(label), |b| {
             let native = factory();
-            let locker = wait(native.bank.locker_with::<Vec<u8>>("settings", cfg(durability)))
-                .unwrap();
+            let locker = wait(
+                native
+                    .bank
+                    .locker_with::<Vec<u8>>("settings", cfg(durability)),
+            )
+            .unwrap();
             fill_eager(&locker, SETTINGS_N, SETTINGS_BYTES);
             let mut i = 0usize;
             b.iter(|| {
@@ -127,8 +133,16 @@ fn bulk_lazy_put(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     for (label, factory, durability) in [
-        ("memory", memory_bank as fn() -> NativeBank, Durability::Immediate),
-        ("redb", redb_bank as fn() -> NativeBank, Durability::Immediate),
+        (
+            "memory",
+            memory_bank as fn() -> NativeBank,
+            Durability::Immediate,
+        ),
+        (
+            "redb",
+            redb_bank as fn() -> NativeBank,
+            Durability::Immediate,
+        ),
         (
             "redb_eventual",
             redb_bank as fn() -> NativeBank,
@@ -137,8 +151,12 @@ fn bulk_lazy_put(c: &mut Criterion) {
     ] {
         group.bench_function(BenchmarkId::from_parameter(label), |b| {
             b.iter_with_setup(factory, |native| {
-                let locker =
-                    wait(native.bank.lazy_locker_with::<Vec<u8>>("bulk", cfg(durability))).unwrap();
+                let locker = wait(
+                    native
+                        .bank
+                        .lazy_locker_with::<Vec<u8>>("bulk", cfg(durability)),
+                )
+                .unwrap();
                 fill_lazy(&locker, BULK_N, BULK_BYTES);
                 // An eventual run must pay for the fsync it deferred, or the
                 // number is a lie rather than a trade.
@@ -241,24 +259,35 @@ fn reopen(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(3));
 
+    // Cold: a file this process has never opened before, one per iteration.
+    // Creating it and writing the key is SETUP, not measurement — Hive's
+    // 1.3 ms `reopen` times only the open, so timing redb's file creation here
+    // too would compare a create against an open. Only
+    // `Bank::open` + `lazy_locker` + one `get` is inside the timed closure.
     group.bench_function("redb", |b| {
-        b.iter(|| {
-            let dir = TempDir::new().unwrap();
-            let path = dir.path().join("bank.redb");
-            {
+        b.iter_batched(
+            || {
+                let dir = TempDir::new().unwrap();
+                let path = dir.path().join("bank.redb");
                 let bank = wait(Bank::open(BankConfig::at(&path))).unwrap();
                 let locker = wait(bank.lazy_locker::<Vec<u8>>("l")).unwrap();
                 wait(locker.put("k", &payload(1024, 1))).unwrap();
-            }
-            let bank = wait(Bank::open(BankConfig::at(&path))).unwrap();
-            let locker = wait(bank.lazy_locker::<Vec<u8>>("l")).unwrap();
-            criterion::black_box(wait(locker.get("k")).unwrap());
-        });
+                wait(bank.close()).unwrap();
+                (dir, path)
+            },
+            |(dir, path)| {
+                let bank = wait(Bank::open(BankConfig::at(&path))).unwrap();
+                let locker = wait(bank.lazy_locker::<Vec<u8>>("l")).unwrap();
+                criterion::black_box(wait(locker.get("k")).unwrap());
+                // Returned so the TempDir is dropped outside the timed region.
+                dir
+            },
+            criterion::BatchSize::PerIteration,
+        );
     });
-    // The same reopen with the create-and-write half hoisted out, because the
-    // combined number is dominated by redb creating and validating a fresh
-    // file twice. This arm is the one that describes an application start:
-    // open an existing bank, open a locker, read a key.
+    // The same open against a file that has already been opened in this
+    // process, so the OS page cache is warm. This arm is the one that
+    // describes a *second* application start on the same bank.
     group.bench_function("redb_warm", |b| {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("bank.redb");
@@ -292,10 +321,8 @@ fn index_open(c: &mut Criterion) {
         let path = dir.path().join("bank.redb");
         {
             let bank = wait(Bank::open(BankConfig::at(&path))).unwrap();
-            let locker = wait(
-                bank.lazy_locker_with::<Vec<u8>>("bulk", cfg(Durability::Eventual)),
-            )
-            .unwrap();
+            let locker =
+                wait(bank.lazy_locker_with::<Vec<u8>>("bulk", cfg(Durability::Eventual))).unwrap();
             fill_lazy(&locker, BULK_N, BULK_BYTES);
             wait(locker.flush()).unwrap();
         }

@@ -124,6 +124,10 @@ async function main() {
 
   if (!doc) throw new Error(failure ?? 'the page never produced a BENCH_JSON document');
 
+  // Stamp the browser on every row so Chrome and Firefox rows coexist.
+  const short = browserName === 'chromium' ? 'chrome' : browserName;
+  for (const s of doc.samples ?? []) s.browser = short;
+
   const file = resultsPath(ROOT, arg('date', null));
   const base = mergeInto(file, doc, {
     machine: arg('machine', null),

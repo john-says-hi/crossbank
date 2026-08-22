@@ -1,0 +1,124 @@
+{
+  "tool": "ci/web-bench",
+  "date_utc": "2026-08-21",
+  "machine": "12th Gen Intel Core i9-12900HK, Linux 7.0.11 x86_64, NVMe",
+  "notes": [
+    "hive_ce_web rows: Hive CE chromium 151.0.7922.108 (/usr/bin/google-chrome), IndexedDB, 20 iterations, median/p99.",
+    "crossbank_indexeddb_web rows: tests/bench_web.rs in chrome, cargo profile --release, ONE un-warmed shot (Criterion does not run in wasm), so p99 is null and these are noisier than the Hive rows. It times with Date.now() (1 ms resolution), so a sub-millisecond per-op loop reads as 0 / null ops_per_s.",
+    "Both lanes drove the SAME browser binary: /usr/bin/google-chrome 151.0.7922.108 (Playwright executablePath for the Hive lane, chromedriver for the wasm lane).",
+    "The *_web_small rows are the only apples-to-apples pair today: tests/bench_web.rs uses 50 settings keys / 200 bulk ops, so bench/hive_ce/web mirrors those shapes exactly. Unifying bench_web.rs onto the large shapes is the remaining Phase 5 item.",
+    "crossbank_indexeddb_web run-to-run spread over three runs: bulk_lazy_put_web_small 33-49 ms, bulk_lazy_get_web_small 16-27 ms. One un-warmed shot is noisy; treat these as an order of magnitude, not a point estimate.",
+    "Neither side is fsync-durable here. IndexedDB durability is browser-dependent (Chromium defaults its transactions to 'relaxed'), so a Hive put and a crossbank put on the web are on comparable footing - unlike the native table, where crossbank commits durably and Hive does not."
+  ],
+  "samples": [
+    {
+      "workload": "big_value_put_get",
+      "backend": "hive_ce_web",
+      "n": 1,
+      "bytes": 8388608,
+      "p50_ms": 14.300000000745058,
+      "p99_ms": 16.900000002235174,
+      "ops_per_s": 69.93006992642643
+    },
+    {
+      "workload": "bulk_lazy_get",
+      "backend": "hive_ce_web",
+      "n": 1000,
+      "bytes": 256,
+      "p50_ms": 69.10000000149012,
+      "p99_ms": 190.80000000074506,
+      "ops_per_s": 14471.78002863148
+    },
+    {
+      "workload": "bulk_lazy_get_web_small",
+      "backend": "crossbank_indexeddb_web",
+      "n": 200,
+      "bytes": 256,
+      "p50_ms": 26,
+      "p99_ms": null,
+      "ops_per_s": 7692.307692307692
+    },
+    {
+      "workload": "bulk_lazy_get_web_small",
+      "backend": "hive_ce_web",
+      "n": 200,
+      "bytes": 256,
+      "p50_ms": 13.799999997019768,
+      "p99_ms": 68.70000000298023,
+      "ops_per_s": 14492.753626318245
+    },
+    {
+      "workload": "bulk_lazy_put",
+      "backend": "hive_ce_web",
+      "n": 2000,
+      "bytes": 512000,
+      "p50_ms": 362.0999999977648,
+      "p99_ms": 669.6000000014901,
+      "ops_per_s": 5523.336095035475
+    },
+    {
+      "workload": "bulk_lazy_put_web_small",
+      "backend": "crossbank_indexeddb_web",
+      "n": 200,
+      "bytes": 51200,
+      "p50_ms": 41,
+      "p99_ms": null,
+      "ops_per_s": 4878.048780487805
+    },
+    {
+      "workload": "bulk_lazy_put_web_small",
+      "backend": "hive_ce_web",
+      "n": 200,
+      "bytes": 51200,
+      "p50_ms": 21,
+      "p99_ms": 445.1000000014901,
+      "ops_per_s": 9523.809523809523
+    },
+    {
+      "workload": "reopen",
+      "backend": "hive_ce_web",
+      "n": 1,
+      "bytes": 1024,
+      "p50_ms": 0.30000000074505806,
+      "p99_ms": 0.9000000022351742,
+      "ops_per_s": 3333.3333250549103
+    },
+    {
+      "workload": "settings_eager",
+      "backend": "hive_ce_web",
+      "n": 1000,
+      "bytes": 1024,
+      "p50_ms": 10.899999998509884,
+      "p99_ms": 20.5,
+      "ops_per_s": 91743.11927859705
+    },
+    {
+      "workload": "settings_eager_web_small",
+      "backend": "crossbank_indexeddb_web",
+      "n": 200,
+      "bytes": 1024,
+      "p50_ms": 0,
+      "p99_ms": null,
+      "ops_per_s": null
+    },
+    {
+      "workload": "settings_eager_web_small",
+      "backend": "hive_ce_web",
+      "n": 200,
+      "bytes": 1024,
+      "p50_ms": 0.09999999776482582,
+      "p99_ms": 0.19999999925494194,
+      "ops_per_s": 2000000.0447034847
+    },
+    {
+      "workload": "txn_batch",
+      "backend": "hive_ce_web",
+      "n": 100,
+      "bytes": 6400,
+      "p50_ms": 4,
+      "p99_ms": 26.5,
+      "ops_per_s": 25000
+    }
+  ],
+  "run": "pre-Phase-3 (2026-08-21, morning): the first Hive-vs-crossbank web comparison, taken BEFORE the Phase 3 performance work landed and before tests/bench_web.rs was unified onto the large shapes. Kept verbatim so the before/after is preserved; the current numbers live in 2026-08-21-web.json."
+}

@@ -9,7 +9,8 @@ you rediscover them the hard way.
 - **Local checkout:** `~/Documents/crossbank`
 - **Owner:** John (`john-says-hi`)
 - **Started:** 2026-08-15 · **Last worked:** 2026-08-20
-- **State:** M0–M5 complete. **M6 (consumer readiness: docs, worked example, publish) is next.**
+- **State:** M0–M5 complete, plus a Phase 3 performance pass (see `PLAN.md` → Performance).
+  **M6 (consumer readiness: docs, worked example, publish) is next.**
 
 ---
 
@@ -282,6 +283,34 @@ Every one of these was hit and paid for already. Do not rediscover them.
 22. **Locker `close()` is async now.** It flushes first and closes even when
     the flush fails, returning the flush error. A bare `locker.close();` is a
     dropped future that does nothing.
+23. **redb 4 has no `Durability::Eventual`.** That variant was removed; the
+    relaxed level is `Durability::None`, and redb's own docs are explicit that
+    such a commit "will not be persisted to disk unless followed by a commit
+    with `Durability::Immediate`". That is not a soft "sometime later" — make
+    `RedbBackend::flush` a no-op and the eventual-durability crash test comes
+    back with *nothing at all* in the file. The empty Immediate commit in
+    `flush` is load-bearing, and the negative control proves it.
+24. **The conformance suite has TWO case lists.** `__for_each_case!` emits the
+    tests and `__count_cases!` feeds the arity guard, and they are separate
+    macros in `crossbank-conformance/src/lib.rs`. Adding a case to only one of
+    them fails the guard with a count that is off by exactly the number you
+    forgot. Add to both, and bump `CASE_COUNT`, and bump every lane in
+    `ci/expected-tests.txt` by the number of backends the suite runs in the
+    browser (two, so +2 per case).
+25. **A test sized against a page constant stops testing when the page grows.**
+    `opening_pages_past_a_single_scan_page` wrote 600 keys against a hard-coded
+    page of 256. The moment backends were allowed to advertise their own page
+    size and redb/memory went to 1024, it stopped crossing a page boundary at
+    all — still green, testing nothing, exactly the shape of trap 2. Size such
+    a fixture **from** `backend.scan_page_size()`, never from a literal.
+26. **A RAM index may over-claim presence, never absence.** The write path uses
+    the key index to skip the read-before-write that finds chunks to GC
+    (`locker::inner::Prior`). A key wrongly believed present costs one wasted
+    read; a key wrongly believed *absent* orphans its chunks permanently. The
+    trap is that a staged `Commit::Deferred` delete removes the key from the
+    index while the record is still stored — so `Resident::prior` refuses to
+    answer at all while anything is staged. `Writer::finish` was a second
+    instance: it stored a fully chunked record and never indexed the key.
 
 ## 8. Where the detail lives
 

@@ -557,6 +557,66 @@ because a bench is not a gate.
 to move `bench_web.rs` onto the large shapes with a warm-up and a median — then every row in
 the first table above gets a crossbank column.
 
+### Phase 3 — performance (2026-08-21, same machine)
+
+Six work items, one commit each, each A/B'd against the commit before it.
+Native numbers are `cargo bench --bench kv`; web numbers are
+`tests/bench_web.rs` in headless Firefox, release, median of three or more
+runs. **Read the web column with the noise in mind** — repeated runs of
+*identical* code on this machine spread 65–104 ms on `bulk_put_200`, so
+anything under about 15% there is not a result.
+
+| # | Change | Metric | Before | After |
+|---|---|---|---|---|
+| 1 | `Durability::Eventual` + explicit `flush` | `settings_eager/redb` | 42.5 µs/op | **1.17 µs/op** |
+| 1 | same | `bulk_lazy_put/redb` (2 000 puts) | 907 ms | **25.5 ms** |
+| 2 | skip read-before-write | `bulk_lazy_put/redb_eventual` | 25.5 ms | 24.9 ms |
+| 2 + 4 | fewer IDB transactions per op | `bulk_put_200` (web) | ~102 ms | **~66 ms** |
+| 3 | no write txn on open, one `get_many` | `reopen/redb_warm` | 1.62 ms | **1.39 ms** |
+| 3 | same | `reopen/redb` (create + reopen) | 10.38 ms | 10.04 ms |
+| 4 | chunk reads via `get_many` | `chunk_sweep/256KiB` (native) | 15.5 ms | 15.3 ms (noise) |
+| 4 | same | `chunked_get_4mib` (web) | ~209 ms | ~190 ms |
+| 5 | kill payload copies | `chunk_sweep/8192KiB` | 22.85 ms | **21.80 ms** |
+| 5 | backend-advertised scan page (256 → 1024) | `index_open/redb` (2 000 keys) | 1.95 ms | 1.89 ms (noise) |
+| 6 | `join_all` the IDB requests in one commit | — | — | **reverted** |
+
+**Item 1 is the whole phase.** Everything else is single digits; the
+durability knob is 36× on both of the shapes Hive was beating us on, and it
+takes crossbank past Hive CE on Hive's own ground — `settings_eager` 1.17 µs
+against Hive's 4.0 µs, `bulk_lazy_put` 25.5 ms against Hive's 27 ms — while
+still committing every write atomically and making it reopen-visible. What is
+traded is only the per-commit `fsync`, and only until `flush`. The default is
+unchanged and still pays for the `fsync` on every put.
+
+**Items 2 and 4 are web items and were measured as such.** Natively they are
+worth almost nothing, because a redb read is a cheap B-tree hit; on IndexedDB
+each one they remove is a whole transaction. `bulk_put_200` at roughly 102 →
+66 ms is the pair landing on the platform that actually ships. They are
+*kept on that evidence*, not on the native numbers, and the native numbers are
+recorded above as the nothing they are.
+
+**Item 5 is kept partly for a reason the clock cannot show.** `codec/api.rs`
+already documents it: on a 32-bit target whose linear memory never shrinks, a
+transient extra copy of a large value raises the process's memory ceiling
+permanently. The 4.6% on an 8 MiB value is the visible half.
+
+**Item 6 was reverted, and this is why.** Issuing a commit's puts and deletes
+and then `join_all`-ing them does work — the `indexed-db` waker accepts it and
+all 112 browser tests pass, so trap 8 is genuinely satisfied when everything
+joined is an IDB request. It simply buys nothing. On a chunked 4 MiB put, one
+commit carrying ~64 puts and the best case this change has, it measured 164 ms
+before and 157 ms after: inside the noise. On the far commoner single-op
+commit it was measurably *worse* — `bulk_put_200` went 68 → 90 ms — because
+every op now costs a `Box::pin` for a batch of one. Paying a boxed allocation
+per write, plus an argument about IndexedDB request ordering that has to stay
+true forever, to buy nothing is a bad trade, so it went back.
+
+The general lesson is worth more than the item: **crossbank's IndexedDB cost
+is transactions, not requests within a transaction.** Items 2 and 4 removed
+transactions and showed up plainly. Item 6 reshuffled requests inside one and
+did not. A future web optimisation should be aimed at the former.
+
+
 ---
 
 ## Open questions
@@ -632,6 +692,29 @@ a cost we have chosen to carry. None of them loses data.
   always consistent (the backend serialises the commits); it is the *resident*
   copies that may disagree with it until a reopen. A key two tabs genuinely
   contend for belongs in a lazy locker, which reads through.
+- **`Durability::Eventual` is a native-only trade.** IndexedDB exposes no
+  fsync lever at all, so an `Eventual` locker on the web behaves exactly like
+  an `Immediate` one and the setting costs nothing there. That keeps the
+  configuration portable rather than platform-specific, but it does mean the
+  speed-up is native. `IndexedDbBackend` deliberately does not override
+  `commit_with`: a backend that ignores the knob is more durable than asked,
+  never less.
+- **An `Eventual` locker that is never flushed can lose its last writes to a
+  power cut.** Not to a crash — the commit is atomic and reopen-visible the
+  moment it returns — but the `fsync` is deferred until `flush`. This is the
+  whole point of the knob, and it is why the default is `Immediate` and why
+  `flush` on an `Eventual` locker forces the backend fsync as well as
+  committing whatever is staged. The consumer's duty is exactly the one
+  `Commit::Deferred` already imposes, and one `flush` discharges both.
+- **The write path's fast path gives up on doubt rather than tracking harder.**
+  `put` and `delete` skip the read that finds chunks to GC when the RAM index
+  proves the key absent, or proves the record inline. Both proofs are refused
+  outright while anything is staged, and the inline marker is dropped
+  wholesale on a clear, a transaction, a close, and per key on any cross-tab
+  change. A `transact` therefore always takes the slow path. That leaves reads
+  on the table, deliberately: the failure mode of being wrong here is orphaned
+  chunks that nothing will ever reclaim, and one wasted read is a much better
+  price than a leak.
 - **A key written twice in one transaction is collapsed.** Only the last write
   per key is committed (and everything before a `clear` is dropped), so the
   eager size check applies to what actually lands rather than to every

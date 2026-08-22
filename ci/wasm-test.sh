@@ -119,7 +119,11 @@ trap 'rm -f "${OUT}"' EXIT
 
 echo "==> lane=${LANE} browser=${BROWSER}"
 set +e
-cargo "${TOOLCHAIN[@]}" "${CONFIG[@]}" test \
+# macOS runners ship bash 3.2, where expanding an EMPTY array as "${arr[@]}"
+# under `set -u` is an unbound-variable error (bash >= 4.4 tolerates it). Both
+# arrays below are empty on the plain lane, so every empty-able array in this
+# repo's ci scripts must use the ${arr[@]+"${arr[@]}"} form instead.
+cargo ${TOOLCHAIN[@]+"${TOOLCHAIN[@]}"} ${CONFIG[@]+"${CONFIG[@]}"} test \
     --target wasm32-unknown-unknown "$@" 2>&1 | tee "${OUT}"
 status="${PIPESTATUS[0]}"
 set -e

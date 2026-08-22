@@ -504,6 +504,18 @@ Every one of these was hit and paid for already. Do not rediscover them.
     backend decorator that suspends in `scan`, because the memory backend's
     futures are all ready on their first poll and cannot produce the window at
     all; the browser needs no such help (`tests/web_shared_handles.rs`).
+40. **macOS runners are bash 3.2, and an empty array under `set -u` is an
+    unbound variable there.** Bash 4.4+ tolerates `"${arr[@]}"` on an empty
+    array; 3.2 aborts with *"TOOLCHAIN[@]: unbound variable"*. The Safari
+    lane's first-ever run died on exactly that, in `ci/wasm-test.sh`, before a
+    single test executed — every other lane runs on Ubuntu's bash 5, so it had
+    never shown. Use `${arr[@]+"${arr[@]}"}` for every empty-able array in
+    `ci/*.sh` (`wasm-test.sh` and `bench.sh` are converted; `web-e2e.sh`
+    already was), keep the shebang on stock `bash`, and stay off bash-4-only
+    features — `declare -A`, `${var,,}`/`${var^^}`, `mapfile`/`readarray`,
+    `&>>`, negative array indices, `|&`. Worth naming the other half of this:
+    it is also what it took to see the Safari lane **red for the first time**,
+    which by trap 3 is the only way it becomes trustworthy green.
 
 ## 8. Where the detail lives
 

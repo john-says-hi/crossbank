@@ -44,8 +44,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Empty arrays are expanded with the ${arr[@]+"${arr[@]}"} form throughout:
+# macOS bash 3.2 treats a bare "${arr[@]}" on an empty array under `set -u` as
+# an unbound variable. See RESUME_HERE.md trap 40.
 if [ "${NATIVE}" = 1 ]; then
-    cargo bench --bench kv "${CARGO_ARGS[@]}"
+    cargo bench --bench kv ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"}
 fi
 
 if [ "${HIVE:-}" = 1 ] || [ "${WEB:-}" = 1 ]; then
@@ -74,7 +77,7 @@ if [ "${HIVE:-}" = 1 ] && [ "${WEB:-}" = 1 ]; then
         PW_ARGS+=(--chrome-path "${CROSSBANK_CHROME:-/usr/bin/google-chrome}")
     fi
     "${NODE}" "${HERE}/web-bench/run.mjs" \
-        --browser "${PW_BROWSER}" "${PW_ARGS[@]}" "${BENCH_ARGS[@]}" "${HIVE_ARGS[@]}"
+        --browser "${PW_BROWSER}" ${PW_ARGS[@]+"${PW_ARGS[@]}"} ${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"} ${HIVE_ARGS[@]+"${HIVE_ARGS[@]}"}
 fi
 
 # ---- crossbank's own web timings (tests/bench_web.rs) -----------------------
@@ -109,7 +112,7 @@ if [ "${WEB:-}" = 1 ]; then
     OUT="$(mktemp)"
     trap 'rm -f "${OUT}"' EXIT
     set +e
-    cargo test "${WASM_PROFILE[@]}" --target wasm32-unknown-unknown --test bench_web -- --include-ignored --nocapture \
+    cargo test ${WASM_PROFILE[@]+"${WASM_PROFILE[@]}"} --target wasm32-unknown-unknown --test bench_web -- --include-ignored --nocapture \
         2>&1 | tee "${OUT}"
     status="${PIPESTATUS[0]}"
     set -e
@@ -119,7 +122,7 @@ if [ "${WEB:-}" = 1 ]; then
     # recording even if the runner lost the browser on the way out.
     if ! "${NODE}" "${HERE}/web-bench/merge-crossbank.mjs" \
         --browser "${BROWSER}" --profile "${WASM_PROFILE[*]:-debug}" \
-        "${BENCH_ARGS[@]}" < "${OUT}"; then
+        ${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"} < "${OUT}"; then
         echo "FAIL: no bench_web JSON in the run (cargo test exited ${status})" >&2
         exit 1
     fi

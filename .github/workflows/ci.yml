@@ -4,6 +4,12 @@ on:
   pull_request:
   push:
     branches: [master]
+  # The nightly-only jobs below (scale) are gated on these two events, so a
+  # pull request never pays for them. Everything else runs on all four, which
+  # makes the nightly a genuine drift check against a moving toolchain.
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -215,6 +221,29 @@ jobs:
       # --safari unsets CHROMEDRIVER/GECKODRIVER (the runner probes
       # geckodriver first) and asserts the same expected test count.
       - run: ci/wasm-test.sh --plain --safari
+
+  # 100k keys, written and read back. Nightly only: it takes minutes, and it
+  # asserts behaviour that only breaks at size rather than a duration, so it
+  # has nothing to say about a given pull request. Release profile because a
+  # debug build spends the whole run in the codec.
+  scale:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: scale
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # Without CROSSBANK_SCALE=1 the test prints why it skipped and passes,
+      # which is exactly what every other lane sees.
+      - name: 100k keys
+        env:
+          CROSSBANK_SCALE: '1'
+        run: cargo nextest run --release --all-features -E 'binary(scale)' --no-capture
 
   # Single required status check for branch protection.
   ci-green:

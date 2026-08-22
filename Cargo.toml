@@ -15,6 +15,14 @@ categories = ["database-implementations", "wasm"]
 # Flipped on at M6. Guards against an accidental early publish.
 publish = false
 
+[features]
+# Opt-in, and OFF everywhere by default. Its only job is to compile the wasm
+# half of tests/scale.rs into a lane, which the nightly scale job does
+# explicitly. It must stay a feature rather than an env var: `cfg` cannot read
+# one without a build script, and `RUSTFLAGS --cfg` is forbidden (see
+# ci/guard-rustflags.sh).
+scale = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 # Compact and stable, but deliberately NOT self-describing — which is why a

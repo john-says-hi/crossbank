@@ -22,7 +22,28 @@ categories = ["database-implementations", "wasm"]
 # feature, which only the dev-dependency turns on. Publishing strips
 # dev-dependencies, so the packaged bin would not compile — and nobody
 # installing crossbank wants a binary whose whole job is to die.
-exclude = ["bench/", "ci/", ".github/", "tests/web_e2e/", "src/bin/"]
+# `src/bin/` and `tests/crash_recovery.rs` are a PAIR and must be excluded
+# together. The test launches the helper binary through
+# `env!("CARGO_BIN_EXE_crash_child")`, so shipping the test without the binary
+# leaves the packaged crate unable to even compile its test suite; shipping the
+# binary without dev-dependencies fails `cargo publish --dry-run` (it needs
+# `futures`' `executor` feature, which only the dev-dependency turns on).
+exclude = [
+    "bench/",
+    "ci/",
+    ".github/",
+    "tests/web_e2e/",
+    "src/bin/",
+    "tests/crash_recovery.rs",
+    # Same wall, different helper: these three are nothing but a call into the
+    # `crossbank-conformance` macro, and that crate is a path dev-dependency
+    # that publishing strips. Shipping them leaves the packaged crate unable to
+    # compile its own test suite. The suite still runs from this repo, which is
+    # the only place the harness exists.
+    "tests/conformance_memory.rs",
+    "tests/conformance_redb.rs",
+    "tests/conformance_indexeddb.rs",
+]
 
 [features]
 # Opt-in, and OFF everywhere by default. Its only job is to compile the wasm

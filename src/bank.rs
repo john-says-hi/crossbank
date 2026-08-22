@@ -220,6 +220,16 @@ pub struct Bank {
     chain: Arc<FilterChain>,
     /// Name to id, cached so opening a locker twice does not re-read `meta`.
     registry: Mutex<HashMap<String, LockerId>>,
+    /// Every per-locker filter chain this bank knows, by chain id.
+    ///
+    /// Bank-level maintenance — [`Bank::verify`], [`Bank::quarantine`],
+    /// [`Bank::locker_bytes`] — reads records without a locker handle, so it
+    /// has no config to take a chain from. It resolves the chain from the
+    /// `chain::{id}` meta record and looks the id up here. Filled
+    /// automatically whenever a locker is opened with its own chain, and
+    /// fillable ahead of time with [`Bank::register_chain`] for maintenance
+    /// that runs before any such open.
+    chains: Mutex<HashMap<u8, Arc<FilterChain>>>,
     /// Cloned into every [`crate::BankHandle`].
     job_sender: mpsc::Sender<Job>,
     /// Taken exactly once, by `into_service`. A second service would silently
@@ -406,6 +416,20 @@ impl Bank {
     }
 
     /// Open a bank over an already-constructed backend.
+    ///
+    /// **One `Bank` per backend instance.** Two banks over one backend are not
+    /// two views of a store, they are two uncoordinated writers: each keeps
+    /// its own open-locker registry, so neither can see that the other holds a
+    /// handle on a name. That defeats the `name_shared` flag — the thing that stops a stale RAM index proving a
+    /// key absent and orphaning its chunks forever (see `PLAN.md`, "Known
+    /// limitations") — and it defeats the `Commit::Deferred` single-handle
+    /// guard, `delete_locker`'s and `quarantine`'s "is it open?" refusals, and
+    /// `flush_all`'s claim to cover every open locker.
+    ///
+    /// Share the one `Bank` (it is `Sync`, and [`crate::BankHandle`] is
+    /// cheap), rather than reopening over the same backend `Arc`. Separate
+    /// processes or tabs are a different question, and are what
+    /// [`crate::coherence`] is for.
     pub async fn with_backend(backend: Arc<dyn Backend>) -> Result<Self> {
         Self::with_backend_and_chain(backend, default_chain()).await
     }
@@ -439,6 +463,7 @@ impl Bank {
             backend,
             chain: Arc::new(chain),
             registry: Mutex::new(HashMap::new()),
+            chains: Mutex::new(HashMap::new()),
             job_sender,
             job_receiver: Mutex::new(Some(job_receiver)),
             open_lockers: Mutex::new(HashMap::new()),
@@ -631,16 +656,92 @@ impl Bank {
 
     /// The chain a locker opened with `config` reads and writes through.
     fn chain_for(&self, config: &LockerConfig) -> Arc<FilterChain> {
-        config.chain.clone().unwrap_or_else(|| self.chain.clone())
+        match config.chain.clone() {
+            Some(chain) => {
+                self.register_chain(chain.clone());
+                chain
+            }
+            None => self.chain.clone(),
+        }
+    }
+
+    /// Teach the bank a filter chain so maintenance can find it by id.
+    ///
+    /// [`Bank::verify`], [`Bank::quarantine`], [`Bank::locker_bytes`] and
+    /// [`Bank::delete_locker`] read records with no locker handle and so no
+    /// config: they resolve each locker's chain from its `chain::{id}` meta
+    /// record and look the id up in this registry. Opening a locker with
+    /// [`LockerConfig::with_chain`] registers it for you, so this is only
+    /// needed to verify a locker that has not been opened in this process.
+    ///
+    /// Last registration of an id wins. The bank chain is always known and
+    /// never needs registering.
+    pub fn register_chain(&self, chain: Arc<FilterChain>) {
+        if let Ok(mut guard) = self.chains.lock() {
+            guard.insert(chain.id(), chain);
+        }
+    }
+
+    /// The chain id a locker's records were sealed with, if one was recorded.
+    ///
+    /// `None` means the store predates the `chain::` record, which is
+    /// "written under whatever the bank chain was" — see [`Bank::bind_chain`].
+    async fn stored_chain_id(&self, id: LockerId) -> Result<Option<u8>> {
+        match self.backend.get(Table::Meta, &chain_key(id)).await? {
+            Some(raw) => {
+                let [stored] = raw[..] else {
+                    return Err(Error::Corrupt(
+                        "a locker's filter chain id is not a single byte".into(),
+                    ));
+                };
+                Ok(Some(stored))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Resolve the chain one locker's records are sealed with.
+    ///
+    /// `Ok(None)` is "this locker names a chain id nothing in this process
+    /// knows". That is not corruption — it is a locker written by a build, or
+    /// a caller, that had a chain this one has not been told about. Reading
+    /// its payloads is impossible; deleting them is still perfectly possible,
+    /// which is why the callers that only move bytes around fall back to the
+    /// bank chain and only [`Bank::verify`] refuses.
+    async fn locker_chain(&self, id: LockerId) -> Result<Option<Arc<FilterChain>>> {
+        let Some(stored) = self.stored_chain_id(id).await? else {
+            return Ok(Some(self.chain.clone()));
+        };
+        if stored == self.chain.id() {
+            return Ok(Some(self.chain.clone()));
+        }
+        Ok(self
+            .chains
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(&stored).cloned()))
+    }
+
+    /// As [`Bank::locker_chain`], falling back to the bank chain for an
+    /// unknown id. For maintenance that never opens a payload.
+    async fn locker_chain_or_bank(&self, id: LockerId) -> Result<Arc<FilterChain>> {
+        Ok(self
+            .locker_chain(id)
+            .await?
+            .unwrap_or_else(|| self.chain.clone()))
     }
 
     /// Resolve the id and bind both the value type and the filter chain, so
     /// reopening a locker under a different `T` — or a different chain — is
     /// caught rather than silently mis-decoded.
     async fn prepare<T>(&self, name: &str, chain: &FilterChain) -> Result<LockerId> {
+        // Asked *before* `locker_id`, which registers the name as a side
+        // effect: "did this locker already have data?" is the question
+        // `bind_chain` needs, and a moment later the answer is always yes.
+        let pre_existing = self.locker_exists(name).await?;
         let id = self.locker_id(name).await?;
         self.bind_schema(id, &type_tag::<T>()).await?;
-        self.bind_chain(id, chain).await?;
+        self.bind_chain(id, chain, pre_existing).await?;
         Ok(id)
     }
 
@@ -655,7 +756,21 @@ impl Bank {
     /// not a mismatch — it was written with whatever the bank chain was, which
     /// is what an open with no per-locker chain still uses — so the id is
     /// written on this open and enforced from the next one.
-    async fn bind_chain(&self, id: LockerId, chain: &FilterChain) -> Result<()> {
+    ///
+    /// `pre_existing` is what makes that safe. A missing record on a name that
+    /// *already held data* means exactly one thing: the data was sealed with
+    /// the bank chain by a build that had no per-locker chains. Adopting the
+    /// requested chain there would stamp a lie into `meta` and brick the
+    /// locker — every stored value read through the wrong inverse transform,
+    /// for good. So a pre-existing name persists the **bank** chain id, and an
+    /// open that asked for anything else is refused. Only a genuinely fresh
+    /// name adopts the chain it was opened with.
+    async fn bind_chain(
+        &self,
+        id: LockerId,
+        chain: &FilterChain,
+        pre_existing: bool,
+    ) -> Result<()> {
         let key = chain_key(id);
         match self.backend.get(Table::Meta, &key).await? {
             Some(raw) => {
@@ -679,11 +794,32 @@ impl Bank {
                 Ok(())
             }
             None => {
+                let adopted = if pre_existing {
+                    if chain.id() != self.chain.id() {
+                        return Err(Error::SchemaMismatch {
+                            stored: format!(
+                                "no filter chain record; this locker predates per-locker \
+                                 chains, so its values were sealed with the bank chain \
+                                 ({})",
+                                self.chain.describe()
+                            ),
+                            requested: format!(
+                                "{} — reopen it under the bank chain, which records the \
+                                 chain id from then on, or copy its values into a new \
+                                 locker name",
+                                chain.describe()
+                            ),
+                        });
+                    }
+                    self.chain.id()
+                } else {
+                    chain.id()
+                };
                 self.backend
                     .commit(vec![Op::Put {
                         table: Table::Meta,
                         key,
-                        value: vec![chain.id()],
+                        value: vec![adopted],
                     }])
                     .await
             }
@@ -853,11 +989,16 @@ impl Bank {
     /// lockers already own. It has its own watchers, so nothing it does is
     /// announced to a live locker's subscribers — deleting a locker out from
     /// under an open handle is refused instead.
-    fn maintenance_inner(&self, id: LockerId, name: &str) -> Arc<Inner> {
+    /// `chain` must be the locker's own chain, resolved with
+    /// [`Bank::locker_chain`] — **not** the bank chain. A maintenance handle
+    /// built over the wrong chain reads every record of a per-locker-chain
+    /// locker as unopenable, which makes `verify` report the whole locker as
+    /// corrupt and `quarantine` then delete all of it.
+    fn maintenance_inner(&self, id: LockerId, name: &str, chain: Arc<FilterChain>) -> Arc<Inner> {
         Arc::new(Inner {
             write_lock: futures::lock::Mutex::new(()),
             backend: self.backend.clone(),
-            chain: self.chain.clone(),
+            chain,
             id,
             name: name.to_string(),
             config: LockerConfig::default(),
@@ -899,7 +1040,8 @@ impl Bank {
             return Ok(0);
         }
         let id = self.locker_id(name).await?;
-        let inner = self.maintenance_inner(id, name);
+        let chain = self.locker_chain_or_bank(id).await?;
+        let inner = self.maintenance_inner(id, name, chain);
 
         let mut total: u64 = 0;
         let mut chunked: Vec<u64> = Vec::new();
@@ -1005,7 +1147,24 @@ impl Bank {
             return Ok(Vec::new());
         }
         let id = self.locker_id(name).await?;
-        let inner = self.maintenance_inner(id, name);
+        // The locker's own chain, never the bank's. Reading these records
+        // through the wrong chain would report every single key as corrupt,
+        // and the documented next step is to hand that list to
+        // `quarantine` — which would delete the entire locker.
+        let Some(chain) = self.locker_chain(id).await? else {
+            let stored = self.stored_chain_id(id).await?;
+            return Err(Error::SchemaMismatch {
+                stored: format!(
+                    "filter chain {}; nothing in this process can open it",
+                    stored.map(|s| s.to_string()).unwrap_or_else(|| "?".into())
+                ),
+                requested: format!(
+                    "locker {name:?} cannot be verified without its chain — register it \
+                     with Bank::register_chain, or open the locker with it first"
+                ),
+            });
+        };
+        let inner = self.maintenance_inner(id, name, chain);
 
         let mut bad: Vec<Vec<u8>> = Vec::new();
         let mut chunked: Vec<(Vec<u8>, crate::locker::chunk::ChunkPointer)> = Vec::new();
@@ -1026,7 +1185,7 @@ impl Bank {
                             Ok(pointer) => chunked.push((key, pointer)),
                             Err(_) => bad.push(key),
                         }
-                    } else if self.chain.open(&raw).is_err() {
+                    } else if inner.chain.open(&raw).is_err() {
                         bad.push(key);
                     }
                     Ok(())
@@ -1069,7 +1228,8 @@ impl Bank {
         }
 
         let id = self.locker_id(name).await?;
-        let inner = self.maintenance_inner(id, name);
+        let chain = self.locker_chain_or_bank(id).await?;
+        let inner = self.maintenance_inner(id, name, chain);
 
         let mut ops = Vec::new();
         let mut removed = 0usize;
@@ -1123,7 +1283,8 @@ impl Bank {
         }
 
         let id = self.locker_id(name).await?;
-        let inner = self.maintenance_inner(id, name);
+        let chain = self.locker_chain_or_bank(id).await?;
+        let inner = self.maintenance_inner(id, name, chain);
 
         // The chunk GC ops and the record range deletion, exactly as `clear`
         // builds them, plus the two meta keys.

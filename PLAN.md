@@ -816,6 +816,37 @@ a cost we have chosen to carry. None of them loses data.
   on the table, deliberately: the failure mode of being wrong here is orphaned
   chunks that nothing will ever reclaim, and one wasted read is a much better
   price than a leak.
+- **One `Bank` per backend instance; two is not supported.** `Bank::with_backend`
+  will happily build a second bank over the same `Arc<dyn Backend>`, and the
+  two share no state at all: separate open-locker registries, separate name-id
+  caches, separate resident lists. So neither can see that the other holds a
+  handle on a name, which defeats `name_shared` (the flag that stops a stale
+  RAM index proving a key absent and orphaning its chunks forever), the
+  `Commit::Deferred` single-handle guard, the "is it open?" refusals in
+  `delete_locker` and `quarantine`, and `flush_all`'s claim to cover every
+  open locker. This is a documented constraint rather than an enforced one:
+  the backend `Arc` is the caller's, and a bank cannot tell whether another
+  bank shares it without a registry that would outlive both. Share the one
+  `Bank` — it is `Sync`, and `BankHandle` is cheap. Separate processes or tabs
+  are a different question, and are what coherence is for.
+- **Bank maintenance needs to be told about per-locker filter chains.**
+  `verify`, `quarantine`, `locker_bytes` and `delete_locker` read records with
+  no locker handle and so no config, and resolve each locker's chain from its
+  `chain::{id}` meta record. A locker opened in this process registers its
+  chain automatically; one that has not been opened here names a chain id the
+  bank cannot resolve. Deletion still works (it moves bytes and never opens
+  them), but `verify` refuses with `Error::SchemaMismatch` rather than
+  reporting every key as corrupt — that list is documented as `quarantine`
+  input, so a wrong answer there is a whole-locker delete. `Bank::register_chain`
+  is the way to hand it the chain up front.
+- **A locker written before per-locker chains existed can never adopt one.**
+  Such a locker has no `chain::{id}` record and its bytes were sealed with the
+  bank chain, so the first open under a *different* chain is refused
+  (`Error::SchemaMismatch`) rather than recorded; only the bank chain open
+  writes the id. There is no way to tell "legacy, sealed with the bank chain"
+  from "fresh name" other than whether the name already existed, and guessing
+  wrong stamps a lie into `meta` that bricks every stored value. Copy the
+  values into a new locker name to move a locker onto its own chain.
 - **A key written twice in one transaction is collapsed.** Only the last write
   per key is committed (and everything before a `clear` is dropped), so the
   eager size check applies to what actually lands rather than to every

@@ -11,11 +11,38 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crossbank::backend::{Backend, MemoryBackend, Op, Table};
 use crossbank::codec::{FilterChain, Lz4};
 use crossbank::{Bank, Error, LockerConfig};
+
+/// Records the largest single allocation the process has made since the last
+/// reset, so a test can assert that nothing reserved a value's *claimed* size
+/// before reading it. A peak counter would be perturbed by anything else
+/// running; the largest single request is not, because nothing else in this
+/// suite asks for anywhere near a megabyte at once.
+struct Watched;
+
+static LARGEST: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl std::alloc::GlobalAlloc for Watched {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new: usize) -> *mut u8 {
+        LARGEST.fetch_max(new, Ordering::Relaxed);
+        unsafe { std::alloc::System.realloc(ptr, layout, new) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Watched = Watched;
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     futures::executor::block_on(f)
@@ -231,4 +258,259 @@ async fn total_chunk_bytes(backend: &dyn Backend) -> u64 {
         .filter_map(|(_, v)| v.as_ref())
         .map(|v| v.len() as u64)
         .sum()
+}
+
+// ---- bank maintenance under a per-locker chain -------------------------
+
+/// Bank maintenance reads records with no locker handle, so it has no config
+/// to take a chain from. If it reaches for the *bank* chain, every record of
+/// an LZ4 locker fails to open and `verify` reports the whole locker as
+/// corrupt — and `verify`'s own doc example feeds that list straight to
+/// `quarantine`, which deletes every key in it. A survey that erases the
+/// thing it surveys is the worst failure this crate has.
+#[test]
+fn verify_reads_a_per_locker_chain_through_that_chain() {
+    block_on(async {
+        let backend = Arc::new(MemoryBackend::new());
+        let bank = Bank::with_backend(backend.clone()).await.expect("bank");
+
+        let candles = bank
+            .lazy_locker_with::<Vec<u8>>(
+                "candles",
+                LockerConfig::default()
+                    .with_chain(lz4_chain())
+                    .with_chunk_size(4096),
+            )
+            .await
+            .expect("open");
+        for n in 0..50u8 {
+            candles
+                .put(&format!("k{n}"), &vec![n; 64])
+                .await
+                .expect("put");
+        }
+        // One value big enough to be chunked, so the chunk read path is
+        // covered too and not just the inline one.
+        candles
+            .put("chunked", &vec![9u8; 40_000])
+            .await
+            .expect("put chunked");
+        candles.close().await.expect("close");
+
+        assert!(
+            bank.verify("candles").await.expect("verify").is_empty(),
+            "a healthy LZ4 locker must verify clean; a non-empty list here is \
+             the bank chain being used to open records it never sealed"
+        );
+        assert_eq!(
+            bank.quarantine("candles", &[]).await.expect("quarantine"),
+            0,
+            "quarantining nothing must remove nothing"
+        );
+
+        // And the data really is all still there.
+        let reopened = bank
+            .lazy_locker_with::<Vec<u8>>("candles", LockerConfig::default().with_chain(lz4_chain()))
+            .await
+            .expect("reopen");
+        assert_eq!(reopened.len(), 51, "verify must not have cost any keys");
+        assert_eq!(
+            reopened.get("chunked").await.expect("read"),
+            Some(vec![9u8; 40_000])
+        );
+        reopened.close().await.expect("close");
+
+        // Now break exactly one record. `verify` must name it and nothing
+        // else — the negative control for the assertion above, which would
+        // pass just as happily if `verify` always returned an empty list.
+        backend
+            .commit(vec![Op::Put {
+                table: Table::Records,
+                key: crossbank::key::encode(locker_id(&bank, "candles").await, "k7"),
+                value: b"not an envelope".to_vec(),
+            }])
+            .await
+            .expect("corrupt one record");
+
+        let bad = bank.verify("candles").await.expect("verify");
+        assert_eq!(
+            bad,
+            vec![b"k7".to_vec()],
+            "verify must report exactly the record that was broken"
+        );
+    });
+}
+
+/// A locker whose recorded chain id names nothing this process knows must not
+/// be surveyed at all. Answering "every key is bad" would be a lie that
+/// `quarantine` acts on; the honest answer is that the locker cannot be read
+/// from here. Deleting it is still allowed — that needs no chain.
+#[test]
+fn verify_refuses_a_locker_whose_chain_is_unknown() {
+    block_on(async {
+        let backend = Arc::new(MemoryBackend::new());
+        {
+            let bank = Bank::with_backend(backend.clone()).await.expect("bank");
+            let locker = bank
+                .lazy_locker_with::<String>(
+                    "notes",
+                    LockerConfig::default().with_chain(lz4_chain()),
+                )
+                .await
+                .expect("open");
+            locker.put("k", &"v".to_string()).await.expect("put");
+            locker.close().await.expect("close");
+        }
+
+        // A fresh bank that has never been told about chain 7.
+        let bank = Bank::with_backend(backend.clone()).await.expect("reopen");
+        let err = bank
+            .verify("notes")
+            .await
+            .expect_err("an unknown chain cannot be verified");
+        match err {
+            Error::SchemaMismatch { stored, requested } => {
+                assert!(
+                    stored.contains("filter chain 7"),
+                    "the message must name the chain the locker was written with, \
+                     got {stored:?}"
+                );
+                assert!(
+                    requested.contains("register_chain"),
+                    "and must say how to fix it, got {requested:?}"
+                );
+            }
+            other => panic!("expected a schema mismatch, got {other:?}"),
+        }
+
+        // Told about the chain, the same bank verifies it clean.
+        bank.register_chain(lz4_chain());
+        assert!(bank.verify("notes").await.expect("verify").is_empty());
+
+        // And an unreadable locker is still deletable.
+        assert!(bank.delete_locker("notes").await.expect("delete"));
+    });
+}
+
+/// A locker written by a build that had no per-locker chains has no `chain::`
+/// record, and its bytes were sealed with the bank chain. Adopting whatever
+/// chain the caller asked for would stamp that lie into `meta` and brick the
+/// locker permanently.
+#[test]
+fn a_pre_chain_locker_cannot_be_adopted_by_a_new_chain() {
+    block_on(async {
+        let backend = Arc::new(MemoryBackend::new());
+        {
+            let bank = Bank::with_backend(backend.clone()).await.expect("bank");
+            let locker = bank.lazy_locker::<String>("legacy").await.expect("open");
+            locker.put("k", &"v".to_string()).await.expect("put");
+            locker.close().await.expect("close");
+        }
+        assert!(strip_chain_records(backend.as_ref()).await > 0);
+
+        let bank = Bank::with_backend(backend.clone()).await.expect("reopen");
+        let err = bank
+            .lazy_locker_with::<String>("legacy", LockerConfig::default().with_chain(lz4_chain()))
+            .await
+            .expect_err("a pre-chain locker must not adopt a new chain");
+        match err {
+            Error::SchemaMismatch { stored, requested } => {
+                assert!(
+                    stored.contains("bank chain"),
+                    "the message must explain what the bytes were sealed with, \
+                     got {stored:?}"
+                );
+                assert!(
+                    requested.contains("chain 7"),
+                    "and must name what was asked for, got {requested:?}"
+                );
+            }
+            other => panic!("expected a schema mismatch, got {other:?}"),
+        }
+
+        // Nothing was written, so the refusal is repeatable rather than a
+        // one-shot that corrupts on the second try.
+        assert!(bank
+            .lazy_locker_with::<String>("legacy", LockerConfig::default().with_chain(lz4_chain()))
+            .await
+            .is_err());
+
+        // The bank chain still opens it, and *that* open records the id.
+        let locker = bank
+            .lazy_locker::<String>("legacy")
+            .await
+            .expect("the bank chain is what these bytes were sealed with");
+        assert_eq!(locker.get("k").await.expect("read"), Some("v".to_string()));
+        locker.close().await.expect("close");
+        assert!(
+            scan_meta(backend.as_ref())
+                .await
+                .iter()
+                .any(|(key, _)| key.starts_with(b"chain::")),
+            "the bank chain id must now be recorded"
+        );
+    });
+}
+
+/// A chunk pointer is stored data, so its `total_len` is an attacker's — or a
+/// corrupted disk's — number. Reserving from it up front asks for up to 256
+/// MiB, and a wasm release build is `panic=abort`, so a failed allocation is
+/// an unrecoverable app kill rather than an error anyone can catch.
+#[test]
+fn a_pointer_claiming_far_more_than_it_stores_fails_without_reserving_it() {
+    block_on(async {
+        let backend = Arc::new(MemoryBackend::new());
+        let bank = Bank::with_backend(backend.clone()).await.expect("bank");
+        let locker = bank.lazy_locker::<Vec<u8>>("blobs").await.expect("open");
+        locker.put("k", &vec![1u8; 8]).await.expect("put");
+        locker.close().await.expect("close");
+        let id = locker_id(&bank, "blobs").await;
+
+        // 200 MiB claimed, one chunk actually present.
+        let value_id = 99u64;
+        let pointer = crossbank::locker::chunk::ChunkPointer {
+            value_id,
+            n_chunks: 1,
+            total_len: 200 * 1024 * 1024,
+            flags: crossbank::locker::chunk::FLAG_POSTCARD,
+        };
+        backend
+            .commit(vec![
+                Op::Put {
+                    table: Table::Chunks,
+                    key: crossbank::locker::chunk::chunk_key(value_id, 0),
+                    value: bank.chain().seal(vec![1u8; 8]).expect("seal"),
+                },
+                Op::Put {
+                    table: Table::Records,
+                    key: crossbank::key::encode(id, "k"),
+                    value: pointer.encode(),
+                },
+            ])
+            .await
+            .expect("plant the pointer");
+
+        let locker = bank.lazy_locker::<Vec<u8>>("blobs").await.expect("reopen");
+        LARGEST.store(0, Ordering::Relaxed);
+        let err = locker
+            .get("k")
+            .await
+            .expect_err("a pointer that over-claims must be corrupt, not fatal");
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "expected a corruption error, got {err:?}"
+        );
+        // The negative control for the fix: an up-front
+        // `Vec::with_capacity(total_len)` makes this 200 MiB in one request.
+        let largest = LARGEST.load(Ordering::Relaxed);
+        assert!(
+            largest < 1024 * 1024,
+            "reading an over-claiming pointer asked for {largest} bytes in one \
+             allocation; nothing may be reserved from a number read off storage"
+        );
+    });
+}
+
+async fn locker_id(bank: &Bank, name: &str) -> u32 {
+    bank.locker_id(name).await.expect("locker id")
 }

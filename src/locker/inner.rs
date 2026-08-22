@@ -364,9 +364,17 @@ impl Inner {
     /// deliberately keeps fetching a chunk at a time, because holding the
     /// value's worth of pieces at once is precisely what it exists to avoid.
     pub(crate) async fn read_chunks(&self, pointer: &ChunkPointer) -> Result<Vec<u8>> {
-        // `total_len` is bounded by `ChunkPointer::parse`, so this capacity is
-        // as large as a legal value and no larger.
-        let mut out = Vec::with_capacity(pointer.total_len as usize);
+        // Never reserved from `total_len` up front. `parse` bounds it at
+        // MAX_DECODED_BYTES, which is 256 MiB — a legal ceiling, not a
+        // plausible size — so a corrupt pointer claiming it asks for a quarter
+        // of a gigabyte before a single chunk has been read, and a wasm
+        // release build is `panic=abort`, so an allocation failure there is an
+        // unrecoverable app kill rather than an error. The capacity grows one
+        // fetched group at a time instead, which costs a few reallocations on
+        // a genuinely large value and costs a corrupt one nothing at all. The
+        // final `total_len` check below is what still holds the pointer to its
+        // claim.
+        let mut out: Vec<u8> = Vec::new();
         let mut seq = 0u32;
         while seq < pointer.n_chunks {
             // Fixed-size groups rather than one `get_many` over every chunk:
@@ -387,7 +395,19 @@ impl Inner {
                     ))
                 })?;
                 let piece = self.chain.open(&sealed)?;
+                // Reserve for what is actually in hand, and never past what
+                // the pointer claims: a run of oversized chunks cannot grow
+                // the buffer beyond a legal value's length.
+                let room = pointer.total_len.saturating_sub(out.len() as u64);
+                out.reserve(piece.len().min(room as usize));
                 out.extend_from_slice(&piece);
+                if out.len() as u64 > pointer.total_len {
+                    return Err(Error::Corrupt(format!(
+                        "chunked value declared {} bytes and has already reassembled {}",
+                        pointer.total_len,
+                        out.len()
+                    )));
+                }
             }
             seq = upto;
         }

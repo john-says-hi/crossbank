@@ -13,7 +13,7 @@
 //!
 //! # How it works
 //!
-//! [`RemoteBank`] is a cloneable sender. Every operation becomes a message
+//! [`BankHandle`] is a cloneable sender. Every operation becomes a message
 //! carrying **plain data only** — `String`, `Vec<u8>`, and a one-shot reply
 //! channel. No `JsValue`, no generic `T`, nothing that could pin the message to
 //! a thread. The bank's owning thread runs [`Bank::into_service`], receives
@@ -93,11 +93,11 @@ impl std::fmt::Debug for Job {
 
 /// A `Send + Sync + Clone` handle onto a bank running elsewhere.
 #[derive(Debug, Clone)]
-pub struct RemoteBank {
+pub struct BankHandle {
     sender: mpsc::Sender<Job>,
 }
 
-impl RemoteBank {
+impl BankHandle {
     pub(crate) fn new(sender: mpsc::Sender<Job>) -> Self {
         Self { sender }
     }
@@ -174,15 +174,30 @@ impl Bank {
     ///
     /// Requires [`Bank::into_service`] to be running, or every call returns
     /// [`Error::Closed`].
-    pub fn remote(&self) -> RemoteBank {
-        RemoteBank::new(self.job_sender())
+    ///
+    /// ```no_run
+    /// # async fn demo(bank: crossbank::Bank) -> crossbank::Result<()> {
+    /// let handle = bank.handle();
+    /// // Move `handle` to any thread; poll `bank.into_service()` on this one.
+    /// handle.put("settings", "theme", b"dark".to_vec()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn handle(&self) -> BankHandle {
+        BankHandle::new(self.job_sender())
+    }
+
+    /// Renamed to [`Bank::handle`].
+    #[deprecated(since = "0.1.0", note = "renamed to `Bank::handle`")]
+    pub fn remote(&self) -> BankHandle {
+        self.handle()
     }
 
     /// The service loop. The consumer polls this on the bank's owning thread.
     ///
     /// crossbank spawns nothing, so where this runs is the caller's decision:
     /// `wasm_bindgen_futures::spawn_local` on the web, an ordinary task
-    /// natively. It completes when every [`RemoteBank`] has been dropped.
+    /// natively. It completes when every [`BankHandle`] has been dropped.
     ///
     /// The thread polling it must never block.
     pub async fn into_service(self) {
@@ -238,14 +253,14 @@ mod tests {
     /// consumer would with `spawn_local`.
     fn with_service<F, Fut, T>(body: F) -> T
     where
-        F: FnOnce(RemoteBank) -> Fut,
+        F: FnOnce(BankHandle) -> Fut,
         Fut: Future<Output = T>,
     {
         block_on(async {
             // Must be awaited, not block_on'd: nesting one block_on inside
             // another is a hard error in futures' LocalPool.
             let bank = open_bank().await;
-            let remote = bank.remote();
+            let remote = bank.handle();
             let service = bank.into_service();
             futures::pin_mut!(service);
 
@@ -275,7 +290,7 @@ mod tests {
         // The property the whole module exists for. If this stops compiling,
         // a JsValue or an Rc has leaked into the job type.
         fn assert_bounds<T: Send + Sync + Clone + 'static>() {}
-        assert_bounds::<RemoteBank>();
+        assert_bounds::<BankHandle>();
     }
 
     #[test]
@@ -336,7 +351,7 @@ mod tests {
         // Better a typed error than a hang. A caller that forgot to spawn the
         // service should find out immediately.
         let bank = block_on(open_bank());
-        let remote = bank.remote();
+        let remote = bank.handle();
         drop(bank);
 
         assert!(matches!(block_on(remote.get("l", "k")), Err(Error::Closed)));
@@ -348,7 +363,7 @@ mod tests {
         // filter chain, same schema tag. The two views must agree.
         block_on(async {
             let bank = open_bank().await;
-            let remote = bank.remote();
+            let remote = bank.handle();
 
             let service = bank.into_service();
             futures::pin_mut!(service);

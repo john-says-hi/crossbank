@@ -26,7 +26,7 @@ use crate::error::{Error, Result};
 use crate::key::LockerId;
 use crate::locker::inner::Inner;
 use crate::locker::{LazyLocker, Locker, LockerConfig};
-use crate::remote::{Job, JOB_QUEUE};
+use crate::handle::{Job, JOB_QUEUE};
 use serde::{de::DeserializeOwned, Serialize};
 
 /// On-disk format version for the bank as a whole.
@@ -165,7 +165,7 @@ pub struct Bank {
     chain: Arc<FilterChain>,
     /// Name to id, cached so opening a locker twice does not re-read `meta`.
     registry: Mutex<HashMap<String, LockerId>>,
-    /// Cloned into every `RemoteBank`.
+    /// Cloned into every [`crate::BankHandle`].
     job_sender: mpsc::Sender<Job>,
     /// Taken exactly once, by `into_service`. A second service would silently
     /// steal jobs from the first.
@@ -588,7 +588,7 @@ impl Bank {
         self.job_receiver.lock().ok()?.take()
     }
 
-    /// Bytes-level access, used by the remote handle.
+    /// Bytes-level access, used by [`crate::BankHandle`].
     ///
     /// Values go through the same envelope and filter chain as typed ones, and
     /// bind the same schema tag, so a locker reached this way is precisely a

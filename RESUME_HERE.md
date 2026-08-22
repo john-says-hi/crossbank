@@ -142,7 +142,7 @@ redb builds for Android and iOS.
 
 **M1 — complete.** The walking skeleton: `Backend` trait, memory backend, binary keys, value
 envelope and filter chain, `Bank` with a locker registry and schema guard, eager and lazy
-lockers, closure-scoped transactions, bounded watch, `RemoteBank`, and an 18-case conformance
+lockers, closure-scoped transactions, bounded watch, `BankHandle` (named `RemoteBank` until M6), and an 18-case conformance
 suite that runs natively **and** in real browsers.
 
 **M2 — complete.** The `redb` backend. Passes the conformance suite unmodified — the entire

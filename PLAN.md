@@ -69,7 +69,7 @@ plaintext even in encrypted boxes.
 | 20 | Keys on disk | **Binary**, UTF-8 bytes; `&str` in the public API |
 | 21 | Store layout | **Three fixed tables**; locker is a key prefix |
 | 22 | Eager + big | **Refuse.** `ValueTooLarge` naming `LazyLocker`; budget at open |
-| 23 | Send story | Boxed `CbFuture` alias + `RemoteBank`, **at M1** |
+| 23 | Send story | Boxed `CbFuture` alias + `BankHandle` (`RemoteBank` until M6), **at M1** |
 | 24 | LRU clock | **Logical op counter.** `std::time` panics on wasm |
 | 25 | IndexedDB crate | `indexed-db` **0.4.2** (0.5.0 is yanked) |
 
@@ -142,7 +142,7 @@ for batch in batches { w.write_chunk(&batch).await?; }
 w.finish().await?;
 
 // Send + Sync handle for other threads (the ONLY usable API on wasm)
-let remote = bank.remote();
+let handle = bank.handle();
 wasm_bindgen_futures::spawn_local(bank.into_service());   // consumer pumps it
 ```
 
@@ -159,7 +159,7 @@ staging writes in RAM means no foreign await can ever land inside a live IDB tra
 ## Architecture
 
 ```
-   Bank / Locker / LazyLocker / Transaction / Writer / Reader / RemoteBank
+   Bank / Locker / LazyLocker / Transaction / Writer / Reader / BankHandle
  ──────────────────────────────────────────────────────────────────────  public API
    Filter chain (codec · compression · CRC · cipher) · chunking
    RAM index · watch fan-out · eviction · coherence
@@ -226,7 +226,7 @@ it is the only path, which is why it lands in M1.
   bound an `async fn` return type, so boxing is not optional.
 - `Error` is unconditionally `Send + Sync + 'static` and never carries a `JsValue`. JS errors
   are stringified at the boundary with the DOMException name kept as a typed enum.
-- `Bank::remote()` returns a `Send + Sync + Clone` handle; `Bank::into_service()` is a future
+- `Bank::handle()` returns a `Send + Sync + Clone` handle; `Bank::into_service()` is a future
   the *consumer* pumps on the owning thread. crossbank spawns nothing.
 - Encode, compress and encrypt run on the **caller's** thread, never the pump. That keeps
   user code off the service loop, which makes re-entrancy impossible by construction.
@@ -304,7 +304,7 @@ silently unlinks shared memory. `ci/guard-rustflags.sh` enforces this.
 
 **M1 — Walking skeleton. ✅ COMPLETE.** Memory backend, the `Backend` trait above, three
 fixed tables, binary keys, closure-scoped transactions, `Arc<T>` eager lockers with a budget
-ceiling, `RemoteBank` + `into_service()`, bounded watch, `schema_tag`, and an 18-case
+ceiling, `BankHandle` + `into_service()`, bounded watch, `schema_tag`, and an 18-case
 conformance suite that runs natively *and* in a browser.
 *Exit met: adding a backend now costs one four-line file. Both suite guards were
 negative-controlled — a harness that lies about persistence fails, and a spec list out of step

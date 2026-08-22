@@ -63,9 +63,9 @@ pub mod bank;
 pub mod codec;
 pub(crate) mod coherence;
 pub mod error;
+pub mod handle;
 pub mod key;
 pub mod locker;
-pub mod remote;
 pub mod watch;
 
 #[cfg(target_arch = "wasm32")]
@@ -76,12 +76,16 @@ pub use backend::{Backend, MemoryBackend, Usage};
 pub use bank::{delete_bank, Bank, BankConfig, Location};
 pub use codec::{Filter, FilterChain};
 pub use error::{Error, Result};
+pub use handle::BankHandle;
 pub use locker::{
     Commit, Durability, LazyLocker, Locker, LockerConfig, OnCorrupt, Policy, Reader, Transaction,
     Writer,
 };
-pub use remote::RemoteBank;
 pub use watch::{Event, EventStream};
+
+/// Renamed to [`BankHandle`].
+#[deprecated(since = "0.1.0", note = "renamed to `BankHandle`")]
+pub use handle::BankHandle as RemoteBank;
 
 /// The crate name, useful in diagnostics.
 pub const NAME: &str = "crossbank";

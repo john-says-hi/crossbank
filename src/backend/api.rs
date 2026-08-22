@@ -36,7 +36,7 @@ use crate::error::Result;
 // `Send`-ness is target-dependent. On native we want futures a consumer can
 // move across threads; on wasm the backend holds `JsValue`, which is `!Send`,
 // so requiring it would make the trait unimplementable. Callers who need a
-// `Send` handle on wasm go through `RemoteBank`, which proxies over a channel.
+// `Send` handle on wasm go through `BankHandle`, which proxies over a channel.
 //
 // These marker traits have blanket impls, so users never name them — they only
 // ever appear in a compiler error, which is why they carry a diagnostic note.

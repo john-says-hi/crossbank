@@ -7,6 +7,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- `delete_bank` no longer unlinks a native bank file that is still open. Doing so left the
+  live `Bank` committing into a file with no name on Unix — every write after the delete was
+  lost silently — and failed with an opaque backend error on Windows. A bank still open in
+  this process is now refused with `Error::InvalidConfig` saying *close the bank first*, and
+  nothing is removed. Closing the bank, or simply dropping it, frees the name again.
+
 ## [0.1.0] — 2026-08-21
 
 Initial release. crossbank is local, on-device key/value storage for Rust — a direct

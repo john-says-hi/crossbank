@@ -355,6 +355,25 @@ pub struct Bank {
     /// locker so two handles on one name cannot collide.
     shared: Arc<crate::locker::inner::Shared>,
     closed: AtomicBool,
+    /// This bank's entry in [`OPEN_BANKS`], while it holds one.
+    ///
+    /// Only a bank opened from a [`Location::Path`] has one. It is taken by
+    /// whichever of [`Bank::close`] and `Drop` runs first, so a later reopen
+    /// of the same file cannot have its entry removed by the previous bank
+    /// finally being dropped.
+    #[cfg(not(target_arch = "wasm32"))]
+    tracked_path: Mutex<Option<std::path::PathBuf>>,
+}
+
+/// Frees the bank's name in [`OPEN_BANKS`] for a bank that was dropped without
+/// being closed. Bookkeeping only — it awaits nothing and touches no storage,
+/// because a destructor cannot await and a closing process would not run one
+/// anyway.
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Bank {
+    fn drop(&mut self) {
+        self.release_tracked_path();
+    }
 }
 
 impl std::fmt::Debug for Bank {
@@ -484,11 +503,21 @@ impl Bank {
             Location::Path(path) => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    Self::assembled(
+                    // Registered only once the backend is really open, and
+                    // keyed off the file as it exists then, so the key matches
+                    // the one `delete_bank` computes for the same location.
+                    let located = path.clone();
+                    let bank = Self::assembled(
                         Arc::new(crate::backend::RedbBackend::open(path)?),
                         coherence,
                     )
-                    .await
+                    .await?;
+                    let key = bank_key(&located);
+                    register_open_bank(key.clone());
+                    if let Ok(mut guard) = bank.tracked_path.lock() {
+                        *guard = Some(key);
+                    }
+                    Ok(bank)
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
@@ -571,6 +600,8 @@ impl Bank {
             residents: Mutex::new(Vec::new()),
             shared: shared.clone(),
             closed: AtomicBool::new(false),
+            #[cfg(not(target_arch = "wasm32"))]
+            tracked_path: Mutex::new(None),
         };
         bank.check_or_write_format_version().await?;
         Ok(bank)
@@ -1504,7 +1535,27 @@ impl Bank {
         // listening would call into a bank that no longer works.
         self.shared.coherence.close();
         let closed = self.backend.close().await;
+        // The file is free again, so `delete_bank` may have it. Released even
+        // when the backend's own close reported an error: the alternative is a
+        // name nothing can ever delete.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.release_tracked_path();
         flushed.and(closed)
+    }
+
+    /// Give up this bank's [`OPEN_BANKS`] entry, if it still holds one.
+    ///
+    /// Idempotent, and safe to call from `Drop`: it takes the path rather than
+    /// reading it, so only the first caller removes anything.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn release_tracked_path(&self) {
+        let taken = match self.tracked_path.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        if let Some(key) = taken {
+            release_open_bank(&key);
+        }
     }
 
     /// Whether [`Bank::close`] has been called.
@@ -1652,12 +1703,83 @@ impl Bank {
     }
 }
 
+/// Every native bank file this process currently holds open.
+///
+/// `delete_bank` consults it before unlinking. Without that check, deleting a
+/// bank that is still open removes the *name* on Unix while `redb` keeps
+/// writing into the now-nameless file, so every later commit is lost with no
+/// error anywhere; on Windows the unlink instead fails with an opaque
+/// permission error. Both are refusals in disguise, so we refuse honestly.
+///
+/// Keyed by the canonicalised path, so two spellings of one file are one
+/// entry. Only banks opened through [`Bank::open`] (that is, a
+/// [`BankConfig::at`] location) are in here; see the note on
+/// [`Bank::with_backend`] in `delete_bank`'s own documentation.
+#[cfg(not(target_arch = "wasm32"))]
+static OPEN_BANKS: std::sync::OnceLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_banks() -> &'static Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    OPEN_BANKS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// The registry key for a bank location.
+///
+/// `canonicalize` is the one that collapses symlinks and `..`, but it needs the
+/// file to exist; a location whose file is not there yet falls back to the
+/// absolute path, which is still stable for one process.
+#[cfg(not(target_arch = "wasm32"))]
+fn bank_key(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn register_open_bank(key: std::path::PathBuf) {
+    if let Ok(mut guard) = open_banks().lock() {
+        guard.insert(key);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn release_open_bank(key: &std::path::Path) {
+    if let Ok(mut guard) = open_banks().lock() {
+        guard.remove(key);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn bank_is_open(key: &std::path::Path) -> bool {
+    match open_banks().lock() {
+        Ok(guard) => guard.contains(key),
+        // A poisoned registry cannot prove the bank is closed, and guessing
+        // wrong here costs the caller their data. Refuse.
+        Err(_) => true,
+    }
+}
+
 /// Delete a whole bank from the platform it lives on.
 ///
-/// Idempotent: deleting a location that holds nothing succeeds. Every handle
-/// onto that location must be closed first — natively `redb` still holds an
-/// exclusive lock on an open file, and on the web an open IndexedDB connection
-/// blocks the delete until it goes away.
+/// Idempotent: deleting a location that holds nothing succeeds. **Every handle
+/// onto that location must be closed first**, and this refuses rather than
+/// letting you find out later — natively `redb` still holds an exclusive lock
+/// on an open file, and on the web an open IndexedDB connection blocks the
+/// delete until it goes away.
+///
+/// Deleting a native bank that is still open is [`Error::InvalidConfig`]
+/// saying *close the bank first*, and nothing is removed. The refusal matters:
+/// Unix would happily unlink the file out from under `redb`'s open descriptor,
+/// leaving a live `Bank` committing into a file with no name, so every write
+/// after the delete would be lost silently. A bank counts as open until
+/// [`Bank::close`] returns or the `Bank` is dropped — a dropped-but-never-closed
+/// bank frees the name too.
+///
+/// Only banks opened through [`Bank::open`] / [`BankConfig::at`] are tracked. A
+/// bank built with [`Bank::with_backend`] over a hand-made
+/// `RedbBackend` is invisible here, and deleting its file while it lives is the
+/// unlink-under-a-live-fd hazard again.
 ///
 /// A free function rather than a method, because a `Bank` you are about to
 /// erase is not a good place to hang the erasing from.
@@ -1668,9 +1790,25 @@ pub async fn delete_bank(config: &BankConfig) -> Result<()> {
         Location::Path(path) => {
             #[cfg(not(target_arch = "wasm32"))]
             {
+                if bank_is_open(&bank_key(path)) {
+                    return Err(Error::InvalidConfig(format!(
+                        "the bank at {} is still open in this process; \
+                         close the bank first",
+                        path.display()
+                    )));
+                }
                 match std::fs::remove_file(path) {
                     Ok(()) => Ok(()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    // What an externally held lock looks like on Windows: the
+                    // same "it is still open" answer, not a backend fault.
+                    Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        Err(Error::InvalidConfig(format!(
+                            "the bank file {} is held open by something else; \
+                             close the bank first",
+                            path.display()
+                        )))
+                    }
                     Err(e) => Err(Error::backend(format!(
                         "deleting the bank file {}: {e}",
                         path.display()
@@ -2071,6 +2209,82 @@ mod tests {
         let reborn = block_on(Bank::open(config)).unwrap();
         let locker = block_on(reborn.locker::<String>("s")).unwrap();
         assert_eq!(locker.get("k"), None, "the data went with the file");
+    }
+
+    /// The whole point of the open-bank registry.
+    ///
+    /// Unix will unlink a file `redb` still has open, and the `Bank` on the
+    /// other side keeps committing into something with no name — every write
+    /// after the delete is lost, with no error anywhere. Refusing is the only
+    /// honest answer, and the refusal must leave the store completely intact.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn delete_bank_refuses_while_the_bank_is_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("live.redb");
+        let config = BankConfig::at(&path);
+
+        let bank = block_on(Bank::open(config.clone())).unwrap();
+        let locker = block_on(bank.locker::<String>("s")).unwrap();
+        block_on(locker.put("k", "v".into())).unwrap();
+
+        let refused = block_on(delete_bank(&config));
+        match refused {
+            Err(Error::InvalidConfig(msg)) => assert!(
+                msg.contains("close the bank first"),
+                "the error must say what to do instead: {msg}"
+            ),
+            other => panic!("deleting an open bank must be refused, got {other:?}"),
+        }
+
+        // Nothing was touched, and the bank is still fully usable.
+        assert!(path.exists(), "the refusal must not remove the file");
+        block_on(locker.put("k2", "v2".into())).unwrap();
+        assert_eq!(locker.get("k").as_deref(), Some(&"v".to_string()));
+
+        // Closing frees the name, and the write made after the refusal is
+        // really on disk rather than in a file nobody can find.
+        block_on(bank.close()).unwrap();
+        block_on(delete_bank(&config)).unwrap();
+        assert!(!path.exists());
+    }
+
+    /// A bank that is merely dropped never runs `close`, but it does run
+    /// `Drop`, and the file is just as free afterwards.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn dropping_a_bank_without_closing_it_frees_the_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dropped.redb");
+        let config = BankConfig::at(&path);
+
+        {
+            let bank = block_on(Bank::open(config.clone())).unwrap();
+            let locker = block_on(bank.locker::<String>("s")).unwrap();
+            block_on(locker.put("k", "v".into())).unwrap();
+            assert!(block_on(delete_bank(&config)).is_err(), "still open here");
+        }
+
+        block_on(delete_bank(&config)).unwrap();
+        assert!(!path.exists());
+    }
+
+    /// Two spellings of one file are one entry: the registry canonicalises.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_open_registry_sees_through_a_roundabout_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("twisty.redb");
+        let bank = block_on(Bank::open(BankConfig::at(&path))).unwrap();
+
+        let roundabout = dir.path().join("sub").join("..").join("twisty.redb");
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        assert!(
+            block_on(delete_bank(&BankConfig::at(&roundabout))).is_err(),
+            "the same file spelled differently is the same open bank"
+        );
+
+        block_on(bank.close()).unwrap();
     }
 
     #[cfg(not(target_arch = "wasm32"))]

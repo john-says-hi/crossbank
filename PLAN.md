@@ -749,10 +749,17 @@ a cost we have chosen to carry. None of them loses data.
   `corrupt_keys` / `verify`, which is where a caller sees what was dropped.
   This is the documented behaviour, not an accident: the alternative is
   refusing to open at all, which is what `OnCorrupt::Fail` is for.
-- **`delete_bank` on a still-open native bank unlinks under a live fd.** The
-  doc already says to close the bank first. On Unix the file stays alive until
-  the last handle closes, so an open `Bank` keeps working against a file that
-  no longer has a name, and its later commits go nowhere visible. Close first.
+- **`delete_bank` on a still-open native bank is refused, not attempted.** It
+  used to unlink under a live fd: on Unix the file stays alive until the last
+  handle closes, so an open `Bank` kept working against a file that no longer
+  had a name and its later commits went nowhere visible, while on Windows the
+  unlink failed with an opaque permission error. A process-local registry of
+  open native bank paths (`OPEN_BANKS` in `src/bank.rs`, keyed by the
+  canonicalised path, entered by `Bank::open` and left by `Bank::close` or
+  `Drop`) now answers `Error::InvalidConfig` — *close the bank first* — and
+  removes nothing. The remaining hole is a bank built with `Bank::with_backend`
+  over a hand-made `RedbBackend`: nothing tracks it, so the old hazard stands
+  for that arrangement, which is already documented as unsupported.
 - **A deferred write is announced when it is staged, not when it commits.**
   That is when it becomes visible to its own handle, which is what a watcher
   on that handle is asking about — but it does mean an `Event::Put` can

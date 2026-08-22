@@ -1248,7 +1248,9 @@ pub async fn eviction_accounting_survives_a_reopen<H: Harness>(h: &H) -> Result<
     let config = LockerConfig::default().with_policy(Policy::Evictable { max_bytes: 3_100 });
     {
         let bank = bank(h).await?;
-        let locker = bank.lazy_locker_with::<Vec<u8>>("lru", config.clone()).await?;
+        let locker = bank
+            .lazy_locker_with::<Vec<u8>>("lru", config.clone())
+            .await?;
         for key in ["a", "b", "c"] {
             locker.put(key, &vec![7u8; 1_000]).await?;
         }
@@ -1257,7 +1259,9 @@ pub async fn eviction_accounting_survives_a_reopen<H: Harness>(h: &H) -> Result<
     }
 
     let bank = bank(h).await?;
-    let locker = bank.lazy_locker_with::<Vec<u8>>("lru", config.clone()).await?;
+    let locker = bank
+        .lazy_locker_with::<Vec<u8>>("lru", config.clone())
+        .await?;
 
     if !h.caps().persists_across_open {
         assert_eq!(
@@ -1294,7 +1298,9 @@ pub async fn deferred_writes_are_visible_before_flush_and_durable_after<H: Harne
     let deferred = LockerConfig::default().with_commit(Commit::Deferred { after: 4 });
     {
         let bank = bank(h).await?;
-        let locker = bank.lazy_locker_with::<V>("deferred", deferred.clone()).await?;
+        let locker = bank
+            .lazy_locker_with::<V>("deferred", deferred.clone())
+            .await?;
 
         locker.put("a", &v("alpha")).await?;
         locker.put("b", &v("beta")).await?;
@@ -1338,7 +1344,9 @@ pub async fn deferred_writes_are_visible_before_flush_and_durable_after<H: Harne
     }
 
     let bank = bank(h).await?;
-    let locker = bank.lazy_locker_with::<V>("deferred", deferred.clone()).await?;
+    let locker = bank
+        .lazy_locker_with::<V>("deferred", deferred.clone())
+        .await?;
 
     if h.caps().persists_across_open {
         assert_eq!(locker.get("b").await?, Some(v("beta")));
@@ -1354,7 +1362,9 @@ pub async fn deferred_writes_are_visible_before_flush_and_durable_after<H: Harne
 
     // The same bargain on an eager locker, whose resident value is updated
     // when the write is staged.
-    let eager = bank.locker_with::<V>("deferred_eager", deferred.clone()).await?;
+    let eager = bank
+        .locker_with::<V>("deferred_eager", deferred.clone())
+        .await?;
     eager.put("k", v("resident")).await?;
     assert_eq!(eager.pending(), 1);
     assert_eq!(eager.get("k").as_deref(), Some(&v("resident")));
@@ -1377,7 +1387,9 @@ pub async fn a_transaction_absorbs_staged_deferred_writes<H: Harness>(h: &H) -> 
     let deferred = LockerConfig::default().with_commit(Commit::Deferred { after: 16 });
     {
         let bank = bank(h).await?;
-        let locker = bank.lazy_locker_with::<V>("tx_absorb", deferred.clone()).await?;
+        let locker = bank
+            .lazy_locker_with::<V>("tx_absorb", deferred.clone())
+            .await?;
 
         locker.put("k", &v("staged")).await?;
         locker.put("other", &v("kept")).await?;
@@ -1411,7 +1423,9 @@ pub async fn a_transaction_absorbs_staged_deferred_writes<H: Harness>(h: &H) -> 
     }
 
     let bank = bank(h).await?;
-    let locker = bank.lazy_locker_with::<V>("tx_absorb", deferred.clone()).await?;
+    let locker = bank
+        .lazy_locker_with::<V>("tx_absorb", deferred.clone())
+        .await?;
     if h.caps().persists_across_open {
         assert_eq!(
             locker.get("k").await?,

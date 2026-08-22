@@ -102,12 +102,16 @@ async fn run() -> crossbank::Result<()> {
     let cache: LazyLocker<Vec<u8>> = bank
         .lazy_locker_with(
             "thumbnail-cache",
-            LockerConfig::default().with_policy(Policy::Evictable { max_bytes: 8 * 1024 }),
+            LockerConfig::default().with_policy(Policy::Evictable {
+                max_bytes: 8 * 1024,
+            }),
         )
         .await?;
 
     for i in 0..20u32 {
-        cache.put(&format!("thumb-{i:02}"), &vec![i as u8; 1024]).await?;
+        cache
+            .put(&format!("thumb-{i:02}"), &vec![i as u8; 1024])
+            .await?;
     }
     println!(
         "cache holds {} of 20 entries, {} bytes against an 8 KiB budget",

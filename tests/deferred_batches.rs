@@ -403,7 +403,9 @@ fn a_second_deferred_handle_on_one_name_is_refused() {
             .await
             .expect("first open");
 
-        let second = bank.lazy_locker_with::<String>("only_one", deferred.clone()).await;
+        let second = bank
+            .lazy_locker_with::<String>("only_one", deferred.clone())
+            .await;
         assert!(
             matches!(second, Err(Error::InvalidConfig(_))),
             "a second deferred handle must be refused: {second:?}"

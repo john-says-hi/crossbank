@@ -42,7 +42,10 @@ async fn run() -> crossbank::Result<()> {
         dark: false,
         accent: "blue".into(),
     };
-    println!("before any write: {:?}", settings.get_or("theme", fallback.clone()));
+    println!(
+        "before any write: {:?}",
+        settings.get_or("theme", fallback.clone())
+    );
 
     // Watch before writing, so the write below is observed. `watch_keys` is
     // the equivalent of Hive's `listenable(keys: […])`; the stream is bounded,
@@ -66,10 +69,15 @@ async fn run() -> crossbank::Result<()> {
     // This is the call the UI makes.
     let theme = settings.get("theme").expect("just written");
     println!("after the write: {theme:?}");
-    println!("get_or now returns the stored value: {:?}", settings.get_or("theme", fallback.clone()));
+    println!(
+        "get_or now returns the stored value: {:?}",
+        settings.get_or("theme", fallback.clone())
+    );
 
     match watched.next().await {
-        Some(Event::Put { key }) => println!("watch saw a write to {:?}", String::from_utf8_lossy(&key)),
+        Some(Event::Put { key }) => {
+            println!("watch saw a write to {:?}", String::from_utf8_lossy(&key))
+        }
         other => println!("watch saw {other:?}"),
     }
 
@@ -95,11 +103,17 @@ async fn run() -> crossbank::Result<()> {
 
     println!("keys: {:?}", settings.keys());
     println!("length: {}", settings.len());
-    println!("contains theme_light: {}", settings.contains_key("theme_light"));
+    println!(
+        "contains theme_light: {}",
+        settings.contains_key("theme_light")
+    );
 
     // Hive's `deleteAll`, also one commit.
     settings
-        .delete_all(vec!["theme_light".to_string(), "theme_high_contrast".to_string()])
+        .delete_all(vec![
+            "theme_light".to_string(),
+            "theme_high_contrast".to_string(),
+        ])
         .await?;
     println!("after delete_all: {:?}", settings.keys());
 

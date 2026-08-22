@@ -23,10 +23,10 @@ use crate::backend::KeyRange;
 use crate::codec::{default_chain, type_tag, FilterChain};
 use crate::error::{Error, Result};
 
+use crate::handle::{Job, JOB_QUEUE};
 use crate::key::LockerId;
 use crate::locker::inner::Inner;
 use crate::locker::{LazyLocker, Locker, LockerConfig};
-use crate::handle::{Job, JOB_QUEUE};
 use serde::{de::DeserializeOwned, Serialize};
 
 /// On-disk format version for the bank as a whole.

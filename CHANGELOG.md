@@ -75,6 +75,12 @@ consumer whose storage trait requires `Send` futures, because the IndexedDB back
 **No async runtime dependency.** `futures` only, never `tokio`. crossbank spawns nothing;
 the consumer decides where work runs.
 
+### Fixed
+
+- The LRU tick clock is now seeded from the `lru::` records themselves at open, so a reopened
+  bank never re-issues a tick already recorded against a key and the byte budget cannot shed
+  the wrong one.
+
 ### Notes
 
 - Hive's on-disk format is *not* read. There is no migration, by decision.

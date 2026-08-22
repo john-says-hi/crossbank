@@ -22,8 +22,18 @@
 //!
 //! The counter is the same shape as [`super::chunk::ValueIds`]: seeded from
 //! `meta` on first use, then a RAM cursor, with its high-water mark persisted
-//! by **every** commit that allocates from it. A reopen therefore never
-//! re-issues a tick that is already recorded against a key.
+//! by **every** commit that allocates from it.
+//!
+//! That alone is not enough to make it monotonic across a reopen. A read
+//! allocates a tick and — correctly — writes nothing, so a session that only
+//! reads leaves the stored `next_tick` behind the cursor it advanced; and two
+//! banks over one store each keep their own cursor, so the last one to commit
+//! can lower the stored figure below ticks a *different* cursor already
+//! recorded against keys. A reopen seeded from that number would re-issue
+//! ticks that already sit in `lru::` rows, and the LRU would then shed the
+//! wrong key. So [`load`] — which already reads every one of those rows —
+//! also tells [`Ticks`] the highest tick it saw, and the clock starts above
+//! it. No extra I/O, and still nothing written on the read path.
 //!
 //! # What `bytes` counts
 //!
@@ -126,19 +136,47 @@ pub(crate) fn clear_op(id: LockerId) -> Op {
 /// across an await — allocation is arithmetic.
 #[derive(Debug, Default)]
 pub struct Ticks {
-    next: std::sync::Mutex<Option<u64>>,
+    state: std::sync::Mutex<TickState>,
+}
+
+/// The cursor, and the floor the stored records put under it.
+///
+/// `floor` is kept separately from `next` because it is learned at open,
+/// *before* anything has allocated: folding it into `next` there would seed
+/// the cursor and stop [`Ticks::allocate`] ever reading the stored figure,
+/// which may be higher still.
+#[derive(Debug, Default)]
+struct TickState {
+    next: Option<u64>,
+    floor: u64,
+}
+
+impl TickState {
+    /// The next tick to issue, never below what the stored rows demand.
+    fn cursor(&self, stored: Option<u64>) -> Option<u64> {
+        let next = match (self.next, stored) {
+            (Some(current), Some(stored)) => current.max(stored),
+            (Some(current), None) => current,
+            (None, Some(stored)) => stored,
+            (None, None) => return None,
+        };
+        Some(next.max(self.floor))
+    }
 }
 
 impl Ticks {
-    fn take(&self) -> Result<Option<u64>> {
-        let mut guard = self
-            .next
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, TickState>> {
+        self.state
             .lock()
-            .map_err(|_| Error::backend("tick cursor was poisoned"))?;
-        match *guard {
+            .map_err(|_| Error::backend("tick cursor was poisoned"))
+    }
+
+    fn take(&self) -> Result<Option<u64>> {
+        let mut guard = self.lock()?;
+        match guard.cursor(None) {
             None => Ok(None),
             Some(tick) => {
-                *guard = Some(advance(tick)?);
+                guard.next = Some(advance(tick)?);
                 Ok(Some(tick))
             }
         }
@@ -148,16 +186,26 @@ impl Ticks {
     /// the cursor while this one awaited the read, and a clock must only ever
     /// move forward.
     fn seed_and_take(&self, stored: u64) -> Result<u64> {
-        let mut guard = self
-            .next
-            .lock()
-            .map_err(|_| Error::backend("tick cursor was poisoned"))?;
-        let tick = match *guard {
-            Some(current) => current.max(stored),
-            None => stored,
-        };
-        *guard = Some(advance(tick)?);
+        let mut guard = self.lock()?;
+        let tick = guard.cursor(Some(stored)).unwrap_or(stored);
+        guard.next = Some(advance(tick)?);
         Ok(tick)
+    }
+
+    /// Raise the clock above a tick that storage already records.
+    ///
+    /// Called by [`load`] with the highest tick in the `lru::` rows it read.
+    /// Nothing is written and no read is added: the rows were being scanned
+    /// anyway. See this module's header for why the persisted counter alone
+    /// cannot carry this.
+    pub(crate) fn observe_recorded(&self, max_seen: u64) -> Result<()> {
+        let at_least = advance(max_seen)?;
+        let mut guard = self.lock()?;
+        guard.floor = guard.floor.max(at_least);
+        if let Some(current) = guard.next {
+            guard.next = Some(current.max(guard.floor));
+        }
+        Ok(())
     }
 
     /// Allocate the next tick.
@@ -181,11 +229,8 @@ impl Ticks {
 
     /// Persist the current high-water mark. Belongs in every allocating commit.
     pub(crate) fn counter_op(&self) -> Result<Op> {
-        let guard = self
-            .next
-            .lock()
-            .map_err(|_| Error::backend("tick cursor was poisoned"))?;
-        let next = guard.unwrap_or(0);
+        let guard = self.lock()?;
+        let next = guard.cursor(None).unwrap_or(guard.floor);
         Ok(Op::Put {
             table: Table::Meta,
             key: META_NEXT_TICK.to_vec(),
@@ -492,10 +537,20 @@ impl LruState {
 ///
 /// One prefix scan of `meta`, paged like every other scan because an IndexedDB
 /// cursor cannot outlive its transaction.
-pub(crate) async fn load(backend: &dyn Backend, id: LockerId, max_bytes: u64) -> Result<LruState> {
+///
+/// The scan also carries the clock: the highest tick it sees is handed to
+/// `ticks`, so the bank never re-issues a tick that is already recorded
+/// against a key. See this module's header.
+pub(crate) async fn load(
+    backend: &dyn Backend,
+    id: LockerId,
+    max_bytes: u64,
+    ticks: &Ticks,
+) -> Result<LruState> {
     let mut state = LruState::new(max_bytes);
     let prefix = locker_prefix(id);
     let mut range = KeyRange::prefix(&prefix);
+    let mut max_tick: Option<u64> = None;
 
     loop {
         let page = backend
@@ -517,6 +572,7 @@ pub(crate) async fn load(backend: &dyn Backend, id: LockerId, max_bytes: u64) ->
             // locker whose data is perfectly intact.
             if let Some(entry) = value.as_deref().and_then(parse_entry) {
                 state.total = state.total.saturating_add(entry.bytes);
+                max_tick = Some(max_tick.map_or(entry.tick, |m: u64| m.max(entry.tick)));
                 state.entries.insert(key.to_vec(), entry);
             }
         }
@@ -525,6 +581,10 @@ pub(crate) async fn load(backend: &dyn Backend, id: LockerId, max_bytes: u64) ->
             Some(last) => range.start = std::ops::Bound::Excluded(last),
             None => break,
         }
+    }
+
+    if let Some(max_tick) = max_tick {
+        ticks.observe_recorded(max_tick)?;
     }
 
     Ok(state)
@@ -640,6 +700,78 @@ mod tests {
         );
         // `a` is no longer the oldest, so `b` is shed instead.
         assert_eq!(plan.victims, vec![b"b".to_vec()]);
+    }
+
+    /// Reading a locker's records at open must also start the clock above
+    /// them. The persisted counter cannot be trusted on its own: reads never
+    /// write it, and a second bank over the same store can lower it.
+    ///
+    /// Native only: it needs an executor, and wasm32 has none to block on.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_clock_opens_above_every_tick_the_records_hold() {
+        let backend = crate::backend::MemoryBackend::new();
+        futures::executor::block_on(async {
+            backend
+                .commit(vec![
+                    put_op(
+                        7,
+                        b"a",
+                        Entry {
+                            tick: 41,
+                            bytes: 10,
+                        },
+                    ),
+                    put_op(
+                        7,
+                        b"b",
+                        Entry {
+                            tick: 900,
+                            bytes: 10,
+                        },
+                    ),
+                ])
+                .await
+                .expect("plant records");
+
+            // No `next_tick` is stored at all, which reads as zero — exactly
+            // the case where the rows are the only honest authority.
+            let ticks = Ticks::default();
+            let state = load(&backend, 7, 1_000, &ticks).await.expect("load");
+            assert_eq!(state.total(), 20);
+
+            let first = ticks.allocate(&backend).await.expect("allocate");
+            assert!(
+                first > 900,
+                "opened on tick {first}, at or below the 900 already recorded"
+            );
+        });
+    }
+
+    /// The stored counter still wins when it is the higher of the two: a
+    /// locker whose keys were all deleted has no rows left to speak for the
+    /// ticks it already issued.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_higher_stored_counter_is_not_dragged_back_down() {
+        let backend = crate::backend::MemoryBackend::new();
+        futures::executor::block_on(async {
+            backend
+                .commit(vec![
+                    put_op(7, b"a", Entry { tick: 3, bytes: 10 }),
+                    Op::Put {
+                        table: Table::Meta,
+                        key: META_NEXT_TICK.to_vec(),
+                        value: 5_000u64.to_be_bytes().to_vec(),
+                    },
+                ])
+                .await
+                .expect("plant records");
+
+            let ticks = Ticks::default();
+            load(&backend, 7, 1_000, &ticks).await.expect("load");
+            assert_eq!(ticks.allocate(&backend).await.expect("allocate"), 5_000);
+        });
     }
 
     #[test]

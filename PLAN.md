@@ -765,10 +765,11 @@ a cost we have chosen to carry. None of them loses data.
   chunk allocations commit out of order, the stored `next_value_id` can land
   one lower than the highest id actually handed out. Within a process the RAM
   cursor covers it; only a reopen immediately after such an interleaving could
-  re-hand an id in use. The M5 tick counter is written the same way and
-  carries the same caveat; making both durable-monotonic against out-of-order
+  re-hand an id in use. Making that durable-monotonic against out-of-order
   commits needs a compare-and-set the `Backend` trait does not have, so it is
-  still open.
+  still open. The M5 tick counter no longer carries that caveat: the open-time
+  scan of the `lru::` rows now seeds the clock above the highest tick they
+  hold, so a reopen is monotonic whatever the stored counter says.
 - **Corrupt bytes and an oversized value look the same at the eager sink.**
   A coherence message either carries a value or does not. When it does not —
   because the write was past the inline limit, or was chunked — and when it

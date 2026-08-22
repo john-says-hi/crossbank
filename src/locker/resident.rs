@@ -344,7 +344,13 @@ impl Resident {
         if !dirty {
             return Ok(());
         }
-        let loaded = lru::load(self.inner.backend.as_ref(), self.inner.id, max_bytes).await?;
+        let loaded = lru::load(
+            self.inner.backend.as_ref(),
+            self.inner.id,
+            max_bytes,
+            &self.inner.shared.ticks,
+        )
+        .await?;
         if let Some(mut state) = self.lru_lock() {
             state.adopt_loaded(loaded);
         }
@@ -574,7 +580,13 @@ pub(crate) async fn open_lru(inner: &Inner, index: &BTreeSet<Vec<u8>>) -> Result
     let Policy::Evictable { max_bytes } = inner.config.policy else {
         return Ok(None);
     };
-    let mut state = lru::load(inner.backend.as_ref(), inner.id, max_bytes).await?;
+    let mut state = lru::load(
+        inner.backend.as_ref(),
+        inner.id,
+        max_bytes,
+        &inner.shared.ticks,
+    )
+    .await?;
     // Reconcile with what storage actually holds. A locker first written as
     // `Precious` and reopened as `Evictable` has keys with no accounting, and
     // a crash between two commits could leave accounting with no key.

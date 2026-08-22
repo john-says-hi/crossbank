@@ -125,6 +125,16 @@ impl Resident {
     }
 
     /// Every key noted so far, in byte order.
+    /// Whether this key's stored bytes would not decode when the locker was
+    /// opened — so it is missing from the resident map while its record is
+    /// still very much on disk.
+    pub(crate) fn is_corrupt(&self, key: &[u8]) -> bool {
+        self.corrupt
+            .lock()
+            .map(|c| c.contains(key))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn corrupt_keys(&self) -> Vec<Vec<u8>> {
         self.corrupt
             .lock()

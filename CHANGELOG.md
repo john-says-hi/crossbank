@@ -14,6 +14,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lost silently — and failed with an opaque backend error on Windows. A bank still open in
   this process is now refused with `Error::InvalidConfig` saying *close the bank first*, and
   nothing is removed. Closing the bank, or simply dropping it, frees the name again.
+- An eager `Locker`'s `delete` and `delete_all` no longer announce `Event::Deleted` for a key
+  that was not there. Hive fires only for keys that existed, so a `listenable(keys:)`-shaped
+  rebuild was repainting for nothing. A key skipped as corrupt still counts as present — its
+  bytes are on disk — and is still really deleted. `LazyLocker` keeps only the key index, so
+  it cannot answer "was it there?" without a read; it still announces unconditionally, and
+  the asymmetry is documented on both `delete` methods.
 
 ## [0.1.0] — 2026-08-21
 

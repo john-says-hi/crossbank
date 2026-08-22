@@ -347,24 +347,33 @@ where
             return Err(e);
         }
 
+        // A delete is only news if it took something away. Presence is
+        // recorded as the map is mutated rather than beforehand, so a
+        // put-then-delete of one key inside a single transaction still counts
+        // as a real removal and a delete after a `Clear` does not. All-true if
+        // the map is poisoned: announcing too much beats going quiet.
+        let mut removed_something = vec![true; entries.len()];
         if let Ok(mut guard) = self.values.lock() {
-            for entry in &entries {
+            for (entry, removed) in entries.iter().zip(removed_something.iter_mut()) {
                 match entry {
                     Staged::Put { key, value, .. } => {
                         guard.insert(key.clone(), value.clone());
                     }
                     Staged::Delete { key } => {
-                        guard.remove(key);
+                        *removed = guard.remove(key).is_some() || self.res.is_corrupt(key);
                     }
                     Staged::Clear => guard.clear(),
                 }
             }
         }
 
-        for entry in &entries {
+        for (entry, removed) in entries.iter().zip(removed_something) {
             match entry {
                 Staged::Put { key, .. } => self.inner.announce(Event::Put { key: key.clone() }),
-                Staged::Delete { key } => self.inner.announce(Event::Deleted { key: key.clone() }),
+                Staged::Delete { key } if removed => {
+                    self.inner.announce(Event::Deleted { key: key.clone() })
+                }
+                Staged::Delete { .. } => {}
                 Staged::Clear => self.inner.announce(Event::Cleared),
             }
         }
@@ -372,6 +381,13 @@ where
     }
 
     /// Remove a key. Removing an absent key is not an error.
+    ///
+    /// **No [`Event::Deleted`] is announced for a key that was not there.**
+    /// Hive fires only for keys that existed, and a `listenable(keys:)`-shaped
+    /// rebuild driven off a spurious event repaints for nothing. An eager
+    /// locker holds its values, so it can answer "was it there?" for free;
+    /// [`crate::LazyLocker::delete`] cannot, and deliberately still announces
+    /// unconditionally rather than paying a read to find out.
     pub async fn delete(&self, key: &str) -> Result<()> {
         self.delete_by(key.as_bytes()).await
     }
@@ -379,12 +395,24 @@ where
     /// As [`Locker::delete`], under a binary key.
     pub async fn delete_by(&self, key: &[u8]) -> Result<()> {
         self.inner.ensure_open()?;
+        let held = self.holds(key);
+        if !held && self.inner.index_is_authoritative() {
+            // Nothing resident, and nothing this handle will never hear from
+            // can have written a record here: no bytes to remove and no news
+            // to carry. Where the map may *not* prove absence — a maintenance
+            // locker, two banks over one backend, or a web tab with coherence
+            // off — the delete still goes to storage, because a record left
+            // behind is one whose chunks a later overwrite would orphan.
+            return Ok(());
+        }
         if self.res.is_deferred() {
             let full = self.res.stage(Pending::Delete { key: key.to_vec() })?;
             if let Ok(mut guard) = self.values.lock() {
                 guard.remove(key);
             }
-            self.inner.announce(Event::Deleted { key: key.to_vec() });
+            if held {
+                self.inner.announce(Event::Deleted { key: key.to_vec() });
+            }
             if full {
                 let _guard = self.inner.write_lock.lock().await;
                 self.res.flush_locked().await?;
@@ -395,8 +423,23 @@ where
         if let Ok(mut guard) = self.values.lock() {
             guard.remove(key);
         }
-        self.inner.announce(Event::Deleted { key: key.to_vec() });
+        if held {
+            self.inner.announce(Event::Deleted { key: key.to_vec() });
+        }
         Ok(())
+    }
+
+    /// Whether this locker holds a record under `key`.
+    ///
+    /// A key skipped as corrupt counts: it is missing from the resident map
+    /// while its bytes are still on disk, so a delete must reach storage and
+    /// really is news to anyone watching.
+    fn holds(&self, key: &[u8]) -> bool {
+        match self.values.lock() {
+            Ok(guard) => guard.contains_key(key) || self.res.is_corrupt(key),
+            // A poisoned map cannot prove absence. Behave as before.
+            Err(_) => true,
+        }
     }
 
     /// Store many entries in **one** atomic commit.
@@ -421,7 +464,9 @@ where
     /// Remove many keys in **one** atomic commit. Hive's `deleteAll`.
     ///
     /// Removing an absent key is not an error, exactly as for
-    /// [`Locker::delete`].
+    /// [`Locker::delete`], and exactly as there it announces nothing: a
+    /// `delete_all` over a hundred keys of which two existed is two events,
+    /// not a hundred.
     pub async fn delete_all(&self, keys: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
         let keys: Vec<String> = keys.into_iter().map(|k| k.as_ref().to_string()).collect();
         if keys.is_empty() {
@@ -1051,6 +1096,125 @@ mod tests {
         block_on(l.delete("k")).unwrap();
         assert!(l.get("k").is_none());
         assert_eq!(l.len(), 0);
+    }
+
+    /// Hive fires a box event only for keys that were really there. A
+    /// `listenable(keys:)`-shaped rebuild driven off a spurious `Deleted`
+    /// repaints for nothing, so an absent key must be silent.
+    #[test]
+    fn deleting_an_absent_key_is_silent() {
+        let l = locker();
+        block_on(l.put("here", "v".into())).unwrap();
+        let mut events = l.watch();
+
+        block_on(l.delete("gone")).unwrap();
+        assert_eq!(
+            events.try_recv(),
+            None,
+            "a key that was never there is not news"
+        );
+
+        block_on(l.delete("here")).unwrap();
+        assert_eq!(
+            events.try_recv(),
+            Some(Event::Deleted {
+                key: b"here".to_vec()
+            })
+        );
+        assert_eq!(events.try_recv(), None, "exactly one event, not two");
+
+        // And a second delete of the same key is silent in its turn.
+        block_on(l.delete("here")).unwrap();
+        assert_eq!(events.try_recv(), None);
+    }
+
+    /// `delete_all` runs through `transact`, so the same rule has to hold
+    /// there — and it is where the spurious events came in bulk.
+    #[test]
+    fn delete_all_announces_only_the_keys_it_took_away() {
+        let l = locker();
+        block_on(l.put("a", "1".into())).unwrap();
+        block_on(l.put("c", "3".into())).unwrap();
+        let mut events = l.watch();
+
+        block_on(l.delete_all(["a", "b", "c", "d"])).unwrap();
+
+        assert_eq!(
+            events.try_recv(),
+            Some(Event::Deleted { key: b"a".to_vec() })
+        );
+        assert_eq!(
+            events.try_recv(),
+            Some(Event::Deleted { key: b"c".to_vec() })
+        );
+        assert_eq!(events.try_recv(), None, "b and d were never there");
+        assert_eq!(l.len(), 0);
+    }
+
+    /// Deferred staging takes the same route, and stages nothing for a key it
+    /// does not hold.
+    #[test]
+    fn a_deferred_delete_of_an_absent_key_stages_nothing() {
+        let l =
+            open_with(LockerConfig::default().with_commit(crate::Commit::Deferred { after: 64 }))
+                .unwrap();
+        block_on(l.put("here", "v".into())).unwrap();
+        let mut events = l.watch();
+        let staged = l.pending();
+
+        block_on(l.delete("gone")).unwrap();
+        assert_eq!(events.try_recv(), None);
+        assert_eq!(l.pending(), staged, "nothing was staged for an absent key");
+    }
+
+    /// The one key an eager locker does not hold and must still delete.
+    ///
+    /// Under `OnCorrupt::Skip` a damaged record is missing from the resident
+    /// map while its bytes sit on disk untouched. Reading presence off the map
+    /// alone would leave it there forever — and a later write of the same key
+    /// would then orphan its chunks.
+    #[test]
+    fn deleting_a_corrupt_skipped_key_still_removes_the_record() {
+        use crate::backend::api::{Backend, Op, Table};
+        use crate::locker::OnCorrupt;
+
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let stored = crate::key::encode(1, "bad");
+        block_on(backend.commit(vec![Op::Put {
+            table: Table::Records,
+            key: stored.clone(),
+            value: b"not a CBNK envelope".to_vec(),
+        }]))
+        .unwrap();
+
+        let l: Locker<String> = block_on(Locker::open(
+            backend.clone(),
+            Arc::new(default_chain()),
+            1,
+            "test".into(),
+            LockerConfig::default().with_on_corrupt(OnCorrupt::Skip),
+            Default::default(),
+        ))
+        .unwrap();
+        assert_eq!(l.corrupt_keys(), vec![b"bad".to_vec()]);
+        assert!(l.get("bad").is_none(), "skipped, so not resident");
+
+        let mut events = l.watch();
+        block_on(l.delete("bad")).unwrap();
+
+        assert!(
+            block_on(backend.get(Table::Records, &stored))
+                .unwrap()
+                .is_none(),
+            "the corrupt bytes must really go"
+        );
+        assert_eq!(
+            events.try_recv(),
+            Some(Event::Deleted {
+                key: b"bad".to_vec()
+            }),
+            "a record that was there really did go away"
+        );
     }
 
     #[test]

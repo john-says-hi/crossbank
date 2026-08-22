@@ -336,6 +336,15 @@ where
     }
 
     /// Remove one key. Removing an absent key is not an error.
+    ///
+    /// **[`Event::Deleted`] is announced whether or not the key was there**,
+    /// and that differs from [`crate::Locker::delete`] on purpose. An eager
+    /// locker holds its values and can tell presence apart from absence for
+    /// nothing; a lazy one holds only the key index, which may not prove a key
+    /// absent (a staged batch, a maintenance locker, a web tab with coherence
+    /// off), so the only honest answer costs a backend read on every delete.
+    /// A watcher on a lazy locker must therefore tolerate a `Deleted` for a
+    /// key that was already gone.
     pub async fn delete(&self, key: &str) -> Result<()> {
         self.delete_by(key.as_bytes()).await
     }

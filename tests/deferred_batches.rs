@@ -387,13 +387,17 @@ fn a_failed_transaction_restages_the_batch_it_absorbed() {
     });
 }
 
-// ---- F13: one deferred handle per name ---------------------------------
+// ---- F13: every handle on one name is one locker -----------------------
 
-/// Two handles on one name under `Commit::Deferred` each keep their own
-/// staging buffer, so whichever flushed last silently overwrote the other.
-/// The second open is refused instead.
+/// Two handles on one name under `Commit::Deferred` share one staging buffer.
+///
+/// They each used to keep their own, over the same stored data, so whichever
+/// flushed last silently overwrote the other — which is why the second open
+/// was refused outright. Sharing the locker's state removes the hazard rather
+/// than refusing the open, so a Hive-shaped shim that calls `bank.locker(name)`
+/// at every call site works under `Deferred` too.
 #[test]
-fn a_second_deferred_handle_on_one_name_is_refused() {
+fn two_deferred_handles_on_one_name_share_one_staging_buffer() {
     block_on(async {
         let bank = Bank::open(BankConfig::memory()).await.expect("bank");
         let deferred = LockerConfig::default().with_commit(Commit::Deferred { after: 8 });
@@ -402,30 +406,43 @@ fn a_second_deferred_handle_on_one_name_is_refused() {
             .lazy_locker_with::<String>("only_one", deferred.clone())
             .await
             .expect("first open");
-
         let second = bank
             .lazy_locker_with::<String>("only_one", deferred.clone())
-            .await;
-        assert!(
-            matches!(second, Err(Error::InvalidConfig(_))),
-            "a second deferred handle must be refused: {second:?}"
+            .await
+            .expect("a second handle is a view of the first, not a rival writer");
+
+        first.put("a", &"alpha".to_string()).await.expect("stage a");
+        second.put("b", &"beta".to_string()).await.expect("stage b");
+
+        // Neither handle can lose the other's staged write, because there is
+        // only one buffer to lose it from.
+        assert_eq!(
+            second.get("a").await.expect("read"),
+            Some("alpha".to_string())
+        );
+        assert_eq!(
+            first.get("b").await.expect("read"),
+            Some("beta".to_string())
         );
 
-        // Even an immediate handle is refused while a deferred one is live:
-        // it would not see the staged batch either.
-        let immediate = bank.lazy_locker::<String>("only_one").await;
-        assert!(matches!(immediate, Err(Error::InvalidConfig(_))));
-
-        // Closing the first frees the name.
-        first.close().await.expect("close");
-        bank.lazy_locker::<String>("only_one")
+        // And one flush lands both.
+        second.flush().await.expect("flush");
+        let reader = bank
+            .lazy_locker_with::<String>("only_one", deferred.clone())
             .await
-            .expect("the name is free once the deferred handle is closed");
+            .expect("third handle");
+        assert_eq!(
+            reader.get("a").await.expect("read"),
+            Some("alpha".to_string())
+        );
+        assert_eq!(
+            reader.get("b").await.expect("read"),
+            Some("beta".to_string())
+        );
     });
 }
 
-/// Two immediate handles stay allowed — they hold nothing back, so the
-/// backend already serialises every write.
+/// Two immediate handles stay allowed, and share their state too.
 #[test]
 fn two_immediate_handles_on_one_name_are_still_allowed() {
     block_on(async {
@@ -437,16 +454,19 @@ fn two_immediate_handles_on_one_name_are_still_allowed() {
     });
 }
 
-/// Two handles on one name never sync their key indexes, so neither may use
-/// its own index to prove a key absent.
+/// Two handles on one name share one key index, so a write through either
+/// finds the chunks the other wrote.
 ///
-/// Handle A chunk-writes `k`; handle B, which has never heard of `k`, puts a
-/// small value over it. If B trusts its index it skips the read that finds
-/// A's chunks, and they are orphaned in the `chunks` table forever — nothing
-/// points at them and nothing will ever collect them.
+/// Handle A chunk-writes `k`; handle B puts a small value over it. While the
+/// two kept separate indexes, B's index had never heard of `k`, so B skipped
+/// the read that finds A's chunks and they were orphaned in the `chunks`
+/// table forever — nothing pointed at them and nothing would ever collect
+/// them.
 ///
-/// Negative control: delete the `index_is_authoritative` guard in
-/// `Resident::prior` and this goes red with A's eight chunks still stored.
+/// Negative control: give each handle its own `Inner` and resident state
+/// again — or open the two handles from two `Bank`s over the one backend,
+/// which is the unsupported arrangement that still reaches it — and this goes
+/// red with A's chunks still stored.
 #[test]
 fn a_second_handle_overwriting_a_chunked_key_leaves_no_orphan_chunks() {
     block_on(async {
@@ -463,46 +483,25 @@ fn a_second_handle_overwriting_a_chunked_key_leaves_no_orphan_chunks() {
             .await
             .expect("second handle");
 
-        // A stores a chunked value. B's index has never seen the key.
+        // A stores a chunked value. B sees it at once: one name, one index.
         a.put("k", &vec![9u8; 4096]).await.expect("chunked put");
         assert!(
-            !b.contains_key("k"),
-            "the second handle's index must be the stale one this test needs"
+            b.contains_key("k"),
+            "the second handle must see the first handle's write immediately"
         );
         assert_no_orphan_chunks(backend.as_ref()).await;
 
         // B overwrites it with a value small enough to store inline. Every
-        // chunk A wrote is now dead.
+        // chunk A wrote is now dead, and B's write is what has to collect it.
         b.put("k", &vec![1u8; 8]).await.expect("overwrite");
         assert_no_orphan_chunks(backend.as_ref()).await;
         assert_eq!(b.get("k").await.expect("read"), Some(vec![1u8; 8]));
 
-        // And the same for a delete, which takes the other branch. `b` writes
-        // it chunked; `a` has never heard of the key and deletes it.
+        // And the same for a delete, which takes the other branch.
         b.put("big", &vec![3u8; 4096]).await.expect("chunked put");
-        assert!(
-            !a.contains_key("big"),
-            "the deleting handle's index must be the stale one this test needs"
-        );
+        assert!(a.contains_key("big"));
         a.delete("big").await.expect("delete");
         assert_eq!(b.get("big").await.expect("read"), None);
         assert_no_orphan_chunks(backend.as_ref()).await;
-    });
-}
-
-/// A degenerate `Deferred` is `Immediate` with extra steps, and must not
-/// inherit the one-handle restriction.
-#[test]
-fn a_batch_of_one_does_not_count_as_deferral_for_the_handle_rule() {
-    block_on(async {
-        let bank = Bank::open(BankConfig::memory()).await.expect("bank");
-        let config = LockerConfig::default().with_commit(Commit::Deferred { after: 1 });
-        let _one = bank
-            .lazy_locker_with::<String>("degenerate", config.clone())
-            .await
-            .expect("first");
-        bank.lazy_locker_with::<String>("degenerate", config.clone())
-            .await
-            .expect("a batch of one stages nothing, so a second handle is fine");
     });
 }

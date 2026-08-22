@@ -35,6 +35,13 @@ use super::resident::{Pending, Resident};
 use super::transaction::{Staged, Transaction, TxMode};
 use crate::watch::Event;
 
+/// An eager locker's resident values.
+///
+/// Named because it is shared, type-erased, through the bank's open-locker
+/// registry, and the downcast back has to spell it exactly. See
+/// [`crate::Bank::locker_with`].
+pub(crate) type EagerValues<T> = Mutex<BTreeMap<Vec<u8>, Arc<T>>>;
+
 /// A locker whose values live in memory. Hive's `Box`.
 ///
 /// Every value is loaded at open and kept resident, which is what makes
@@ -71,19 +78,13 @@ use crate::watch::Event;
 pub struct Locker<T> {
     inner: Arc<Inner>,
     /// Shared with the coherence sink, which replaces resident values from
-    /// another tab's news without going through the locker handle.
-    values: Arc<Mutex<BTreeMap<Vec<u8>, Arc<T>>>>,
-    /// Keys whose stored bytes would not decode at open, under
-    /// [`OnCorrupt::Skip`]. Fixed once open returns.
-    corrupt: Vec<Vec<u8>>,
-    /// Staged writes, shared with [`crate::Bank::flush_all`], which cannot
-    /// know `T`. An eager locker keeps no key index and takes no byte budget,
-    /// so staging is all this holds.
+    /// another tab's news without going through the locker handle — and with
+    /// every other handle on this locker's name.
+    values: Arc<EagerValues<T>>,
+    /// Staged writes and the keys that would not decode, shared with
+    /// [`crate::Bank::flush_all`], which cannot know `T`. An eager locker
+    /// keeps no key index and takes no byte budget, so that is all this holds.
     res: Arc<Resident>,
-    /// Keeps this locker's coherence registration alive; the channel holds
-    /// only a `Weak`, so dropping the locker unregisters it.
-    #[cfg(target_arch = "wasm32")]
-    sink: Mutex<Option<crate::coherence::SinkHandle>>,
 }
 
 impl<T> std::fmt::Debug for Locker<T> {
@@ -182,14 +183,29 @@ where
         }
 
         let res = Arc::new(Resident::new(inner.clone(), TxMode::Eager, None, None));
+        for key in corrupt {
+            res.note_corrupt(&key);
+        }
         Ok(Self {
             inner,
             values: Arc::new(Mutex::new(values)),
-            corrupt,
             res,
-            #[cfg(target_arch = "wasm32")]
-            sink: Mutex::new(None),
         })
+    }
+
+    /// A second handle onto a name this bank already has open.
+    ///
+    /// Every part of the locker's state is shared, so the two handles are two
+    /// views of one open locker rather than two copies of it — which is what
+    /// `Hive.box(name)` gives, and the only shape that cannot serve a stale
+    /// read. Nothing is read from the backend: the first open already loaded
+    /// the values and bound the type and the filter chain.
+    pub(crate) fn from_shared(
+        inner: Arc<Inner>,
+        values: Arc<EagerValues<T>>,
+        res: Arc<Resident>,
+    ) -> Self {
+        Self { inner, values, res }
     }
 
     /// Store a value. Writes are asynchronous even though reads are not.
@@ -548,14 +564,8 @@ impl<T: DeserializeOwned + 'static> Locker<T> {
     pub(crate) fn join_coherence(&self) {
         #[cfg(target_arch = "wasm32")]
         {
-            if !self.inner.shared.coherence.is_enabled() {
-                return;
-            }
-            let handle = crate::coherence::handle(self.sink());
-            self.inner.shared.coherence.register(&handle);
-            if let Ok(mut slot) = self.sink.lock() {
-                *slot = Some(handle);
-            }
+            self.res
+                .join_coherence(|| crate::coherence::handle(self.sink()));
         }
     }
 }
@@ -573,6 +583,11 @@ impl<T> Locker<T> {
         &self.res
     }
 
+    /// The resident map, for the bank to hand to the next handle on this name.
+    pub(crate) fn shared_values(&self) -> &Arc<EagerValues<T>> {
+        &self.values
+    }
+
     /// Keys whose stored bytes would not decode when this locker was opened.
     ///
     /// Always empty under [`OnCorrupt::Fail`], which refuses to open at all
@@ -581,7 +596,7 @@ impl<T> Locker<T> {
     /// their bytes are still on disk, untouched. [`crate::Bank::quarantine`]
     /// is the only thing that removes them.
     pub fn corrupt_keys(&self) -> Vec<Vec<u8>> {
-        self.corrupt.clone()
+        self.res.corrupt_keys()
     }
 
     /// Close this locker: drop its resident values and refuse further writes.

@@ -831,9 +831,11 @@ a cost we have chosen to carry. None of them loses data.
   will happily build a second bank over the same `Arc<dyn Backend>`, and the
   two share no state at all: separate open-locker registries, separate name-id
   caches, separate resident lists. So neither can see that the other holds a
-  handle on a name, which defeats `name_shared` (the flag that stops a stale
-  RAM index proving a key absent and orphaning its chunks forever), the
-  `Commit::Deferred` single-handle guard, the "is it open?" refusals in
+  handle on a name — the sharing that makes every handle on one name a view of
+  one open locker stops at the bank boundary, and the two banks' resident
+  values and RAM indexes diverge silently. That is the `name_shared` hazard
+  (a stale RAM index proving a key absent and orphaning its chunks forever),
+  and it also defeats the "is it open?" refusals in
   `delete_locker` and `quarantine`, and `flush_all`'s claim to cover every
   open locker. This is a documented constraint rather than an enforced one:
   the backend `Arc` is the caller's, and a bank cannot tell whether another
@@ -858,6 +860,30 @@ a cost we have chosen to carry. None of them loses data.
   from "fresh name" other than whether the name already existed, and guessing
   wrong stamps a lie into `meta` that bricks every stored value. Copy the
   values into a new locker name to move a locker onto its own chain.
+- **Every handle on one locker name shares one state, and `close` closes the
+  name.** `Bank::locker(name)` used to hand out an independent handle per call,
+  each with its own resident values or key index, and they never synchronised —
+  so a `get` through one could answer with a value another had already
+  overwritten. That is a silent wrong answer, and the shape a Hive-style shim
+  (which calls `box(name)` at hundreds of call sites) would hit constantly, so
+  the handles now share: one `Inner`, one resident map or index, one staged
+  batch, one watcher set, one coherence registration. Three consequences are
+  deliberate. A second open must **agree** with the first — a different value
+  type or container kind is `SchemaMismatch`, a different `LockerConfig` is
+  `InvalidConfig` naming the field — because sharing means one set of rules
+  governs both handles' writes. `close()` on any handle closes the locker for
+  all of them, as `box.close()` does in Hive; the alternative (a handle still
+  serving reads out of state its own `close` released) would make `close` mean
+  nothing. And an eager locker's value type now needs `Send + Sync`: the bank
+  holds the shared map type-erased so it can hand it to the next handle, and
+  `Arc::downcast` — the only route back to the typed map without `unsafe`,
+  which this crate forbids — exists solely for `Arc<dyn Any + Send + Sync>`.
+- **Recovering an eager key after `Event::Stale` means closing the locker
+  first.** The documented recovery was "reopen the locker", which used to mean
+  a second `Bank::locker(name)` call reading storage afresh. Now that every
+  handle on a name is a view of one open locker, that call returns the same
+  resident state, stale key and all. `close()` then open, or read the key
+  through a lazy handle, which never answers from a resident value at all.
 - **A key written twice in one transaction is collapsed.** Only the last write
   per key is committed (and everything before a `clear` is dropped), so the
   eager size check applies to what actually lands rather than to every

@@ -140,7 +140,11 @@ async fn an_eager_locker_absorbs_small_writes_and_goes_stale_on_large_ones() {
         "a value too large to carry must not be answered from a stale copy"
     );
 
-    // Reopening is what recovers it, exactly as documented.
+    // Reopening is what recovers it, exactly as documented — and reopening
+    // means *closing* the locker first: every handle on a name is a view of
+    // one open locker, so asking the bank for it again while this one is open
+    // hands back the same resident state, stale key and all.
+    ea.close().await.unwrap();
     let reopened = a.locker_with::<Vec<u8>>("e", config).await.unwrap();
     assert_eq!(
         reopened.get("small").as_deref(),

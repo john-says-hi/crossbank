@@ -25,7 +25,9 @@ use crate::error::{Error, Result};
 
 use crate::handle::{Job, JOB_QUEUE};
 use crate::key::LockerId;
+use crate::locker::eager::EagerValues;
 use crate::locker::inner::Inner;
+use crate::locker::transaction::TxMode;
 use crate::locker::{LazyLocker, Locker, LockerConfig};
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -64,6 +66,101 @@ fn u32_from(bytes: &[u8], what: &str) -> Result<u32> {
     <[u8; 4]>::try_from(bytes)
         .map(u32::from_be_bytes)
         .map_err(|_| Error::Corrupt(format!("{what} is not a 4-byte integer")))
+}
+
+/// The state every handle on one locker name shares, held weakly.
+///
+/// Weakly because the bank must not keep a locker alive: the entry exists to
+/// let a later `locker(name)` find the open locker, not to own it.
+struct OpenLocker {
+    inner: Weak<Inner>,
+    resident: Weak<crate::locker::resident::Resident>,
+    /// An eager locker's resident value map, type-erased: the bank cannot
+    /// name `T`, and the type tag is what proves the downcast is sound.
+    /// `None` on a lazy locker, which holds no values.
+    ///
+    /// `Send + Sync` on every target, not only natively where the bank is
+    /// `Sync` and this is reachable through it: `Arc::downcast` — the only way
+    /// back to the typed map without `unsafe`, which this crate forbids — is
+    /// implemented for `Arc<dyn Any + Send + Sync>` and for nothing else. That
+    /// is where an eager value type's two bounds come from.
+    values: Option<Weak<dyn std::any::Any + Send + Sync>>,
+    kind: TxMode,
+    /// [`crate::codec::type_tag`] of the value type it was opened as.
+    type_tag: String,
+    config: LockerConfig,
+}
+
+/// [`OpenLocker`] with every part upgraded, or nothing.
+struct Shared {
+    inner: Arc<Inner>,
+    resident: Arc<crate::locker::resident::Resident>,
+    values: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    kind: TxMode,
+    type_tag: String,
+    config: LockerConfig,
+}
+
+impl OpenLocker {
+    /// The live state, or `None` if the last handle has gone or closed.
+    fn upgrade(&self) -> Option<Shared> {
+        let inner = self.inner.upgrade()?;
+        if inner.is_closed() {
+            return None;
+        }
+        let resident = self.resident.upgrade()?;
+        let values = match self.values.as_ref() {
+            Some(weak) => Some(weak.upgrade()?),
+            None => None,
+        };
+        Some(Shared {
+            inner,
+            resident,
+            values,
+            kind: self.kind,
+            type_tag: self.type_tag.clone(),
+            config: self.config.clone(),
+        })
+    }
+}
+
+fn kind_word(kind: TxMode) -> &'static str {
+    match kind {
+        TxMode::Eager => "eager",
+        TxMode::Lazy => "lazy",
+    }
+}
+
+/// The first field two configs disagree on, if any.
+///
+/// Named rather than merely reported so the caller is told which open to
+/// change. The order is the order the fields are declared in.
+fn config_conflict(open: &LockerConfig, requested: &LockerConfig) -> Option<&'static str> {
+    if open.max_inline != requested.max_inline {
+        return Some("max_inline");
+    }
+    if open.eager_budget != requested.eager_budget {
+        return Some("eager_budget");
+    }
+    if open.policy != requested.policy {
+        return Some("policy");
+    }
+    if open.commit != requested.commit {
+        return Some("commit");
+    }
+    if open.durability != requested.durability {
+        return Some("durability");
+    }
+    if open.on_corrupt != requested.on_corrupt {
+        return Some("on_corrupt");
+    }
+    if open.chunk_size != requested.chunk_size {
+        return Some("chunk_size");
+    }
+    if open.chain_id() != requested.chain_id() {
+        return Some("filter chain");
+    }
+    None
 }
 
 /// Where a bank stores its data.
@@ -110,8 +207,10 @@ pub struct BankConfig {
     /// copy is dropped and [`crate::Event::Stale`] is raised. The key is then
     /// gone from *every* resident answer, not just `get()`: `len()`, `keys()`,
     /// `keys_bytes()`, `contains_key()`, `entries()` and `to_map()` all stop
-    /// reporting it, until the locker is reopened and reads the bytes that are
-    /// still perfectly intact in storage. Lazy lockers have no such limit:
+    /// reporting it, until the locker is closed and opened again, which reads
+    /// the bytes that are still perfectly intact in storage. (Closed and
+    /// opened, not merely opened again: every handle on a name is a view of
+    /// one open locker — see [`Bank::locker_with`].) Lazy lockers have no such limit:
     /// their key index is updated either way.
     ///
     /// # How two tabs writing one key are resolved
@@ -181,9 +280,8 @@ impl BankConfig {
 /// One bank is one store — a `redb` file natively, one IndexedDB database on
 /// the web — and every locker inside it shares that store, its filter chain
 /// and its chunk-id allocator. Opening the same locker name twice is allowed
-/// and gives two independent handles; the one exception is
-/// [`crate::Commit::Deferred`], where a second live handle is refused because
-/// two staging buffers over one name would overwrite each other.
+/// and every handle on a name is a view of the **one** open locker, exactly as
+/// `Hive.box(name)` is — see [`Bank::locker_with`].
 ///
 /// ```no_run
 /// use crossbank::{Bank, BankConfig, LazyLocker, Locker};
@@ -235,16 +333,18 @@ pub struct Bank {
     /// Taken exactly once, by `into_service`. A second service would silently
     /// steal jobs from the first.
     job_receiver: Mutex<Option<mpsc::Receiver<Job>>>,
-    /// Name to the locker handles currently open under it.
+    /// Name to the one open locker under it.
     ///
-    /// `Weak`, so a locker the application dropped stops counting as open
-    /// without needing a destructor to reach back into the bank. Entries are
-    /// pruned lazily on every read.
-    /// Every live handle per name, not just the newest. Keeping one `Weak`
-    /// per name meant opening a name twice and dropping the *second* handle
-    /// made the name read as closed while the first was still live, which let
-    /// `delete_locker` and `quarantine` run under a working locker.
-    open_lockers: Mutex<HashMap<String, Vec<Weak<Inner>>>>,
+    /// **One entry per name, and every handle on that name is a view of it.**
+    /// Handing out independent handles instead let one handle serve a read
+    /// from RAM that another handle had already overwritten — silently, and
+    /// with no error anywhere. See [`Bank::locker`].
+    ///
+    /// `Weak` throughout, so a locker the application dropped stops counting
+    /// as open without needing a destructor to reach back into the bank.
+    /// Entries are pruned lazily on every read, and the entry outlives any
+    /// one handle: it goes when the last one does.
+    open_lockers: Mutex<HashMap<String, OpenLocker>>,
     /// The staged-write buffers of every open locker.
     ///
     /// `Weak`, and non-generic, so [`Bank::flush_all`] can commit them all
@@ -420,10 +520,11 @@ impl Bank {
     /// **One `Bank` per backend instance.** Two banks over one backend are not
     /// two views of a store, they are two uncoordinated writers: each keeps
     /// its own open-locker registry, so neither can see that the other holds a
-    /// handle on a name. That defeats the `name_shared` flag — the thing that stops a stale RAM index proving a
-    /// key absent and orphaning its chunks forever (see `PLAN.md`, "Known
-    /// limitations") — and it defeats the `Commit::Deferred` single-handle
-    /// guard, `delete_locker`'s and `quarantine`'s "is it open?" refusals, and
+    /// handle on a name — so the sharing that makes two handles on one name
+    /// one locker stops at the bank boundary, and the two banks' RAM indexes
+    /// and resident values silently diverge. That is the `name_shared` hazard
+    /// (see `PLAN.md`, "Known limitations"), and it also defeats
+    /// `delete_locker`'s and `quarantine`'s "is it open?" refusals and
     /// `flush_all`'s claim to cover every open locker.
     ///
     /// Share the one `Bank` (it is `Sync`, and [`crate::BankHandle`] is
@@ -573,39 +674,88 @@ impl Bank {
     /// await. Fails if the stored contents exceed the configured budget, which
     /// is the guardrail against reaching for this where a lazy locker was
     /// meant.
+    ///
+    /// **Opening a name that is already open returns another handle onto the
+    /// same open locker**, exactly as Hive's `Hive.box(name)` does — see
+    /// [`Bank::locker_with`].
     pub async fn locker<T>(&self, name: &str) -> Result<Locker<T>>
     where
         // `'static` because an eager locker's resident values are what a
         // coherence callback replaces, and a callback outlives the call that
-        // installed it.
-        T: Serialize + DeserializeOwned + 'static,
+        // installed it. `Send + Sync` because every handle on a name shares
+        // one resident map, the bank holds it type-erased to do that, and
+        // `Arc::downcast` — the only `unsafe`-free way back to the typed map —
+        // exists solely for `Arc<dyn Any + Send + Sync>`. Both hold for any
+        // ordinary serialisable value type.
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
     {
         self.locker_with(name, LockerConfig::default()).await
     }
 
     /// As [`Bank::locker`], with explicit limits.
     ///
-    /// Opening the same name twice is allowed and gives two independent
-    /// handles — **except under [`crate::Commit::Deferred`]**, where the
-    /// second open reports [`Error::InvalidConfig`]. See
-    /// [`Bank::refuse_second_deferred_handle`].
+    /// # Opening one name twice
+    ///
+    /// Allowed, and the second handle is a **view of the first**: one resident
+    /// map, one staged batch, one set of watchers, shared by every handle on
+    /// the name. A `put` through one is visible to a `get` through the other
+    /// immediately, and a `watch` on either sees both. That is `Hive.box`'s
+    /// contract, and the only one a caller can hold safely — two independent
+    /// handles served stale reads from their own RAM with no error anywhere.
+    ///
+    /// Because they share, the two opens must agree:
+    ///
+    /// * a different value type, or opening a lazy name eagerly (or the other
+    ///   way round), is [`Error::SchemaMismatch`];
+    /// * a different [`LockerConfig`] is [`Error::InvalidConfig`], naming the
+    ///   field that differs.
+    ///
+    /// A shared open reads nothing from storage — the first open already did.
+    /// [`Locker::close`] closes the locker for **every** handle on the name,
+    /// as `box.close()` does in Hive; opening the name again afterwards opens
+    /// it afresh.
     pub async fn locker_with<T>(&self, name: &str, config: LockerConfig) -> Result<Locker<T>>
     where
-        T: Serialize + DeserializeOwned + 'static,
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
     {
-        self.refuse_second_deferred_handle(name, &config)?;
+        self.ensure_open()?;
         let chain = self.chain_for(&config);
+        if let Some(open) = self.open_locker(name) {
+            Self::check_shared::<T>(name, &open, TxMode::Eager, &config)?;
+            let values = open
+                .values
+                .clone()
+                .and_then(|erased| erased.downcast::<EagerValues<T>>().ok())
+                .ok_or_else(|| Error::SchemaMismatch {
+                    stored: open.type_tag.clone(),
+                    requested: type_tag::<T>(),
+                })?;
+            return Ok(Locker::from_shared(open.inner, values, open.resident));
+        }
+
         let id = self.prepare::<T>(name, &chain).await?;
         let locker = Locker::open(
             self.backend.clone(),
             chain,
             id,
             name.to_string(),
-            config,
+            config.clone(),
             self.shared.clone(),
         )
         .await?;
-        self.register_open(name, locker.inner());
+        self.register_open(
+            name,
+            OpenLocker {
+                inner: Arc::downgrade(locker.inner()),
+                resident: Arc::downgrade(locker.resident()),
+                values: Some(
+                    Arc::downgrade(locker.shared_values()) as Weak<dyn std::any::Any + Send + Sync>
+                ),
+                kind: TxMode::Eager,
+                type_tag: type_tag::<T>(),
+                config,
+            },
+        );
         self.register_resident(locker.resident());
         locker.join_coherence();
         Ok(locker)
@@ -615,6 +765,10 @@ impl Bank {
     ///
     /// For bulk data. Open cost scales with the number of keys, not the size
     /// of the data.
+    ///
+    /// **Opening a name that is already open returns another handle onto the
+    /// same open locker** — see [`Bank::locker_with`], whose rules apply here
+    /// unchanged.
     pub async fn lazy_locker<T>(&self, name: &str) -> Result<LazyLocker<T>>
     where
         T: Serialize + DeserializeOwned,
@@ -624,10 +778,9 @@ impl Bank {
 
     /// As [`Bank::lazy_locker`], with explicit limits.
     ///
-    /// Opening the same name twice is allowed and gives two independent
-    /// handles — **except under [`crate::Commit::Deferred`]**, where the
-    /// second open reports [`Error::InvalidConfig`]. See
-    /// [`Bank::refuse_second_deferred_handle`].
+    /// Opening one name twice shares the key index, the byte budget, the
+    /// staged batch and the watchers, under the same agreement rules as
+    /// [`Bank::locker_with`].
     pub async fn lazy_locker_with<T>(
         &self,
         name: &str,
@@ -636,19 +789,34 @@ impl Bank {
     where
         T: Serialize + DeserializeOwned,
     {
-        self.refuse_second_deferred_handle(name, &config)?;
+        self.ensure_open()?;
         let chain = self.chain_for(&config);
+        if let Some(open) = self.open_locker(name) {
+            Self::check_shared::<T>(name, &open, TxMode::Lazy, &config)?;
+            return Ok(LazyLocker::from_shared(open.inner, open.resident));
+        }
+
         let id = self.prepare::<T>(name, &chain).await?;
         let locker = LazyLocker::open(
             self.backend.clone(),
             chain,
             id,
             name.to_string(),
-            config,
+            config.clone(),
             self.shared.clone(),
         )
         .await?;
-        self.register_open(name, locker.inner());
+        self.register_open(
+            name,
+            OpenLocker {
+                inner: Arc::downgrade(locker.inner()),
+                resident: Arc::downgrade(locker.resident()),
+                values: None,
+                kind: TxMode::Lazy,
+                type_tag: type_tag::<T>(),
+                config,
+            },
+        );
         self.register_resident(locker.resident());
         locker.join_coherence();
         Ok(locker)
@@ -1385,60 +1553,55 @@ impl Bank {
         }
     }
 
-    /// Refuse a second live handle on a name where either side stages writes.
-    ///
-    /// Two handles under [`crate::Commit::Deferred`] each hold their own
-    /// staging buffer over the same stored data. Neither can see the other's,
-    /// so whichever flushes last overwrites the other's writes — silently, and
-    /// with no way for either caller to notice. There is no sane merge to
-    /// perform after the fact, so the second open is refused instead.
-    ///
-    /// Two `Commit::Immediate` handles stay allowed: they hold nothing back,
-    /// so every write is already serialised by the backend.
-    fn refuse_second_deferred_handle(&self, name: &str, config: &LockerConfig) -> Result<()> {
-        let Ok(mut guard) = self.open_lockers.lock() else {
-            return Ok(());
-        };
-        Self::prune(&mut guard);
-        let Some(handles) = guard.get(name) else {
-            return Ok(());
-        };
-        let existing_defers = handles
-            .iter()
-            .filter_map(|weak| weak.upgrade())
-            .any(|inner| inner.config.defers_writes());
-        if !existing_defers && !config.defers_writes() {
-            return Ok(());
-        }
-        if handles.is_empty() {
-            return Ok(());
-        }
-        Err(Error::InvalidConfig(format!(
-            "locker {name:?} is already open and one of the two handles uses \
-             Commit::Deferred; a deferred locker may have only one live handle, \
-             because two staging buffers over one name overwrite each other. \
-             Close the other handle first, or share this one."
-        )))
-    }
-
-    fn register_open(&self, name: &str, inner: &Arc<Inner>) {
+    /// Record the one open locker for `name`, replacing any dead entry.
+    fn register_open(&self, name: &str, open: OpenLocker) {
         if let Ok(mut guard) = self.open_lockers.lock() {
             Self::prune(&mut guard);
-            let handles = guard.entry(name.to_string()).or_default();
-            handles.push(Arc::downgrade(inner));
-            // A second live handle on one name means neither handle's RAM
-            // index can prove a key absent any more: they never sync, so a
-            // chunked record one of them wrote is invisible to the other, and
-            // overwriting it from the wrong side would orphan its chunks
-            // forever. Mark every live handle, including this one, and never
-            // unmark — closing the other handle does not unwrite what it
-            // wrote. See `Inner::index_is_authoritative`.
-            if handles.len() > 1 {
-                for live in handles.iter().filter_map(Weak::upgrade) {
-                    live.mark_name_shared();
-                }
-            }
+            guard.insert(name.to_string(), open);
         }
+    }
+
+    /// The live state behind `name`, if this bank still has it open.
+    fn open_locker(&self, name: &str) -> Option<Shared> {
+        let mut guard = self.open_lockers.lock().ok()?;
+        Self::prune(&mut guard);
+        guard.get(name)?.upgrade()
+    }
+
+    /// Refuse a second handle whose open would mean something different from
+    /// the first one's.
+    ///
+    /// Sharing is only safe while both handles agree about what the locker
+    /// *is*. A different value type would decode one handle's writes into
+    /// plausible garbage for the other; a different config would mean one
+    /// handle's rules silently governing the other's writes.
+    fn check_shared<T>(
+        name: &str,
+        open: &Shared,
+        kind: TxMode,
+        config: &LockerConfig,
+    ) -> Result<()> {
+        if open.kind != kind {
+            return Err(Error::SchemaMismatch {
+                stored: format!("{} locker {name:?}", kind_word(open.kind)),
+                requested: format!("{} locker {name:?}", kind_word(kind)),
+            });
+        }
+        let requested = type_tag::<T>();
+        if open.type_tag != requested {
+            return Err(Error::SchemaMismatch {
+                stored: open.type_tag.clone(),
+                requested,
+            });
+        }
+        if let Some(field) = config_conflict(&open.config, config) {
+            return Err(Error::InvalidConfig(format!(
+                "locker {name:?} is already open with a different {field}; every handle on \
+                 one name shares its state, so they must be opened the same way. Close the \
+                 open handle first, or open this one with the same config."
+            )));
+        }
+        Ok(())
     }
 
     /// Whether a locker is currently open under `name`.
@@ -1447,12 +1610,10 @@ impl Bank {
     /// `close()` called on it. Dropped handles stop counting on the next read
     /// of this registry.
     ///
-    /// Note that opening the same name twice is **allowed** and returns two
-    /// independent handles over the same stored data — the eager form gives
-    /// each its own resident copy, which will diverge on write. The name
-    /// counts as open until *every* one of those handles is dropped or
-    /// closed. The one exception is [`crate::Commit::Deferred`], where a
-    /// second live handle is refused outright.
+    /// Opening the same name twice is **allowed** and hands out another view
+    /// of the same open locker (see [`Bank::locker_with`]). The name counts as
+    /// open until every one of those handles is dropped — or until any one of
+    /// them is closed, which closes the locker for all of them.
     pub fn is_locker_open(&self, name: &str) -> bool {
         let Ok(mut guard) = self.open_lockers.lock() else {
             return false;
@@ -1472,14 +1633,11 @@ impl Bank {
         names
     }
 
-    /// Drop handles that are gone or closed, and names left with none.
-    fn prune(map: &mut HashMap<String, Vec<Weak<Inner>>>) {
-        map.retain(|_, handles| {
-            handles.retain(|weak| match weak.upgrade() {
-                Some(inner) => !inner.is_closed(),
-                None => false,
-            });
-            !handles.is_empty()
+    /// Drop names whose last handle is gone, or that have been closed.
+    fn prune(map: &mut HashMap<String, OpenLocker>) {
+        map.retain(|_, open| match open.inner.upgrade() {
+            Some(inner) => !inner.is_closed(),
+            None => false,
         });
     }
 

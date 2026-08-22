@@ -54,7 +54,11 @@ pub enum Event {
     /// though the key were never written — because a resident locker answers
     /// all of them from the same map, and a value it cannot decode is a value
     /// it cannot hold. Reopening the locker reads the stored bytes and brings
-    /// the key back.
+    /// the key back — and reopening means [`crate::Locker::close`] first, then
+    /// asking the bank for the name again: while a handle is open, every other
+    /// handle on that name is a view of the same resident state (see
+    /// [`crate::Bank::locker_with`]), so a second open cannot re-read. A lazy
+    /// handle on the same name reads through to storage without any of that.
     ///
     /// A lazy locker has no such limit — it fetches on demand — so it raises
     /// [`Event::Put`] instead.

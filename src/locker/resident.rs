@@ -68,6 +68,22 @@ pub(crate) struct Resident {
     /// one orphans chunks. `None` on a locker with no index, where absence
     /// cannot be proven anyway.
     known_inline: Option<Mutex<BTreeSet<Vec<u8>>>>,
+    /// Keys whose stored bytes would not decode.
+    ///
+    /// Lives here, rather than on the locker handle, because every handle on
+    /// one name shares this state — see [`crate::Bank::locker`]. An eager
+    /// locker fills it at open and never adds to it; a lazy one adds a key as
+    /// a read discovers the damage.
+    corrupt: Mutex<BTreeSet<Vec<u8>>>,
+    /// This name's registration with the cross-tab channel, which holds only
+    /// a `Weak` and so stops delivering the moment this is dropped.
+    ///
+    /// One per *name*, not per handle: every handle folds another tab's news
+    /// into the same resident state, so a second registration would apply the
+    /// same news twice, and hanging it off one handle would silently stop the
+    /// others hearing anything the moment that handle was dropped.
+    #[cfg(target_arch = "wasm32")]
+    sink: Mutex<Option<crate::coherence::SinkHandle>>,
 }
 
 impl std::fmt::Debug for Resident {
@@ -93,7 +109,47 @@ impl Resident {
             index: index.map(Mutex::new),
             lru: lru.map(Mutex::new),
             staged: Mutex::new(Vec::new()),
+            corrupt: Mutex::new(BTreeSet::new()),
+            #[cfg(target_arch = "wasm32")]
+            sink: Mutex::new(None),
         }
+    }
+
+    // ---- keys that would not decode ------------------------------------
+
+    /// Note that `key`'s stored bytes did not decode.
+    pub(crate) fn note_corrupt(&self, key: &[u8]) {
+        if let Ok(mut guard) = self.corrupt.lock() {
+            guard.insert(key.to_vec());
+        }
+    }
+
+    /// Every key noted so far, in byte order.
+    pub(crate) fn corrupt_keys(&self) -> Vec<Vec<u8>> {
+        self.corrupt
+            .lock()
+            .map(|c| c.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Register this name with the cross-tab channel, once.
+    ///
+    /// `make` is only called when nothing is registered yet, so a second
+    /// handle on the name does not build a sink it would have to throw away.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn join_coherence(&self, make: impl FnOnce() -> crate::coherence::SinkHandle) {
+        if !self.inner.shared.coherence.is_enabled() {
+            return;
+        }
+        let Ok(mut slot) = self.sink.lock() else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        let handle = make();
+        self.inner.shared.coherence.register(&handle);
+        *slot = Some(handle);
     }
 
     // ---- the key index -------------------------------------------------
@@ -121,11 +177,12 @@ impl Resident {
     /// * nothing is staged. A staged delete drops the key from the index while
     ///   the record is still stored, so a staged batch makes the index
     ///   over-claim *absence* — the one direction that loses data;
-    /// * this handle's index is authoritative — no second handle has been live
-    ///   on the name, and on the web cross-tab coherence is on. Both of those
-    ///   let someone else write a chunked record this index has never heard of,
-    ///   whose chunks would then be orphaned forever. See
-    ///   [`Inner::index_is_authoritative`].
+    /// * this handle's index is authoritative — nobody this index will never
+    ///   hear from can be writing the same stored data. Every handle on one
+    ///   name shares this index, so that is about maintenance lockers and, on
+    ///   the web, other tabs with coherence off: either could write a chunked
+    ///   record this index has never heard of, whose chunks would then be
+    ///   orphaned forever. See [`Inner::index_is_authoritative`].
     ///
     /// `Inline` additionally requires that this handle wrote the record and
     /// nothing has since invalidated that. See [`Resident::note_inline`].

@@ -68,7 +68,18 @@ every file that imported it. The root handle is `Bank` rather than the `Hive` st
 | `box.compact()` | not needed — redb and IndexedDB reclaim their own space |
 | `HiveAesCipher` | the `Filter` trait — **no crypto is bundled** |
 
-Two differences worth knowing before you port anything:
+**One name is one open locker.** `Hive.box(name)` is a process-wide singleton, and
+`Bank::locker(name)` behaves the same way: opening a name that is already open hands back
+another view of the *same* locker — one resident map (or key index), one staged batch, one
+set of watchers — so a write through any handle is visible through every other one
+immediately, and a `watch` on either sees both. A shim that calls `bank.locker(name)` at
+every call site therefore cannot read a stale value. The two opens have to agree: a
+different value type, or the other container kind, is `Error::SchemaMismatch`, and a
+different `LockerConfig` is `Error::InvalidConfig` naming the field that differs. `close()`
+closes the locker for every handle on the name, exactly as `box.close()` does; the name
+reopens afresh afterwards.
+
+Two more differences worth knowing before you port anything:
 
 - **Keys are bytes.** A `&str` key is stored as exactly its UTF-8 bytes, and every `&str`
   method has a `_by` twin taking `&[u8]` (`get_by`, `put_by`, `range_by`, …). Hive's

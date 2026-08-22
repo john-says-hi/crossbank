@@ -93,6 +93,20 @@ because Hive's `get(key, defaultValue:)` is used on a `LazyBox` as readily as on
   stored chunks actually use, so an id in use is never handed out again. Reachable on the web
   (IndexedDB), where a write really does pause mid-flight; not on desktop or mobile.
 
+- Two handles on one locker name no longer read stale data. `Bank::locker(name)` used to
+  hand out an independent handle each time, with its own resident values (or its own key
+  index), and the two never synchronised — so a `get` through one could quietly answer with
+  a value the other had already overwritten or deleted, with no error anywhere. Every handle
+  on a name is now a view of the one open locker, as `Hive.box(name)` is: one resident map,
+  one key index, one staged batch, one set of watchers. A second open under a different
+  value type or container kind is `SchemaMismatch`, and one under a different `LockerConfig`
+  is `InvalidConfig` naming the field that differs; `close()` on any handle closes the
+  locker for all of them. Two consequences worth noting: an eager locker's value type now
+  needs `Send + Sync` (the bank holds the shared map type-erased, and `Arc::downcast` is
+  defined only for `Arc<dyn Any + Send + Sync>`), and recovering a key after `Event::Stale`
+  means closing the locker before opening it again, since opening it again on its own now
+  returns the same resident state.
+
 ### Notes
 
 - Hive's on-disk format is *not* read. There is no migration, by decision.

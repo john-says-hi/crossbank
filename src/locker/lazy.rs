@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -74,13 +74,6 @@ pub struct LazyLocker<T> {
     /// coherence sink and with [`crate::Bank::flush_all`] — neither of which
     /// can know `T`.
     pub(crate) res: Arc<Resident>,
-    /// Keys whose stored bytes failed to decode on a `get`. See
-    /// [`LazyLocker::corrupt_keys`].
-    corrupt: Mutex<BTreeSet<Vec<u8>>>,
-    /// Keeps this locker's coherence registration alive; the channel holds
-    /// only a `Weak`, so dropping the locker unregisters it.
-    #[cfg(target_arch = "wasm32")]
-    sink: Mutex<Option<crate::coherence::SinkHandle>>,
     _value: PhantomData<fn() -> T>,
 }
 
@@ -142,11 +135,23 @@ where
         Ok(Self {
             inner,
             res,
-            corrupt: Mutex::new(BTreeSet::new()),
-            #[cfg(target_arch = "wasm32")]
-            sink: Mutex::new(None),
             _value: PhantomData,
         })
+    }
+
+    /// A second handle onto a name this bank already has open.
+    ///
+    /// The key index, the byte budget, the staged batch and the watchers are
+    /// all shared, so the two handles are two views of one open locker rather
+    /// than two copies of it — see [`crate::Bank::lazy_locker`]. Nothing is
+    /// read from the backend: the first open already built the index and
+    /// bound the type and the filter chain.
+    pub(crate) fn from_shared(inner: Arc<Inner>, res: Arc<Resident>) -> Self {
+        Self {
+            inner,
+            res,
+            _value: PhantomData,
+        }
     }
 
     /// Fetch and decode one value.
@@ -224,9 +229,7 @@ where
     async fn load_and_note(&self, key: &[u8]) -> Result<Option<T>> {
         match self.inner.load_value(key).await {
             Err(e) if self.inner.config.on_corrupt == OnCorrupt::Skip && e.is_corruption() => {
-                if let Ok(mut guard) = self.corrupt.lock() {
-                    guard.insert(key.to_vec());
-                }
+                self.res.note_corrupt(key);
                 Err(e)
             }
             other => other,
@@ -761,7 +764,13 @@ fn in_bounds(key: &[u8], start: Bound<&[u8]>, end: Bound<&[u8]>) -> bool {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) struct LazySink {
     inner: Arc<Inner>,
-    res: Arc<Resident>,
+    /// Weak, because the sink is owned *by* the resident state — one
+    /// registration per locker name, kept alive for as long as the locker is
+    /// (see [`Resident::join_coherence`]). A strong reference here would be a
+    /// cycle, and the locker, its `Inner` and the backend handle underneath it
+    /// would never be freed — which on the web means an IndexedDB connection
+    /// that never closes and a `delete_bank` that never returns.
+    res: std::sync::Weak<Resident>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -774,18 +783,21 @@ impl crate::coherence::Sink for LazySink {
         if self.inner.is_closed() {
             return;
         }
+        let Some(res) = self.res.upgrade() else {
+            return;
+        };
         if announcement.cleared {
-            self.res.touch_index(|index| index.clear());
-            self.res.forget_inline();
+            res.touch_index(|index| index.clear());
+            res.forget_inline();
             // The byte budget has to follow the index, or this tab's
             // accounting drifts from what storage holds and it starts evicting
             // against a total that describes a locker that no longer exists.
-            self.res.remote_budget_clear();
+            res.remote_budget_clear();
             self.inner.epochs.forget_local();
             self.inner.announce(Event::Cleared);
         }
         for change in &announcement.changes {
-            self.res.touch_index(|index| {
+            res.touch_index(|index| {
                 if change.deleted {
                     index.remove(change.key.as_slice());
                 } else {
@@ -795,7 +807,7 @@ impl crate::coherence::Sink for LazySink {
             // Another tab may have replaced an inline record with a chunked
             // one. This tab's marker is stale either way, and a stale
             // `Inline` would skip the GC of chunks it did not write.
-            self.res.note_inline(&change.key, false);
+            res.note_inline(&change.key, false);
             // The size, where it can be had without awaiting: an inlined value
             // is opened through this tab's own filter chain, and a chunked one
             // announced its payload length. Anything else marks the accounting
@@ -804,7 +816,7 @@ impl crate::coherence::Sink for LazySink {
                 (Some(sealed), _) => self.inner.chain.open(sealed).ok().map(|p| p.len() as u64),
                 (None, announced) => announced,
             };
-            self.res.remote_budget(&change.key, bytes, change.deleted);
+            res.remote_budget(&change.key, bytes, change.deleted);
 
             // A lazy locker never holds values, so a write it could not carry
             // inline costs it nothing: the next `get` reads the new bytes.
@@ -826,7 +838,7 @@ impl<T> LazyLocker<T> {
     pub(crate) fn sink(&self) -> LazySink {
         LazySink {
             inner: self.inner.clone(),
-            res: self.res.clone(),
+            res: Arc::downgrade(&self.res),
         }
     }
 
@@ -838,14 +850,8 @@ impl<T> LazyLocker<T> {
     pub(crate) fn join_coherence(&self) {
         #[cfg(target_arch = "wasm32")]
         {
-            if !self.inner.shared.coherence.is_enabled() {
-                return;
-            }
-            let handle = crate::coherence::handle(self.sink());
-            self.inner.shared.coherence.register(&handle);
-            if let Ok(mut slot) = self.sink.lock() {
-                *slot = Some(handle);
-            }
+            self.res
+                .join_coherence(|| crate::coherence::handle(self.sink()));
         }
     }
 
@@ -934,10 +940,7 @@ impl<T> LazyLocker<T> {
     /// [`OnCorrupt::Skip`]. It is therefore a record of what *has been hit*,
     /// not a survey. [`crate::Bank::verify`] is the survey.
     pub fn corrupt_keys(&self) -> Vec<Vec<u8>> {
-        self.corrupt
-            .lock()
-            .map(|c| c.iter().cloned().collect())
-            .unwrap_or_default()
+        self.res.corrupt_keys()
     }
 
     /// Number of keys. Synchronous — the index is already here.

@@ -65,16 +65,17 @@ pub(crate) struct Shared {
 /// `Absent` or `Inline` **orphans chunks forever**. So every producer of this
 /// type errs towards `Unknown`.
 ///
-/// A RAM index can only answer for the handle that owns it, and it is only
-/// the whole truth when this handle is the only writer. Three things make it
-/// not the whole truth, and each of them forces `Unknown`:
+/// A RAM index is only the whole truth while nothing it will never hear from
+/// writes the same records. Every handle on one locker name shares one index
+/// (see [`crate::Bank::locker_with`]), so that is no longer the hazard it was;
+/// three things still make the index not the whole truth, and each of them
+/// forces `Unknown`:
 ///
 /// * a staged [`super::policy::Commit::Deferred`] batch, whose delete has
 ///   already left the index while the record is still stored;
-/// * **a second live handle on the same locker name**, which is legal (see
-///   [`crate::Bank::locker_with`]) and never syncs its index with this one, so
-///   a key this handle believes absent may be a chunked record the other
-///   handle wrote;
+/// * **a locker with no index at all**, such as the one the bank fabricates
+///   for maintenance, and the unsupported arrangement of two `Bank`s over one
+///   backend, where the second bank's writes are invisible to this index;
 /// * on wasm, cross-tab coherence being off, because another tab may have
 ///   chunk-written the very key this tab is about to overwrite and nothing
 ///   will ever tell us.
@@ -128,13 +129,16 @@ pub(crate) struct Inner {
     /// Only ever written when coherence is on, because it is filled from the
     /// announcement a commit produced and there is none otherwise.
     pub(crate) epochs: Epochs,
-    /// Set once a second live handle has existed on this locker's name, and
-    /// **never cleared**.
+    /// Set when this locker's stored data is reachable by an index this one
+    /// will never hear from, so its own index may not prove a key *absent*.
     ///
-    /// Two handles on one name are legal and keep entirely separate RAM
-    /// indexes. Once that has happened this handle's index can no longer prove
-    /// a key absent, and closing the other handle does not undo what it wrote
-    /// — so the flag is one-way on purpose. See [`Prior`].
+    /// Two handles on one name no longer set it: they share one `Inner` and
+    /// one index, so there is no second index to go stale (see
+    /// [`crate::Bank::locker_with`]). What still does is a locker the bank
+    /// fabricates for maintenance, which carries no index at all. The
+    /// remaining in-process way to reach the hazard is two `Bank`s over one
+    /// backend, which is documented as unsupported for exactly this reason.
+    /// See [`Prior`].
     pub(crate) name_shared: AtomicBool,
 }
 
@@ -220,11 +224,6 @@ impl Inner {
             return Err(Error::Closed);
         }
         Ok(())
-    }
-
-    /// Note that another handle is, or has been, live on this locker's name.
-    pub(crate) fn mark_name_shared(&self) {
-        self.name_shared.store(true, Ordering::Release);
     }
 
     /// Whether this handle's RAM index is allowed to prove a key *absent*.

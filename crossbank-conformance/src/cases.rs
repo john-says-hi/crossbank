@@ -952,8 +952,8 @@ pub async fn concurrent_chunk_writers_do_not_collide<H: Harness>(h: &H) -> Resul
     assert_eq!(second.get("k").await?, Some(b.clone()));
     let both = count_rows(&bank, Table::Chunks).await?;
 
-    // Two handles on ONE name are the same hazard: they share stored data but
-    // are separate objects.
+    // Two handles on ONE name are one locker now, but their chunked writes
+    // still have to own disjoint ids.
     let one = bank.lazy_locker_with::<V>("shared", tiny_chunks()).await?;
     let two = bank.lazy_locker_with::<V>("shared", tiny_chunks()).await?;
     let (l, r) = futures::future::join(one.put("x", &a), two.put("y", &b)).await;
@@ -1020,6 +1020,10 @@ pub async fn a_corrupt_chunk_pointer_does_not_block_delete<H: Harness>(h: &H) ->
 /// dropping the second made the name read as closed while the first handle
 /// was still live and serving data — enough to let `delete_locker` pull the
 /// data out from under it.
+///
+/// **Dropping is not closing.** `close()` on any handle closes the locker for
+/// every handle on the name, as `box.close()` does in Hive; this case is
+/// about the handle that simply goes out of scope.
 pub async fn a_name_is_open_until_every_handle_closes<H: Harness>(h: &H) -> Result<()> {
     let bank = bank(h).await?;
     let first = bank.lazy_locker::<V>("l").await?;
@@ -1027,7 +1031,7 @@ pub async fn a_name_is_open_until_every_handle_closes<H: Harness>(h: &H) -> Resu
     first.put("k", &v("x")).await?;
 
     assert!(bank.is_locker_open("l"));
-    second.close().await?;
+    drop(second);
     assert!(
         bank.is_locker_open("l"),
         "the first handle is still live, so the name is still open"
@@ -1045,6 +1049,84 @@ pub async fn a_name_is_open_until_every_handle_closes<H: Harness>(h: &H) -> Resu
     assert!(!bank.is_locker_open("l"));
     assert!(bank.open_locker_names().is_empty());
     assert!(bank.delete_locker("l").await?);
+    Ok(())
+}
+
+/// Two handles on one eager name are one locker, not two copies of it.
+///
+/// `Hive.box(name)` is a process-wide singleton, and a Hive-shaped shim over
+/// crossbank would call `bank.locker(name)` at every one of its call sites. So
+/// the second handle must not get its own resident map: it would answer `get`
+/// from RAM the first handle had already overwritten — a stale read, returned
+/// happily, with no error anywhere to notice it by.
+pub async fn two_handles_on_one_eager_name_share_state<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let a = bank.locker::<V>("settings").await?;
+    let b = bank.locker::<V>("settings").await?;
+
+    // A watcher registered on B hears what A writes: the watchers belong to
+    // the locker, not to the handle that asked for them.
+    let mut events = b.watch();
+
+    a.put("theme", v("dark")).await?;
+    assert_eq!(
+        b.get("theme").as_deref(),
+        Some(&v("dark")),
+        "the second handle must see the first handle's put synchronously"
+    );
+    assert_eq!(b.len(), 1);
+    assert_eq!(
+        events.next().await,
+        Some(Event::Put {
+            key: "theme".into()
+        })
+    );
+
+    // And in the other direction, including removal.
+    b.put("theme", v("light")).await?;
+    assert_eq!(a.get("theme").as_deref(), Some(&v("light")));
+
+    b.delete("theme").await?;
+    assert_eq!(
+        a.get("theme"),
+        None,
+        "a delete through either handle is the locker's delete"
+    );
+    assert!(!a.contains_key("theme"));
+    assert_eq!(a.len(), 0);
+    Ok(())
+}
+
+/// The same for a lazy name, whose resident state is the key index.
+///
+/// A lazy handle answers `len`, `keys` and `contains_key` from its index
+/// without touching storage, so a private index is the same stale answer in a
+/// different shape.
+pub async fn two_handles_on_one_lazy_name_share_the_index<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let a = bank.lazy_locker::<V>("series").await?;
+    let b = bank.lazy_locker::<V>("series").await?;
+
+    let mut events = b.watch();
+
+    a.put("k", &v("value")).await?;
+    assert!(
+        b.contains_key("k"),
+        "the second handle's index must see the put"
+    );
+    assert_eq!(b.len(), 1);
+    assert_eq!(b.keys(), vec!["k".to_string()]);
+    assert_eq!(b.get("k").await?, Some(v("value")));
+    assert_eq!(events.next().await, Some(Event::Put { key: "k".into() }));
+
+    b.delete("k").await?;
+    assert!(
+        !a.contains_key("k"),
+        "the first handle's index must see the delete"
+    );
+    assert_eq!(a.len(), 0);
+    assert!(a.keys().is_empty());
+    assert_eq!(a.get("k").await?, None);
     Ok(())
 }
 

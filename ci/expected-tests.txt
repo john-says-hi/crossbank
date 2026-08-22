@@ -11,12 +11,12 @@
 # WHEN YOU ADD TEST CASES YOU MUST BUMP THESE NUMBERS. Run the lane, take the
 # "OK: N test(s) actually ran and passed." number, and write N here.
 #
-# Last verified: 2026-08-21, the value-id counter fix: 134 tests per lane.
-# (131 at M6, +2 for the new conformance case x two browser backends, and +1
-#  for the LazyLocker::get_or unit test that landed without a bump.)
-plain-firefox    134
-plain-chrome     134
-atomics-chrome   134
-atomics-firefox  134
+# Last verified: 2026-08-21, shared locker handles: 138 tests per lane.
+# (134 at the value-id counter fix, +4 for the two new conformance cases x
+#  two browser backends.)
+plain-firefox    138
+plain-chrome     138
+atomics-chrome   138
+atomics-firefox  138
 # Safari runs the same plain suite; the lane is new and non-blocking.
-plain-safari     134
+plain-safari     138

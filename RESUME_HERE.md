@@ -195,8 +195,14 @@ is answered in prose (README → Web caveats), because nothing in code can answe
 - **Publish readiness.** Version 0.1.0, `exclude` list, `CHANGELOG.md`, 13 doc examples where
   there had been **zero**, and `examples/{settings,candles,flush_on_pagehide}.rs`.
 
-**331 tests native, 13 doctests. The conformance suite × 3 backends in browsers, plus
-browser-only coherence tests.**
+**352 tests native, 14 doctests, 138 per wasm lane. The conformance suite × 3 backends in
+browsers, plus browser-only coherence tests.**
+
+**Post-M6 — one locker name is one open locker.** `Bank::locker` handed out an independent
+handle per call, so two handles on a name served each other stale reads with no error — the
+single biggest accuracy risk for the Hive-replacement goal, since `Hive.box(name)` is a
+process-wide singleton. Every handle on a name is now a view of one open locker. See traps
+16, 27 and 35, and `PLAN.md` → Known limitations.
 
 ### Remaining work
 
@@ -278,12 +284,25 @@ Every one of these was hit and paid for already. Do not rediscover them.
     destructor — `Drop` cannot await, and a closing tab would not run one. The
     consumer flushes from `pagehide` / `visibilitychange:hidden` on the web and
     from the app's stop hook natively.
-16. **A `Commit::Deferred` locker may have exactly ONE live handle.** Two
-    handles on a name each keep their own staging buffer over the same stored
-    data, so whichever flushed last silently overwrote the other. `Bank`
-    refuses the second open with `Error::InvalidConfig` — including an
-    `Immediate` handle opened while a deferred one is live, which would not
-    see the staged batch either. Close the first handle to free the name.
+16. **Every handle on one locker name is a view of ONE open locker.**
+    `Bank::locker` / `lazy_locker` used to hand out an independent handle per
+    call — its own resident values, its own key index — and the two never
+    synchronised, so a `get` through one could answer with a value the other
+    had already overwritten. Silent, and exactly what a Hive-shaped shim
+    (`Hive.box(name)` is a process-wide singleton, called at hundreds of sites)
+    would hit. They now share one `Inner`, one resident map or index, one
+    staged batch, one watcher set. Consequences to know: a second open must
+    agree with the first (different value type or container kind →
+    `SchemaMismatch`; different `LockerConfig` → `InvalidConfig` naming the
+    field); `close()` on any handle closes the locker for **all** of them, as
+    `box.close()` does; and an eager value type now needs `Send + Sync`,
+    because the bank holds the shared map type-erased and `Arc::downcast` is
+    defined only for `Arc<dyn Any + Send + Sync>`. This is what replaced the
+    old `Commit::Deferred` single-handle guard: two deferred handles used to
+    keep two staging buffers over one name and whichever flushed last silently
+    overwrote the other, so the second open was refused. Sharing removes the
+    hazard, so the guard is gone rather than merely unreachable.
+
 17. **A drained batch must be restaged on every failure path.** `transact`
     absorbs the staged deferred batch so both ride in one commit; if anything
     after the drain returns `Err`, the batch has to go back exactly where it
@@ -344,17 +363,20 @@ Every one of these was hit and paid for already. Do not rediscover them.
     answer at all while anything is staged. `Writer::finish` was a second
     instance: it stored a fully chunked record and never indexed the key.
 
-27. **A RAM index answers for ONE handle, and two handles on one name are
-    legal.** Trap 26 is only half the story. `Bank::locker_with` /
-    `lazy_locker_with` hand out a second independent handle on the same locker
-    name (only `Commit::Deferred` refuses one), and the two never sync their
-    indexes. So handle B overwriting a key handle A chunk-wrote would skip the
-    GC and orphan A's chunks *forever* — the exact failure trap 26 describes,
-    reached from a direction trap 26 does not cover. Same across two tabs with
-    coherence off. `Inner::name_shared` is set by the bank's open-locker
-    registry the moment a second handle exists and is **never cleared**:
-    closing the other handle does not unwrite what it wrote. Anything that
-    lets a stale index prove absence must consult
+27. **A RAM index may be answering for storage someone else is writing.**
+    Trap 26 is only half the story. The index can only prove absence while
+    nothing this handle will never hear from can write the same records. Two
+    handles on one name used to be exactly that — they were independent
+    objects with independent indexes — and handle B overwriting a key handle A
+    had chunk-written would skip the GC and orphan A's chunks *forever*. That
+    half is gone: one name is one locker with one index (trap 16), so there is
+    no second in-process index to go stale. What remains is **cross-tab** (two
+    tabs with coherence off, where another tab may have chunk-written the very
+    key this one is about to overwrite) and the **two-banks-over-one-backend**
+    arrangement `Bank::with_backend` documents as unsupported.
+    `Inner::name_shared` keeps that role — it is set on the lockers the bank
+    fabricates for maintenance, which carry no index at all — and is still
+    never cleared. Anything that lets a stale index prove absence must consult
     `Inner::index_is_authoritative`, not just "is anything staged".
 
 28. **Never size an allocation from a number you read off storage.**
@@ -407,6 +429,19 @@ Every one of these was hit and paid for already. Do not rediscover them.
     would have failed the whole first push. It runs `continue-on-error: true`
     until 0.1.0 is on crates.io; drop that in the commit right after the first
     publish.
+
+35. **A sink stored in the state it points at is a leak, and on the web a
+    hang.** The coherence registration moved from the locker handle onto the
+    shared `Resident` (one registration per name, so a second handle does not
+    double-apply another tab's news and dropping the first does not stop the
+    others hearing it). But `LazySink` held `Arc<Resident>`, and the `Resident`
+    now held the sink — a cycle, so the locker, its `Inner` and the backend
+    underneath it were never freed. Natively that is a leak nobody sees. On the
+    web it is an **IndexedDB connection that never closes**, and the next
+    `delete_bank` blocks forever: `web_coherence` did not fail, it timed out at
+    180 s. `LazySink` holds a `Weak<Resident>` and upgrades in `apply`.
+    Whenever shared state starts owning something that points back at it, check
+    which way the `Arc`s run.
 
 ## 8. Where the detail lives
 

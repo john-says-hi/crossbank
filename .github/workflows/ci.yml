@@ -51,6 +51,23 @@ jobs:
       - uses: obi1kenobi/cargo-semver-checks-action@v2
         continue-on-error: true
 
+  # Cargo.toml declares `rust-version = "1.85"`, and nothing checked it until
+  # this job existed. Pinned to the declared version on purpose: if the floor
+  # has really moved, this lane says so instead of the manifest quietly
+  # promising a toolchain that cannot build the crate.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      # --lib for trap 34: a bare `cargo check --workspace` builds
+      # `src/bin/crash_child.rs`, which needs `futures`' `executor` feature
+      # that only the dev-dependency turns on.
+      - run: cargo check --workspace --lib --all-features
+
   native:
     strategy:
       fail-fast: false
@@ -313,7 +330,7 @@ jobs:
   # Single required status check for branch protection.
   ci-green:
     if: always()
-    needs: [lint, native, mobile-check, wasm]
+    needs: [lint, msrv, native, mobile-check, wasm]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any job did not succeed

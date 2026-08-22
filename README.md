@@ -106,6 +106,13 @@ Two more differences worth knowing before you port anything:
   deliberately, so key handling and its audit burden stay with the application that owns the
   keys. A chain can be set per bank or per locker (`LockerConfig::with_chain`), and the
   chain's id is recorded in storage so a locker can never be reopened under the wrong one.
+  Maintenance needs that chain too: `Bank::verify`, `quarantine`, `locker_bytes` and
+  `delete_locker` read records with no locker handle, so they resolve the chain from the
+  stored id. A locker with its own chain that has not been opened in this process cannot be
+  resolved, and `verify` refuses with `Error::SchemaMismatch` rather than calling every key
+  corrupt — that list is `quarantine`'s input, so a wrong answer there deletes the lot. Hand
+  the chain over first with `Bank::register_chain(chain: Arc<FilterChain>)`; opening the
+  locker registers it for you.
 - **Quota-aware, and it really evicts.** `Bank::persist()` asks the platform to keep the
   data, `Bank::is_persisted()` reads that back without prompting, and `Bank::usage()`
   reports what the origin is using. A locker marked `Policy::Evictable { max_bytes }` sheds

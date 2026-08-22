@@ -8,16 +8,23 @@ you rediscover them the hard way.
 - **Repo:** `github.com/john-says-hi/crossbank` (public)
 - **Local checkout:** `~/Documents/crossbank`
 - **Owner:** John (`john-says-hi`)
-- **Started:** 2026-08-15 · **Last worked:** 2026-08-20
-- **State:** M0–M5 complete, plus a Phase 3 performance pass (see `PLAN.md` → Performance).
-  **M6 (consumer readiness: docs, worked example, publish) is next.**
+- **Started:** 2026-08-15 · **Last worked:** 2026-08-21
+- **State:** **M0–M6 complete. The crate is a 0.1.0 candidate** — `publish = false` is off,
+  `cargo publish --dry-run` passes, and `cargo publish` has deliberately **not** been run.
+  Includes a Phase 3 performance pass (see `PLAN.md` → Performance) and the two review
+  must-fixes that came out of it.
 
 ---
 
 ## 1. What crossbank is
 
-A cross-platform persistent key/value library in pure Rust. One API that stores data on every
-platform Flutter ships to — Linux, macOS, Windows, Android, iOS, and **the web**.
+**Local, on-device key/value storage in pure Rust — a direct replacement for Flutter's Hive
+(`hive_ce`).** One API that stores data on every platform Flutter ships to — Linux, macOS,
+Windows, Android, iOS, and **the web**.
+
+It has **no network code, no server, no sync and no cloud**, and it never will. That is not
+an omission to be filled in later; it is the whole shape of the thing. If a future task
+sounds like "add sync", it belongs in a different crate.
 
 It is modelled on [Hive](https://github.com/IO-Design-Team/hive_ce), the Flutter key/value
 package: its architecture and ergonomics, deliberately **not** its file format.
@@ -168,21 +175,46 @@ and big values win, Hive's non-fsync puts win, `transact` is the answer for bulk
 tick, opt-in `BroadcastChannel` cross-tab coherence with `Event::Stale`, and opt-in
 `Commit::Deferred` write coalescing with `flush` / `Bank::flush_all`. Safari's ITP 7-day rule
 is answered in prose (README → Web caveats), because nothing in code can answer it.
-**306 tests native. 46-case suite × 3 backends in browsers, plus browser-only coherence
-tests.**
 
-### Remaining milestones
+**M6 — complete.** Consumer readiness, and the crate is now a **0.1.0 candidate**.
 
-- **M6 — Consumer readiness.** ← *next*. Docs, worked example, publish to crates.io.
+- **Two Phase 3 review must-fixes landed first.** `Resident::prior` answered from one
+  handle's RAM index while two handles on one name are legal and never sync, so a handle
+  overwriting a key another had chunk-written orphaned its chunks forever — `Inner` now
+  carries a one-way `name_shared` flag and `prior` refuses to answer once the index is not
+  authoritative (on wasm, that includes coherence being off). And `ChunkPointer::parse` sized
+  two allocations from unvalidated stored numbers; it now bounds both.
+- **`RemoteBank` is now `BankHandle`** (`remote.rs` → `handle.rs`, `Bank::remote()` →
+  `Bank::handle()`). Deprecated aliases keep the old spellings compiling; `into_service()` is
+  unchanged.
+- **Per-locker filter chains.** `LockerConfig::with_chain`, with the chain id persisted as
+  `chain::{locker id}` in `meta` and enforced on every later open. `LockerConfig` is no
+  longer `Copy`.
+- **README rewritten** to say what crossbank is in its first paragraph, with a
+  Hive-to-crossbank mapping table and a Durability & performance section.
+- **Publish readiness.** Version 0.1.0, `exclude` list, `CHANGELOG.md`, 13 doc examples where
+  there had been **zero**, and `examples/{settings,candles,flush_on_pagehide}.rs`.
+
+**331 tests native, 13 doctests. The conformance suite × 3 backends in browsers, plus
+browser-only coherence tests.**
+
+### Remaining work
+
+- **`cargo publish` for real.** Not run, on purpose. John's call.
+- Two CI steps are worth adding to the `lint` job: `cargo publish --dry-run` and
+  `cargo-semver-checks`. Neither is in `.github/workflows/ci.yml` yet.
 
 ## 6. How to run everything
 
 ```sh
 cd ~/Documents/crossbank
 
-cargo nextest run                      # native, all backends (306 tests)
+cargo nextest run                      # native, all backends (331 tests)
 cargo +1.97.1 clippy --workspace --all-targets --all-features   # see §7
-cargo test --doc --workspace           # nextest does NOT run doctests
+cargo test --doc                       # nextest does NOT run doctests (13 of them)
+cargo run --example settings           # the Hive `Box` shape, end to end
+cargo run --example candles            # lazy: transact, Writer/Reader, Evictable
+cargo publish --dry-run                # must pass; do NOT publish without John
 cargo bench --bench kv                 # native Criterion; not a CI gate
 ci/bench.sh                            # same, plus optional --web --firefox
 cargo bench --bench kv -- "chunk_sweep|lz4_f64"   # the M4 sizing benches only
@@ -312,6 +344,56 @@ Every one of these was hit and paid for already. Do not rediscover them.
     answer at all while anything is staged. `Writer::finish` was a second
     instance: it stored a fully chunked record and never indexed the key.
 
+27. **A RAM index answers for ONE handle, and two handles on one name are
+    legal.** Trap 26 is only half the story. `Bank::locker_with` /
+    `lazy_locker_with` hand out a second independent handle on the same locker
+    name (only `Commit::Deferred` refuses one), and the two never sync their
+    indexes. So handle B overwriting a key handle A chunk-wrote would skip the
+    GC and orphan A's chunks *forever* — the exact failure trap 26 describes,
+    reached from a direction trap 26 does not cover. Same across two tabs with
+    coherence off. `Inner::name_shared` is set by the bank's open-locker
+    registry the moment a second handle exists and is **never cleared**:
+    closing the other handle does not unwrite what it wrote. Anything that
+    lets a stale index prove absence must consult
+    `Inner::index_is_authoritative`, not just "is anything staged".
+
+28. **Never size an allocation from a number you read off storage.**
+    `ChunkPointer::parse` took `n_chunks` and `total_len` at face value and
+    `read_chunks` reserved from both. A corrupt pointer claiming `u32::MAX`
+    chunks asks for gigabytes — and a wasm release build is `panic=abort`, so
+    the allocation failure is an unrecoverable app kill, not an error anyone
+    can catch. The chunk size is not in the pointer, so the exact check is
+    impossible; the two bounds that hold regardless are `total_len <=
+    MAX_DECODED_BYTES` and `n_chunks <= total_len` (a chunk holds at least one
+    byte). `n_chunks == 0` stays legal: a `Writer` closed without a single
+    `write` stores exactly that.
+
+29. **`LockerConfig` is no longer `Copy`.** A locker can carry its own
+    `Arc<FilterChain>`. Every call site that passed the same config to two
+    `*_locker_with` calls now needs `.clone()`. It compares by chain **id**,
+    not by `Arc` pointer, because the id is the thing that gates format
+    compatibility.
+
+30. **A filter chain is persistent, not a runtime option.** The id goes into
+    `meta` as `chain::{locker id}` at first open, and a later open under a
+    different one is `Error::SchemaMismatch`. A store written before that
+    record existed has none — treat that as "write it now", never as a
+    mismatch, or every existing bank stops opening.
+
+31. **`BankConfig::at`, not `BankConfig::path`.** The native constructor is
+    spelled `at`. Doc examples that guessed `path` compiled nowhere.
+
+32. **`src/bin/` had to be excluded from the published package.**
+    `crash_child` needs `futures`' `executor` feature, which only the
+    *dev*-dependency turns on, and publishing strips dev-dependencies — so
+    `cargo publish --dry-run` failed to verify the tarball until `src/bin/`
+    joined `exclude`. Any future test-helper binary hits the same wall.
+
+33. **`cargo test --doc` ran ZERO tests for the whole project's life.** It was
+    green the entire time, which is trap 2 wearing a different hat. There were
+    simply no code blocks in the crate. If you add a doc example, run
+    `cargo test --doc` and check the *count* went up, not just that it passed.
+
 ## 8. Where the detail lives
 
 - **`PLAN.md`** — the full technical plan: all 25 decisions with rationale, architecture, the
@@ -326,10 +408,12 @@ Every one of these was hit and paid for already. Do not rediscover them.
 ## 9. First thing to do when resuming
 
 1. Read `PLAN.md`.
-2. Run `cargo nextest run` and one browser lane, and confirm green before changing anything.
-3. Start M5: byte-budget LRU on a logical counter for `Policy::Evictable` lockers, the
-   quota API, and BroadcastChannel cross-tab invalidation. `Bank::persist()` already exists —
-   never call it implicitly on open.
+2. Run `cargo nextest run`, `cargo test --doc` and one browser lane, and confirm green before
+   changing anything.
+3. Every milestone is done. What is left is **publishing**, and that is John's call — run
+   `cargo publish --dry-run`, never `cargo publish`, without being told to. If you are here
+   to change the API instead, remember it is a 0.1.0 candidate: breaking changes are still
+   allowed, but they belong in `CHANGELOG.md` under `[Unreleased]`.
 4. Trap 8 still applies to any IndexedDB work: every backend method must be **one**
    `db.transaction(...).run(...)` awaiting only IDB requests.
 5. Safari CI now has a lane: `wasm-safari` on `macos-latest`, plain lane only, running

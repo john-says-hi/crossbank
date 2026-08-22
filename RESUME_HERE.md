@@ -195,7 +195,7 @@ is answered in prose (README → Web caveats), because nothing in code can answe
 - **Publish readiness.** Version 0.1.0, `exclude` list, `CHANGELOG.md`, 13 doc examples where
   there had been **zero**, and `examples/{settings,candles,flush_on_pagehide}.rs`.
 
-**352 tests native, 14 doctests, 138 per wasm lane. The conformance suite × 3 backends in
+**375 tests native, 14 doctests, 153 per wasm lane. The conformance suite × 3 backends in
 browsers, plus browser-only coherence tests.**
 
 **Post-M6 — one locker name is one open locker.** `Bank::locker` handed out an independent
@@ -215,7 +215,7 @@ process-wide singleton. Every handle on a name is now a view of one open locker.
 ```sh
 cd ~/Documents/crossbank
 
-cargo nextest run                      # native, all backends (331 tests)
+cargo nextest run                      # native, all backends (375 tests)
 cargo +1.97.1 clippy --workspace --all-targets --all-features   # see §7
 cargo test --doc                       # nextest does NOT run doctests (13 of them)
 cargo run --example settings           # the Hive `Box` shape, end to end
@@ -457,6 +457,27 @@ Every one of these was hit and paid for already. Do not rediscover them.
     the manifest and the truth cannot drift apart in silence again — if a
     future dependency lifts the floor, that lane goes red and tells you the
     new number instead of leaving it for a consumer to discover.
+
+37. **Not every Hive-shaped operation can BE a conformance case.** A case is
+    handed an already-open `Backend`; `delete_bank` takes a `BankConfig` — a
+    *location* — and there is no backend-generic way to spell one, so it lives
+    in `tests/delete_bank.rs` natively and `tests/web_delete_bank.rs` on the
+    web. And the two halves are not the same test: the open-bank refusal
+    (`Err(InvalidConfig)`) is native-only by construction, because the registry
+    behind it is `#[cfg(not(target_arch = "wasm32"))]` and an open IndexedDB
+    connection does not *fail* `deleteDatabase`, it **blocks** it. A web test
+    asserting that refusal would not go red — it would hang the lane to its
+    180 s timeout, which is trap 19's shape again: on the web a wrong answer
+    can be indistinguishable from no answer.
+
+38. **A watch case that expects an event too few HANGS, it does not fail.**
+    `events.next().await` on a stream that will never yield again blocks
+    forever, so a case written as "assert exactly these N events" proves
+    over-emission and times out on under-emission. Arrange the writes so both
+    directions come out as a *mismatch*: interleave the writes that must be
+    filtered (a leak then names the intruder in the very next `next()`), and
+    end with a terminating write on a key that IS watched, so a missing event
+    shifts the terminator forward instead of leaving nothing to poll.
 
 ## 8. Where the detail lives
 

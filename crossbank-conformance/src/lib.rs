@@ -92,7 +92,7 @@ pub trait Harness {
 }
 
 /// Number of cases in the spec. The arity guard compares against this.
-pub const CASE_COUNT: usize = 54;
+pub const CASE_COUNT: usize = 61;
 
 /// Run `block_on` without pulling in an async runtime.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -164,6 +164,13 @@ macro_rules! __for_each_case {
         $crate::__emit!(a_late_commit_cannot_re_issue_a_live_value_id, $make);
         $crate::__emit!(two_handles_on_one_eager_name_share_state, $make);
         $crate::__emit!(two_handles_on_one_lazy_name_share_the_index, $make);
+        $crate::__emit!(get_or_returns_the_default_only_for_a_missing_key, $make);
+        $crate::__emit!(watch_key_hears_only_its_own_key, $make);
+        $crate::__emit!(watch_keys_hears_only_the_named_keys, $make);
+        $crate::__emit!(an_eager_watch_reports_writes_and_deletes, $make);
+        $crate::__emit!(an_eager_clear_empties_only_its_own_locker, $make);
+        $crate::__emit!(len_and_contains_key_track_deletes, $make);
+        $crate::__emit!(delete_all_removes_a_set_in_one_commit, $make);
     };
 }
 
@@ -310,5 +317,12 @@ macro_rules! __count_cases {
         $counter!(a_late_commit_cannot_re_issue_a_live_value_id, ());
         $counter!(two_handles_on_one_eager_name_share_state, ());
         $counter!(two_handles_on_one_lazy_name_share_the_index, ());
+        $counter!(get_or_returns_the_default_only_for_a_missing_key, ());
+        $counter!(watch_key_hears_only_its_own_key, ());
+        $counter!(watch_keys_hears_only_the_named_keys, ());
+        $counter!(an_eager_watch_reports_writes_and_deletes, ());
+        $counter!(an_eager_clear_empties_only_its_own_locker, ());
+        $counter!(len_and_contains_key_track_deletes, ());
+        $counter!(delete_all_removes_a_set_in_one_commit, ());
     };
 }

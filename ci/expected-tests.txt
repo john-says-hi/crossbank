@@ -11,12 +11,13 @@
 # WHEN YOU ADD TEST CASES YOU MUST BUMP THESE NUMBERS. Run the lane, take the
 # "OK: N test(s) actually ran and passed." number, and write N here.
 #
-# Last verified: 2026-08-21, shared locker handles: 138 tests per lane.
-# (134 at the value-id counter fix, +4 for the two new conformance cases x
-#  two browser backends.)
-plain-firefox    138
-plain-chrome     138
-atomics-chrome   138
-atomics-firefox  138
+# Last verified: 2026-08-21, Hive-surface conformance cases: 153 per lane.
+# (138 at shared locker handles, +14 for the seven new conformance cases x
+#  two browser backends, +1 for tests/web_delete_bank.rs — delete_bank takes
+#  a BankConfig, not a Backend, so it cannot be a conformance case.)
+plain-firefox    153
+plain-chrome     153
+atomics-chrome   153
+atomics-firefox  153
 # Safari runs the same plain suite; the lane is new and non-blocking.
-plain-safari     138
+plain-safari     153

@@ -2092,3 +2092,381 @@ pub async fn a_late_commit_cannot_re_issue_a_live_value_id<H: Harness>(h: &H) ->
     bank.close().await?;
     Ok(())
 }
+
+// ---- the Hive surface a shim leans on hardest ---------------------------
+//
+// Every operation below is one a Hive-shaped Dart shim reaches for at
+// hundreds of call sites, and none of them had a case of its own — so their
+// IndexedDB behaviour was guarded by nothing at all. Where a stream is
+// involved the sequence is arranged so that both an event too many and an
+// event too few come out as a *mismatch*: a case that would otherwise prove
+// a missing event by blocking forever proves nothing, it just times the lane
+// out.
+
+/// `get_or` falls back only for a key that is genuinely not there.
+///
+/// Hive's `get(key, defaultValue:)`. The stored-empty-value rule is the whole
+/// point: the Dart bridge crossbank exists to replace treats an empty payload
+/// as absent, so an empty string read back as the default rather than as
+/// itself — a silent data loss at every call site that passed a default.
+pub async fn get_or_returns_the_default_only_for_a_missing_key<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let lazy = bank.lazy_locker::<V>("lazy").await?;
+    let eager = bank.locker::<V>("eager").await?;
+
+    lazy.put("empty", &v("")).await?;
+    eager.put("empty", v("")).await?;
+
+    assert_eq!(
+        lazy.get_or("empty", v("fallback")).await?,
+        v(""),
+        "a stored empty value is a value: it must win over the default"
+    );
+    assert_eq!(*eager.get_or("empty", v("fallback")), v(""));
+
+    assert_eq!(lazy.get_or("missing", v("fallback")).await?, v("fallback"));
+    assert_eq!(*eager.get_or("missing", v("fallback")), v("fallback"));
+
+    // A read stays a read: the default is never stored.
+    assert!(!lazy.contains_key("missing"), "get_or must not write");
+    assert!(!eager.contains_key("missing"), "get_or must not write");
+    assert_eq!(lazy.get("missing").await?, None);
+    assert_eq!(eager.get("missing"), None);
+    assert_eq!(lazy.len(), 1);
+    assert_eq!(eager.len(), 1);
+
+    // Empty *bytes*, under a binary key, through the `_by` spelling.
+    let bytes = bank.lazy_locker::<Vec<u8>>("bytes").await?;
+    bytes.put_by(&[0xFF], &Vec::new()).await?;
+    assert_eq!(
+        bytes.get_or_by(&[0xFF], vec![9u8]).await?,
+        Vec::<u8>::new(),
+        "an empty Vec is stored data, not a missing key"
+    );
+    assert_eq!(bytes.get_or_by(&[0xFE], vec![9u8]).await?, vec![9u8]);
+    assert!(!bytes.contains_key_by(&[0xFE]));
+    assert_eq!(bytes.len(), 1);
+    Ok(())
+}
+
+/// `watch_key` delivers its own key and refuses everything else.
+///
+/// The writes on the other key are interleaved on purpose: a filter that
+/// leaked would put `other` at the front of the very next `next()`, so the
+/// assertion names the intruder instead of merely counting.
+pub async fn watch_key_hears_only_its_own_key<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let lazy = bank.lazy_locker::<V>("lazy").await?;
+    let eager = bank.locker::<V>("eager").await?;
+
+    let mut lazy_events = lazy.watch_key("watched");
+    let mut eager_events = eager.watch_key("watched");
+
+    lazy.put("other", &v("x")).await?;
+    lazy.put("watched", &v("value")).await?;
+    lazy.delete("other").await?;
+    lazy.delete("watched").await?;
+    // A terminator, so a *missing* event is a mismatch rather than a hang.
+    lazy.put("watched", &v("again")).await?;
+
+    assert_eq!(
+        lazy_events.next().await,
+        Some(Event::Put {
+            key: "watched".into()
+        })
+    );
+    assert_eq!(
+        lazy_events.next().await,
+        Some(Event::Deleted {
+            key: "watched".into()
+        })
+    );
+    assert_eq!(
+        lazy_events.next().await,
+        Some(Event::Put {
+            key: "watched".into()
+        })
+    );
+
+    eager.put("other", v("x")).await?;
+    eager.put("watched", v("value")).await?;
+    eager.delete("other").await?;
+    eager.delete("watched").await?;
+    eager.put("watched", v("again")).await?;
+
+    assert_eq!(
+        eager_events.next().await,
+        Some(Event::Put {
+            key: "watched".into()
+        })
+    );
+    assert_eq!(
+        eager_events.next().await,
+        Some(Event::Deleted {
+            key: "watched".into()
+        })
+    );
+    assert_eq!(
+        eager_events.next().await,
+        Some(Event::Put {
+            key: "watched".into()
+        })
+    );
+    Ok(())
+}
+
+/// `watch_keys` delivers every key in its set and nothing outside it.
+///
+/// Hive's `listenable(keys:)`, which a shim wires straight to a widget
+/// rebuild — so a leaked key is a repaint nobody asked for, and a dropped one
+/// is a stale screen.
+pub async fn watch_keys_hears_only_the_named_keys<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let lazy = bank.lazy_locker::<V>("lazy").await?;
+    let eager = bank.locker::<V>("eager").await?;
+
+    let mut lazy_events = lazy.watch_keys(&["a", "b"]);
+    let mut eager_events = eager.watch_keys(&["a", "b"]);
+
+    lazy.put("c", &v("x")).await?;
+    lazy.put("a", &v("1")).await?;
+    lazy.put("c", &v("y")).await?;
+    lazy.put("b", &v("2")).await?;
+    lazy.delete("c").await?;
+    lazy.delete("a").await?;
+
+    assert_eq!(
+        lazy_events.next().await,
+        Some(Event::Put { key: "a".into() })
+    );
+    assert_eq!(
+        lazy_events.next().await,
+        Some(Event::Put { key: "b".into() })
+    );
+    assert_eq!(
+        lazy_events.next().await,
+        Some(Event::Deleted { key: "a".into() })
+    );
+
+    eager.put("c", v("x")).await?;
+    eager.put("a", v("1")).await?;
+    eager.put("c", v("y")).await?;
+    eager.put("b", v("2")).await?;
+    eager.delete("c").await?;
+    eager.delete("a").await?;
+
+    assert_eq!(
+        eager_events.next().await,
+        Some(Event::Put { key: "a".into() })
+    );
+    assert_eq!(
+        eager_events.next().await,
+        Some(Event::Put { key: "b".into() })
+    );
+    assert_eq!(
+        eager_events.next().await,
+        Some(Event::Deleted { key: "a".into() })
+    );
+    Ok(())
+}
+
+/// The eager twin of [`watch_reports_writes_and_deletes`].
+///
+/// Two things only an eager locker can promise, because only it holds the
+/// values: deleting a key that was never there announces **nothing**, and an
+/// overwrite announces exactly one [`Event::Put`], not one per stored copy.
+pub async fn an_eager_watch_reports_writes_and_deletes<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let locker = bank.locker::<V>("l").await?;
+
+    let mut events = locker.watch();
+
+    locker.put("k", v("first")).await?;
+    locker.put("k", v("second")).await?;
+    locker.delete("absent").await?;
+    locker.delete("k").await?;
+    locker.put("sentinel", v("last")).await?;
+
+    assert_eq!(events.next().await, Some(Event::Put { key: "k".into() }));
+    assert_eq!(
+        events.next().await,
+        Some(Event::Put { key: "k".into() }),
+        "an overwrite is one Put"
+    );
+    assert_eq!(
+        events.next().await,
+        Some(Event::Deleted { key: "k".into() }),
+        "deleting a key that was never there must announce nothing"
+    );
+    assert_eq!(
+        events.next().await,
+        Some(Event::Put {
+            key: "sentinel".into()
+        }),
+        "the overwrite must not have announced twice"
+    );
+    Ok(())
+}
+
+/// The eager twin of [`clear_empties_only_its_own_locker`].
+///
+/// An eager `clear` has two views to keep in step — the resident map and the
+/// stored records — so it is asserted against both, and against a neighbour
+/// that must not have been touched by the range that did the wiping.
+pub async fn an_eager_clear_empties_only_its_own_locker<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let one = bank.locker::<V>("one").await?;
+    let two = bank.locker::<V>("two").await?;
+
+    one.put("a", v("from one")).await?;
+    one.put("b", v("from one")).await?;
+    two.put("a", v("from two")).await?;
+
+    let mut events = one.watch();
+    one.clear().await?;
+
+    assert_eq!(
+        events.next().await,
+        Some(Event::Cleared),
+        "a clear is one event, never one per key"
+    );
+
+    assert_eq!(one.len(), 0);
+    assert!(one.keys().is_empty());
+    assert_eq!(one.get("a"), None);
+    assert!(!one.contains_key("b"));
+
+    assert_eq!(two.len(), 1, "clearing one locker must not disturb another");
+    assert_eq!(two.get("a").as_deref(), Some(&v("from two")));
+
+    // Storage agrees with RAM: reopening reads the records back, and there
+    // are none.
+    one.close().await?;
+    let reopened = bank.locker::<V>("one").await?;
+    assert_eq!(
+        reopened.len(),
+        0,
+        "the cleared records are gone from storage"
+    );
+    assert!(reopened.keys().is_empty());
+    assert_eq!(two.get("a").as_deref(), Some(&v("from two")));
+    Ok(())
+}
+
+/// `len`, `contains_key` and `keys` say exactly what survived a partial
+/// delete — before and after the resident state is thrown away.
+///
+/// Hive's `length` / `containsKey` / `keys`, the three a shim answers
+/// synchronously. The reopen half is what stops a RAM index passing this on
+/// its own memory of what it did rather than on what storage holds.
+pub async fn len_and_contains_key_track_deletes<H: Harness>(h: &H) -> Result<()> {
+    let bank = bank(h).await?;
+    let lazy = bank.lazy_locker::<V>("lazy").await?;
+    let eager = bank.locker::<V>("eager").await?;
+
+    for i in 0..5 {
+        let k = format!("k{i}");
+        lazy.put(&k, &v(&k)).await?;
+        eager.put(&k, v(&k)).await?;
+    }
+    assert_eq!(lazy.len(), 5);
+    assert_eq!(eager.len(), 5);
+
+    for k in ["k1", "k3", "never_written"] {
+        lazy.delete(k).await?;
+        eager.delete(k).await?;
+    }
+
+    let survivors = vec!["k0".to_string(), "k2".to_string(), "k4".to_string()];
+    let gone = ["k1", "k3", "never_written"];
+
+    assert_eq!(lazy.len(), 3);
+    assert_eq!(eager.len(), 3);
+    assert_eq!(lazy.keys(), survivors);
+    assert_eq!(eager.keys(), survivors);
+    for k in &survivors {
+        assert!(lazy.contains_key(k));
+        assert!(eager.contains_key(k));
+        assert_eq!(lazy.get(k).await?, Some(v(k)));
+        assert_eq!(eager.get(k).as_deref(), Some(k));
+    }
+    for k in gone {
+        assert!(!lazy.contains_key(k), "{k} was deleted");
+        assert!(!eager.contains_key(k), "{k} was deleted");
+        assert_eq!(lazy.get(k).await?, None);
+        assert_eq!(eager.get(k), None);
+    }
+
+    lazy.close().await?;
+    eager.close().await?;
+    let lazy = bank.lazy_locker::<V>("lazy").await?;
+    let eager = bank.locker::<V>("eager").await?;
+
+    assert_eq!(lazy.len(), 3, "the counts must come back from storage");
+    assert_eq!(eager.len(), 3);
+    assert_eq!(lazy.keys(), survivors);
+    assert_eq!(eager.keys(), survivors);
+    for k in gone {
+        assert!(!lazy.contains_key(k), "{k} must not come back on reopen");
+        assert!(!eager.contains_key(k), "{k} must not come back on reopen");
+    }
+    Ok(())
+}
+
+/// `delete_all` removes a set in one commit — and a refused one removes
+/// nothing at all.
+///
+/// Hive's `deleteAll`. The set deliberately names a key that is not there,
+/// because a shim passes whatever list its caller had. The fault half is the
+/// part worth the machinery: a `delete_all` that failed part-way would leave
+/// a locker nobody can reason about, and unlike a failed write there is no
+/// second copy of the data to fall back on.
+pub async fn delete_all_removes_a_set_in_one_commit<H: Harness>(h: &H) -> Result<()> {
+    let faulty = h.open_with_fault().await?;
+    let bank = Bank::with_backend(faulty.clone()).await?;
+    let lazy = bank.lazy_locker::<V>("lazy").await?;
+    let eager = bank.locker::<V>("eager").await?;
+
+    for i in 0..5 {
+        let k = format!("k{i}");
+        lazy.put(&k, &v(&k)).await?;
+        eager.put(&k, v(&k)).await?;
+    }
+
+    lazy.delete_all(["k1", "k3", "never_written"]).await?;
+    eager.delete_all(["k1", "k3", "never_written"]).await?;
+
+    let survivors = vec!["k0".to_string(), "k2".to_string(), "k4".to_string()];
+    assert_eq!(lazy.len(), 3);
+    assert_eq!(eager.len(), 3);
+    assert_eq!(lazy.keys(), survivors);
+    assert_eq!(eager.keys(), survivors);
+    assert_eq!(lazy.get("k1").await?, None);
+    assert_eq!(eager.get("k1"), None);
+    for k in &survivors {
+        assert_eq!(lazy.get(k).await?, Some(v(k)));
+        assert_eq!(eager.get(k).as_deref(), Some(k));
+    }
+
+    // The next commit dies before storage sees any of it.
+    faulty.arm(crate::fault::FaultPlan::new(
+        0,
+        crate::fault::Injection::Abort,
+    ))?;
+
+    let refused = lazy.delete_all(["k0", "k2", "k4"]).await;
+    assert!(
+        refused.is_err(),
+        "a delete_all whose commit failed must be reported as an error"
+    );
+    assert!(faulty.fired()?, "the plan must have fired");
+
+    assert_eq!(lazy.len(), 3, "a refused delete_all must take nothing away");
+    assert_eq!(lazy.keys(), survivors);
+    for k in &survivors {
+        assert_eq!(lazy.get(k).await?, Some(v(k)));
+    }
+
+    bank.close().await?;
+    Ok(())
+}

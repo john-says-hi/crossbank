@@ -17,6 +17,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   absent that the other had chunk-written, which orphaned those chunks permanently. The name
   is now claimed under the registry lock *after* the awaits: the caller that loses the race
   discards the locker it opened (it has only read) and hands out a view of the winner.
+- An eager `Locker`'s `delete` of a key whose resident copy was dropped as `Event::Stale` is
+  no longer a silent no-op. The fast path treated "not in the resident map" as "not stored",
+  but a stale key is precisely a key that is stored while this tab holds no value for it —
+  another tab wrote something too large to carry in a coherence message, or bytes this one
+  could not decode. The delete returned `Ok(())` without touching storage or announcing
+  anything, and the record was back at the next reopen, while `delete_all` on the same key
+  wrote the op. Such keys are now remembered and count as present, so the delete reaches
+  storage and raises `Event::Deleted`.
 - `delete_bank` no longer unlinks a native bank file that is still open. Doing so left the
   live `Bank` committing into a file with no name on Unix — every write after the delete was
   lost silently — and failed with an opaque backend error on Windows. A bank still open in

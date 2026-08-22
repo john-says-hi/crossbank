@@ -239,6 +239,7 @@ where
             if let Ok(mut guard) = self.values.lock() {
                 guard.insert(key.to_vec(), shared.clone());
             }
+            self.res.forget_dropped(key);
             self.inner.announce(Event::Put { key: key.to_vec() });
             if full {
                 let _guard = self.inner.write_lock.lock().await;
@@ -260,6 +261,7 @@ where
         if let Ok(mut guard) = self.values.lock() {
             guard.insert(key.to_vec(), shared.clone());
         }
+        self.res.forget_dropped(key);
         self.inner.announce(Event::Put { key: key.to_vec() });
         Ok(shared)
     }
@@ -360,9 +362,13 @@ where
                         guard.insert(key.clone(), value.clone());
                     }
                     Staged::Delete { key } => {
-                        *removed = guard.remove(key).is_some() || self.res.is_corrupt(key);
+                        *removed = guard.remove(key).is_some() || self.res.stored_but_unheld(key);
+                        self.res.forget_dropped(key);
                     }
-                    Staged::Clear => guard.clear(),
+                    Staged::Clear => {
+                        guard.clear();
+                        self.res.forget_all_dropped();
+                    }
                 }
             }
         }
@@ -410,6 +416,7 @@ where
             if let Ok(mut guard) = self.values.lock() {
                 guard.remove(key);
             }
+            self.res.forget_dropped(key);
             if held {
                 self.inner.announce(Event::Deleted { key: key.to_vec() });
             }
@@ -423,6 +430,7 @@ where
         if let Ok(mut guard) = self.values.lock() {
             guard.remove(key);
         }
+        self.res.forget_dropped(key);
         if held {
             self.inner.announce(Event::Deleted { key: key.to_vec() });
         }
@@ -431,12 +439,14 @@ where
 
     /// Whether this locker holds a record under `key`.
     ///
-    /// A key skipped as corrupt counts: it is missing from the resident map
-    /// while its bytes are still on disk, so a delete must reach storage and
-    /// really is news to anyone watching.
+    /// A key the map does not hold the value of still counts when the record
+    /// is stored: bytes skipped as corrupt at open, and a value another tab
+    /// wrote that this one dropped as [`Event::Stale`]. Both are missing from
+    /// the resident map while the record is very much on disk, so a delete
+    /// must reach storage and really is news to anyone watching.
     fn holds(&self, key: &[u8]) -> bool {
         match self.values.lock() {
-            Ok(guard) => guard.contains_key(key) || self.res.is_corrupt(key),
+            Ok(guard) => guard.contains_key(key) || self.res.stored_but_unheld(key),
             // A poisoned map cannot prove absence. Behave as before.
             Err(_) => true,
         }
@@ -489,6 +499,7 @@ where
             if let Ok(mut guard) = self.values.lock() {
                 guard.clear();
             }
+            self.res.forget_all_dropped();
             self.inner.announce(Event::Cleared);
             if full {
                 let _guard = self.inner.write_lock.lock().await;
@@ -500,6 +511,7 @@ where
         if let Ok(mut guard) = self.values.lock() {
             guard.clear();
         }
+        self.res.forget_all_dropped();
         self.inner.announce(Event::Cleared);
         Ok(())
     }
@@ -513,6 +525,11 @@ where
 pub(crate) struct EagerSink<T> {
     inner: Arc<Inner>,
     values: Arc<Mutex<BTreeMap<Vec<u8>, Arc<T>>>>,
+    /// Weak for the reason `LazySink`'s is: the resident state owns the sink,
+    /// so a strong reference back would be a cycle that keeps the locker, its
+    /// `Inner` and the backend handle alive forever — on the web, an
+    /// IndexedDB connection that never closes.
+    res: std::sync::Weak<Resident>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -532,9 +549,13 @@ impl<T: DeserializeOwned> crate::coherence::Sink for EagerSink<T> {
         }
         self.inner.epochs.note_applied(announcement.epoch);
 
+        let res = self.res.upgrade();
         if announcement.cleared {
             if let Ok(mut values) = self.values.lock() {
                 values.clear();
+            }
+            if let Some(res) = res.as_ref() {
+                res.forget_all_dropped();
             }
             self.inner.epochs.forget_local();
             self.inner.announce(Event::Cleared);
@@ -587,6 +608,17 @@ impl<T: DeserializeOwned> crate::coherence::Sink for EagerSink<T> {
                     }
                 }
             }
+            // A stale key is one this tab no longer holds a value for while
+            // the record is still stored — so it has to keep counting as
+            // *present*, or `delete` would decide there was nothing to remove
+            // and return `Ok(())` having written nothing. Remembering it is
+            // what makes the two tabs' stores agree again.
+            if let Some(res) = res.as_ref() {
+                match event {
+                    Event::Stale { .. } => res.note_dropped(&change.key),
+                    _ => res.forget_dropped(&change.key),
+                }
+            }
             self.inner.announce(event);
         }
     }
@@ -600,6 +632,7 @@ impl<T> Locker<T> {
         EagerSink {
             inner: self.inner.clone(),
             values: self.values.clone(),
+            res: Arc::downgrade(&self.res),
         }
     }
 }
@@ -981,6 +1014,68 @@ mod tests {
 
         assert_eq!(l.get("k"), None, "a value we cannot decode is not held");
         assert_eq!(events.try_recv(), Some(Event::Stale { key: b"k".to_vec() }));
+    }
+
+    /// A key dropped as stale can still be deleted.
+    ///
+    /// `delete` short-circuits when the resident map does not hold the key and
+    /// the index is authoritative: nothing resident, nothing stored, nothing
+    /// to do. A stale key breaks that reasoning — the record *is* stored, it
+    /// is only this tab's copy that is gone — so the short circuit turned a
+    /// user's delete into a silent no-op, and the record came back at the next
+    /// reopen. `delete_all` went through `transact` and wrote the op, so the
+    /// two spellings of one operation disagreed.
+    #[test]
+    fn a_key_dropped_as_stale_is_still_deleted() {
+        let backend = Arc::new(MemoryBackend::new());
+        let l: Locker<String> = block_on(Locker::open(
+            backend.clone(),
+            Arc::new(default_chain()),
+            1,
+            "test".into(),
+            LockerConfig::default(),
+            Default::default(),
+        ))
+        .unwrap();
+        block_on(l.put("session", "mine".into())).unwrap();
+        let stored = l.inner.encode_key(b"session");
+        assert!(
+            block_on(backend.get(crate::backend::api::Table::Records, &stored))
+                .unwrap()
+                .is_some()
+        );
+
+        // Another tab wrote a value this one cannot carry: the resident copy
+        // goes, the record stays.
+        l.sink().apply(&Announcement {
+            instance: 2,
+            locker_id: l.inner.id,
+            epoch: 1,
+            cleared: false,
+            changes: vec![Change {
+                key: b"session".to_vec(),
+                value: None,
+                bytes: None,
+                deleted: false,
+            }],
+        });
+        assert_eq!(l.get("session"), None, "the resident copy is gone");
+
+        let mut events = l.watch();
+        block_on(l.delete("session")).unwrap();
+
+        assert_eq!(
+            block_on(backend.get(crate::backend::api::Table::Records, &stored)).unwrap(),
+            None,
+            "the delete must reach storage: the record was still there"
+        );
+        assert_eq!(
+            events.try_recv(),
+            Some(Event::Deleted {
+                key: b"session".to_vec()
+            }),
+            "and it really took something away, so it is news"
+        );
     }
 
     fn one_change(id: LockerId, epoch: u64, key: &[u8], sealed: Option<Vec<u8>>) -> Announcement {

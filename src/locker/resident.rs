@@ -75,6 +75,15 @@ pub(crate) struct Resident {
     /// locker fills it at open and never adds to it; a lazy one adds a key as
     /// a read discovers the damage.
     corrupt: Mutex<BTreeSet<Vec<u8>>>,
+    /// Keys another tab wrote with a value this locker could not take on —
+    /// too large to ride inside a coherence message, or bytes it could not
+    /// decode — so the resident copy was dropped and [`crate::Event::Stale`]
+    /// raised. The record is still stored; only this tab's copy is gone.
+    ///
+    /// Separate from `corrupt` because `corrupt_keys()` is public and means
+    /// *unreadable*, which these keys are not. Together they are
+    /// [`Resident::stored_but_unheld`].
+    dropped: Mutex<BTreeSet<Vec<u8>>>,
     /// This name's registration with the cross-tab channel, which holds only
     /// a `Weak` and so stops delivering the moment this is dropped.
     ///
@@ -110,12 +119,13 @@ impl Resident {
             lru: lru.map(Mutex::new),
             staged: Mutex::new(Vec::new()),
             corrupt: Mutex::new(BTreeSet::new()),
+            dropped: Mutex::new(BTreeSet::new()),
             #[cfg(target_arch = "wasm32")]
             sink: Mutex::new(None),
         }
     }
 
-    // ---- keys that would not decode ------------------------------------
+    // ---- keys that are stored but not held -----------------------------
 
     /// Note that `key`'s stored bytes did not decode.
     pub(crate) fn note_corrupt(&self, key: &[u8]) {
@@ -140,6 +150,52 @@ impl Resident {
             .lock()
             .map(|c| c.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Note that `key` is stored but this locker is not holding its value.
+    ///
+    /// The `corrupt` set answers that for bytes that would not decode at open
+    /// time; this one answers it for a key another tab wrote with a value this
+    /// tab cannot carry — too large to ride inside a coherence message, or
+    /// bytes it cannot decode — which [`crate::Event::Stale`] reports and the
+    /// sink drops from the resident map. The two are kept apart because
+    /// `corrupt_keys()` is public and means *unreadable*, and a stale key is
+    /// perfectly readable by the tab that wrote it.
+    pub(crate) fn note_dropped(&self, key: &[u8]) {
+        if let Ok(mut guard) = self.dropped.lock() {
+            guard.insert(key.to_vec());
+        }
+    }
+
+    /// Forget that, because this locker now knows what is under `key`.
+    pub(crate) fn forget_dropped(&self, key: &[u8]) {
+        if let Ok(mut guard) = self.dropped.lock() {
+            guard.remove(key);
+        }
+    }
+
+    /// Forget all of it, after something removed every record at once.
+    pub(crate) fn forget_all_dropped(&self) {
+        if let Ok(mut guard) = self.dropped.lock() {
+            guard.clear();
+        }
+    }
+
+    /// Whether a record is stored under `key` that this locker does not hold
+    /// the value of — unreadable bytes, or a value dropped as stale.
+    ///
+    /// An eager locker treats this as *present*: the record is real, so a
+    /// delete has to reach storage and really is news to a watcher. Claiming
+    /// presence too eagerly costs a wasted backend op; claiming absence
+    /// wrongly leaves a record — and any chunks under it — behind for good.
+    pub(crate) fn stored_but_unheld(&self, key: &[u8]) -> bool {
+        if self.is_corrupt(key) {
+            return true;
+        }
+        self.dropped
+            .lock()
+            .map(|d| d.contains(key))
+            .unwrap_or(false)
     }
 
     /// Register this name with the cross-tab channel, once.

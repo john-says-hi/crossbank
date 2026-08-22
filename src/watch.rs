@@ -60,6 +60,13 @@ pub enum Event {
     /// [`crate::Bank::locker_with`]), so a second open cannot re-read. A lazy
     /// handle on the same name reads through to storage without any of that.
     ///
+    /// **`delete` is the exception.** A stale key still counts as *present*
+    /// for the purpose of removing it: the record is stored, so
+    /// [`crate::Locker::delete`] writes the delete, announces
+    /// [`Event::Deleted`] and really does take it away — otherwise the two
+    /// tabs' stores would disagree forever over a key the user asked to be
+    /// rid of.
+    ///
     /// A lazy locker has no such limit — it fetches on demand — so it raises
     /// [`Event::Put`] instead.
     Stale { key: Vec<u8> },

@@ -1,0 +1,38 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>crossbank web e2e</title>
+<body>
+  <pre id="log">loading…</pre>
+  <script type="module">
+    // The wasm glue is an ES module, so its exports are module-scoped. The
+    // driver talks to the page through `window`, so publish them there — and
+    // publish the ready flag LAST, so a driver that polls for it can never
+    // catch a half-built object.
+    import init, * as api from './web_e2e_page.js';
+
+    const log = (m) => {
+      document.getElementById('log').textContent = m;
+    };
+
+    try {
+      await init();
+      window.crossbankE2E = {
+        open: api.open,
+        writeKeys: api.writeKeys,
+        writeOne: api.writeOne,
+        count: api.count,
+        indexHas: api.indexHas,
+        readKey: api.readKey,
+        readAll: api.readAll,
+        verify: api.verify,
+        close: api.close,
+        destroy: api.destroy,
+      };
+      window.crossbankE2EReady = true;
+      log('ready');
+    } catch (e) {
+      window.crossbankE2EError = String(e);
+      log(`failed: ${e}`);
+    }
+  </script>
+</body>

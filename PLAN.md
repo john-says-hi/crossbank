@@ -1,12 +1,14 @@
 # crossbank — build plan
 
-**Status: M5 complete.** 306 tests green natively — the full conformance suite against
-**both** the memory and `redb` backends, crash-and-reopen tests that kill a real process, and
-a peak-RSS test that streams 8 MiB through 64 KiB chunks. The same 46-case suite passes
-against **IndexedDB** in Chrome and Firefox on both wasm lanes (plain and atomics), alongside
-a browser-only cross-tab coherence test. **Data persists on desktop, mobile, and the web,
-large lazy values no longer have to fit in RAM, and storage pressure now has an answer.**
-M6 (consumer readiness) is next.
+**Status: M0–M6 complete; 0.1.0 candidate.** 331 tests green natively — the full conformance
+suite against **both** the memory and `redb` backends, crash-and-reopen tests that kill a real
+process, and a peak-RSS test that streams 8 MiB through 64 KiB chunks. The conformance suite
+also passes against **IndexedDB** in Chrome and Firefox on both wasm lanes (plain and
+atomics), alongside a browser-only cross-tab coherence test. **Data persists on
+desktop, mobile, and the web, large lazy values no longer have to fit in RAM, and storage
+pressure has an answer.** M6 closed it out: the README says plainly what crossbank is, every
+public type carries a doc example, three worked examples run, `CHANGELOG.md` starts, and
+`cargo publish --dry-run` passes.
 
 > Resuming this project? Start with **[RESUME_HERE.md](RESUME_HERE.md)** — purpose, working
 > agreements, current state, and the known traps. This file is the technical plan.
@@ -395,8 +397,38 @@ flush** — crossbank spawns nothing — which is why it is never the default an
 Nothing in code can answer that, so it is answered in prose: see README → Web caveats.
 Safari still has zero CI coverage.
 
-**M6 — Consumer readiness.** Docs, worked example, publish. Shrinks to prose because the
-proxy landed in M1.
+**M6 — Consumer readiness. ✅ COMPLETE.** Five pieces, plus the two Phase 3 review
+must-fixes that had to land first.
+
+*The review fixes.* `Resident::prior` answered from one handle's RAM index, but two handles
+on one locker name are legal and never sync — so a handle overwriting a key another handle
+had chunk-written skipped the GC and orphaned its chunks forever, and the same held across
+two tabs with coherence off. `Inner` now carries a one-way `name_shared` flag, and `prior`
+refuses to answer once the index is no longer authoritative. Separately,
+`ChunkPointer::parse` took `n_chunks` and `total_len` straight off storage and both sized an
+allocation; a pointer must now declare no more bytes than the envelope ceiling and no more
+chunks than bytes, and `read_chunks` fetches in fixed groups of 64.
+
+*README and crate docs.* The first paragraph now says what a reader most needs to know:
+crossbank is local, on-device storage, a direct replacement for Hive, with no network code,
+no server, no sync and no cloud. Stale claims are gone (`Cipher` was never a trait; the LRU
+is real since M5), a Hive-to-crossbank mapping table covers every call wise_apple's
+inventory found, and a Durability & performance section carries the headline numbers.
+
+*`RemoteBank` → `BankHandle`.* The type was never about anything remote. `remote.rs` becomes
+`handle.rs`, `Bank::remote()` becomes `Bank::handle()`, and deprecated aliases keep both old
+spellings compiling.
+
+*Per-locker filter chains.* `LockerConfig::with_chain`. The chain id is written to `meta` as
+`chain::{locker id}` at first open and enforced on every later one, so a locker can never be
+reopened under a chain that would decode its bytes into plausible garbage. A store written
+before the record existed has none, which is not a mismatch: the id is written on that open
+and enforced from the next. `LockerConfig` lost `Copy` as a result — a chain is a
+`dyn Filter` list behind an `Arc`.
+
+*Publish readiness.* `publish = false` off, version 0.1.0, an `exclude` list, `CHANGELOG.md`,
+13 doc examples where the doc-test target previously ran **zero**, and
+`examples/{settings,candles,flush_on_pagehide}.rs`. `cargo publish --dry-run` passes.
 
 ---
 

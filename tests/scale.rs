@@ -56,12 +56,14 @@ mod native {
         let file = dir.join("scale.redb");
         let _ = std::fs::remove_file(&file);
         let config = BankConfig::at(&file);
-        let locker_config = LockerConfig::default().with_durability(durability);
+        // Built fresh at each use rather than held in a variable: whether
+        // `LockerConfig` is `Copy` is not this test's business.
+        let locker_config = || LockerConfig::default().with_durability(durability);
 
         let write = {
             let bank = Bank::open(config.clone()).await?;
             let locker = bank
-                .lazy_locker_with::<String>("scale", locker_config)
+                .lazy_locker_with::<String>("scale", locker_config())
                 .await?;
 
             let started = Instant::now();
@@ -92,7 +94,7 @@ mod native {
         let bank = Bank::open(config).await?;
         let open_started = Instant::now();
         let locker = bank
-            .lazy_locker_with::<String>("scale", locker_config)
+            .lazy_locker_with::<String>("scale", locker_config())
             .await?;
         let open = open_started.elapsed();
 

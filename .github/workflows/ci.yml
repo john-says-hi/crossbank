@@ -4,7 +4,7 @@ on:
   pull_request:
   push:
     branches: [master]
-  # The nightly-only jobs below (scale) are gated on these two events, so a
+  # The nightly-only jobs below (scale, web-e2e) are gated on these two events, so a
   # pull request never pays for them. Everything else runs on all four, which
   # makes the nightly a genuine drift check against a moving toolchain.
   schedule:
@@ -244,6 +244,55 @@ jobs:
         env:
           CROSSBANK_SCALE: '1'
         run: cargo nextest run --release --all-features -E 'binary(scale)' --no-capture
+
+  # A real page reload and two real tabs, on all three engines. Nightly only:
+  # it needs Playwright browsers, which no other lane does, and it covers what
+  # wasm_bindgen_test structurally cannot — that lane owns ONE page that never
+  # navigates, so a fresh wasm instance reading an earlier one's bytes, and a
+  # BroadcastChannel crossing between two documents, are both invisible to it.
+  web-e2e:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web-e2e
+
+      # The CLI must match Cargo.lock's wasm-bindgen EXACTLY; ci/web-e2e.sh
+      # checks and says so, but resolve it here rather than hand-pinning it.
+      - name: Resolve wasm-bindgen version
+        id: wbg
+        run: |
+          v=$(cargo metadata --format-version 1 \
+              | jq -r '.packages[] | select(.name=="wasm-bindgen") | .version' | head -1)
+          if [ -z "$v" ]; then
+            echo "FATAL: could not resolve a wasm-bindgen version" >&2
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ steps.wbg.outputs.version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Playwright browsers
+        run: npx --yes playwright install --with-deps chromium firefox webkit
+
+      # Every engine, and every engine must pass: this is the only lane where
+      # a real reload is tested at all, so a browser skipped here is a browser
+      # nothing covers.
+      - name: chromium
+        run: ci/web-e2e.sh --browser chromium
+      - name: firefox
+        run: ci/web-e2e.sh --browser firefox
+      - name: webkit
+        run: ci/web-e2e.sh --browser webkit
 
   # Single required status check for branch protection.
   ci-green:

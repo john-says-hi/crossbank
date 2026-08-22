@@ -83,6 +83,15 @@ pub enum Location {
 /// The location is always explicit. crossbank does not guess a platform
 /// default, because a library with no knowledge of the calling application has
 /// no business choosing where that application's data lives.
+///
+/// ```no_run
+/// use crossbank::BankConfig;
+///
+/// let on_disk = BankConfig::at("/home/me/.local/share/app/app.crossbank"); // native
+/// let in_browser = BankConfig::web("app").with_coherence(true);            // wasm32
+/// let nowhere = BankConfig::memory();                                      // tests
+/// # let _ = (on_disk, in_browser, nowhere);
+/// ```
 #[derive(Debug, Clone)]
 pub struct BankConfig {
     pub location: Location,
@@ -166,7 +175,46 @@ impl BankConfig {
     }
 }
 
-/// The root handle. Lockers are opened from it.
+/// The root handle. Lockers are opened from it. Hive's `Hive` static, made a
+/// value you own.
+///
+/// One bank is one store — a `redb` file natively, one IndexedDB database on
+/// the web — and every locker inside it shares that store, its filter chain
+/// and its chunk-id allocator. Opening the same locker name twice is allowed
+/// and gives two independent handles; the one exception is
+/// [`crate::Commit::Deferred`], where a second live handle is refused because
+/// two staging buffers over one name would overwrite each other.
+///
+/// ```no_run
+/// use crossbank::{Bank, BankConfig, LazyLocker, Locker};
+///
+/// # async fn demo() -> crossbank::Result<()> {
+/// // Native. On the web this is `BankConfig::web("app")`, and
+/// // `BankConfig::memory()` stores nothing anywhere.
+/// let bank = Bank::open(BankConfig::at("app.crossbank")).await?;
+///
+/// let settings: Locker<String> = bank.locker("settings").await?;
+/// let candles: LazyLocker<Vec<f64>> = bank.lazy_locker("candles").await?;
+///
+/// // Hive's `isBoxOpen` / `boxExists`: one asks about this process, the
+/// // other about the store.
+/// assert!(bank.is_locker_open("settings"));
+/// assert!(bank.locker_exists("candles").await?);
+///
+/// // On the web, ask the browser to keep the data — and handle "no".
+/// // Never on a startup path: Firefox prompts the user and this does not
+/// // resolve until they answer.
+/// let _kept = bank.persist().await?;
+/// if let Some(usage) = bank.usage().await? {
+///     println!("{usage:?}");
+/// }
+///
+/// // One call covers every open locker's staged writes and its fsync.
+/// bank.flush_all().await?;
+/// bank.close().await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Bank {
     backend: Arc<dyn Backend>,
     chain: Arc<FilterChain>,
@@ -933,6 +981,25 @@ impl Bank {
     /// Memory is bounded by the largest single value, not by the locker:
     /// inline records are checked in the walk, and only the chunk pointers are
     /// held back for the second pass.
+    ///
+    /// ```no_run
+    /// use crossbank::{Bank, BankConfig};
+    ///
+    /// # async fn demo() -> crossbank::Result<()> {
+    /// let bank = Bank::open(BankConfig::at("app.crossbank")).await?;
+    ///
+    /// // Survey first. Nothing is written and nothing is deleted.
+    /// let bad = bank.verify("candles").await?;
+    /// if !bad.is_empty() {
+    ///     // Then, deliberately and by key, remove what a human decided to
+    ///     // give up on. Every open handle must be closed first.
+    ///     let keys: Vec<&[u8]> = bad.iter().map(|k| k.as_slice()).collect();
+    ///     let removed = bank.quarantine("candles", &keys).await?;
+    ///     println!("{removed} unreadable records removed");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn verify(&self, name: &str) -> Result<Vec<Vec<u8>>> {
         if !self.locker_exists(name).await? {
             return Ok(Vec::new());

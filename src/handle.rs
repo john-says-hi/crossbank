@@ -92,6 +92,34 @@ impl std::fmt::Debug for Job {
 }
 
 /// A `Send + Sync + Clone` handle onto a bank running elsewhere.
+///
+/// Every call becomes a message carrying plain data and a one-shot reply
+/// channel, answered by [`Bank::into_service`] on the bank's own thread. The
+/// values it reads and writes go through the same envelope and filter chain as
+/// typed ones, so a locker reached this way is exactly a `Locker<Vec<u8>>`.
+///
+/// ```no_run
+/// use crossbank::{Bank, BankConfig};
+///
+/// # async fn demo() -> crossbank::Result<()> {
+/// let bank = Bank::open(BankConfig::at("app.crossbank")).await?;
+/// let handle = bank.handle();
+///
+/// // The service must be polled somewhere, on the bank's own thread, and
+/// // that thread must never block. crossbank spawns nothing, so this is
+/// // yours to place: `spawn_local` on the web, a task natively.
+/// let service = bank.into_service();
+///
+/// // Meanwhile, from anywhere:
+/// handle.put("settings", "theme", b"dark".to_vec()).await?;
+/// assert_eq!(handle.get("settings", "theme").await?, Some(b"dark".to_vec()));
+/// println!("{:?}", handle.keys("settings", "").await?);
+/// handle.delete("settings", "theme").await?;
+///
+/// service.await;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct BankHandle {
     sender: mpsc::Sender<Job>,

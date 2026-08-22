@@ -27,6 +27,47 @@ use super::transaction::{Staged, Transaction, TxMode};
 use crate::watch::Event;
 
 /// A locker that keeps only its key index in memory.
+/// A locker that keeps only its key index resident. Hive's `LazyBox`.
+///
+/// Opening costs the *number* of keys, not the size of the data, and every
+/// read is an await. That is what lets one locker hold hundreds of megabytes
+/// on a platform where an eager one could not. Values past
+/// [`LockerConfig::chunk_size`] are chunked transparently, and
+/// [`LazyLocker::writer`] streams one without ever holding it whole.
+///
+/// ```no_run
+/// use crossbank::{Bank, BankConfig, LazyLocker, LockerConfig, Policy};
+///
+/// # async fn demo() -> crossbank::Result<()> {
+/// let bank = Bank::open(BankConfig::at("app.crossbank")).await?;
+/// let series: LazyLocker<Vec<f64>> = bank.lazy_locker("candles").await?;
+///
+/// // Many small writes belong in one transaction, not one commit each.
+/// series
+///     .transact(|tx| async move {
+///         tx.put("BTCUSDT-1m", vec![1.0, 2.0, 3.0])?;
+///         tx.put("ETHUSDT-1m", vec![4.0, 5.0])?;
+///         Ok(())
+///     })
+///     .await?;
+///
+/// assert_eq!(series.get("ETHUSDT-1m").await?, Some(vec![4.0, 5.0]));
+///
+/// // Keys are ordered, so a window is a range scan.
+/// let window = series.range("BTCUSDT-1m".."ETHUSDT-1m").await?;
+/// assert_eq!(window.len(), 1);
+///
+/// // A cache that is allowed to shed. `Policy::Precious` is the default.
+/// let cache: LazyLocker<Vec<u8>> = bank
+///     .lazy_locker_with(
+///         "thumbnails",
+///         LockerConfig::default().with_policy(Policy::Evictable { max_bytes: 8 << 20 }),
+///     )
+///     .await?;
+/// cache.put("a", &vec![0u8; 1024]).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct LazyLocker<T> {
     pub(crate) inner: Arc<Inner>,
     /// The key index, the byte budget and the staged writes, shared with the

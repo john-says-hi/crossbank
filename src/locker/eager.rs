@@ -35,7 +35,39 @@ use super::resident::{Pending, Resident};
 use super::transaction::{Staged, Transaction, TxMode};
 use crate::watch::Event;
 
-/// A locker whose values live in memory.
+/// A locker whose values live in memory. Hive's `Box`.
+///
+/// Every value is loaded at open and kept resident, which is what makes
+/// [`Locker::get`] synchronous and infallible — the call a UI makes from a
+/// path that cannot await. That bargain has a price, so
+/// [`LockerConfig::eager_budget`] refuses to open a locker whose contents are
+/// larger than you said they would be, rather than discovering it as an
+/// out-of-memory abort later. For bulk data, use [`crate::LazyLocker`].
+///
+/// ```no_run
+/// use crossbank::{Bank, BankConfig, Locker};
+///
+/// # async fn demo() -> crossbank::Result<()> {
+/// let bank = Bank::open(BankConfig::at("app.crossbank")).await?;
+/// let settings: Locker<String> = bank.locker("settings").await?;
+///
+/// // A durable commit by default: when this resolves, the data is on disk.
+/// settings.put("theme", "dark".to_string()).await?;
+///
+/// // ...and reads never await and never fail.
+/// assert_eq!(settings.get("theme").as_deref(), Some(&"dark".to_string()));
+/// assert_eq!(*settings.get_or("accent", "blue".to_string()), "blue");
+///
+/// // Bulk work is one atomic commit, not one per pair.
+/// settings.put_all(vec![("locale".to_string(), "en".to_string())]).await?;
+/// settings.delete_all(vec!["locale".to_string()]).await?;
+///
+/// // `close` is async: it flushes first, so a bare `settings.close();`
+/// // would be a dropped future that does nothing.
+/// settings.close().await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Locker<T> {
     inner: Arc<Inner>,
     /// Shared with the coherence sink, which replaces resident values from
@@ -659,6 +691,29 @@ impl<T> Locker<T> {
     /// error — a listing must never fail because of a key it cannot spell.
     /// [`Locker::has_non_utf8_keys`] says whether any were skipped, and
     /// [`Locker::keys_bytes`] returns every key regardless.
+    /// Keys are **bytes**, so the `&str` listings skip what they cannot spell
+    /// rather than failing. [`Locker::has_non_utf8_keys`] says whether
+    /// anything was skipped and [`Locker::keys_bytes`] returns all of them.
+    ///
+    /// ```no_run
+    /// use crossbank::{Bank, BankConfig, Locker};
+    ///
+    /// # async fn demo() -> crossbank::Result<()> {
+    /// let bank = Bank::open(BankConfig::at("app.crossbank")).await?;
+    /// let settings: Locker<String> = bank.locker("settings").await?;
+    ///
+    /// for key in settings.keys() {
+    ///     println!("{key}");
+    /// }
+    /// if settings.has_non_utf8_keys() {
+    ///     println!("{} keys in total", settings.keys_bytes().len());
+    /// }
+    /// for key in settings.keys_with_prefix("theme_") {
+    ///     println!("theme variant: {key}");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn keys(&self) -> Vec<String> {
         self.values
             .lock()

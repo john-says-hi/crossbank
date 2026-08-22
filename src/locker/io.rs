@@ -20,6 +20,28 @@ use crate::backend::api::{Op, Table};
 use crate::watch::Event;
 
 /// Appends raw bytes to a key. Obtain from [`LazyLocker<Vec<u8>>::writer`].
+/// Writes a value one piece at a time, without ever holding it whole.
+///
+/// Each piece is sealed and committed on its own, so peak memory is a small
+/// multiple of [`crate::LockerConfig::chunk_size`] rather than of the value.
+/// Nothing under the key changes until [`Writer::finish`]: a writer dropped or
+/// [`Writer::abort`]ed leaves the previous value exactly as it was.
+///
+/// ```no_run
+/// use crossbank::{Bank, BankConfig, LazyLocker};
+///
+/// # async fn demo() -> crossbank::Result<()> {
+/// let bank = Bank::open(BankConfig::at("app.crossbank")).await?;
+/// let blobs: LazyLocker<Vec<u8>> = bank.lazy_locker("raw-feed").await?;
+///
+/// let mut writer = blobs.writer("2026-08-21").await?;
+/// for _ in 0..64 {
+///     writer.write_chunk(&vec![7u8; 256 * 1024]).await?;
+/// }
+/// writer.finish().await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Writer {
     inner: Arc<Inner>,
     /// Held so `finish` can put the key into the locker's RAM index.
@@ -141,6 +163,30 @@ impl Writer {
 }
 
 /// Yields chunk payloads without holding the whole value.
+/// Yields a chunked value one piece at a time.
+///
+/// The counterpart to [`Writer`], and deliberately not the whole-value path:
+/// holding every piece at once is precisely what this exists to avoid. An
+/// inline value is yielded as a single piece, so a caller never has to know
+/// which it got.
+///
+/// ```no_run
+/// use crossbank::{Bank, BankConfig, LazyLocker};
+///
+/// # async fn demo() -> crossbank::Result<()> {
+/// let bank = Bank::open(BankConfig::at("app.crossbank")).await?;
+/// let blobs: LazyLocker<Vec<u8>> = bank.lazy_locker("raw-feed").await?;
+///
+/// if let Some(mut reader) = blobs.reader("2026-08-21").await? {
+///     let mut total = 0usize;
+///     while let Some(piece) = reader.next_chunk().await? {
+///         total += piece.len();
+///     }
+///     println!("{total} bytes, never held at once");
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub struct Reader {
     inner: Arc<Inner>,
     pointer: Option<ChunkPointer>,

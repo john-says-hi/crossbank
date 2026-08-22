@@ -24,6 +24,31 @@
 //! nothing there.
 
 /// What happens to a locker's contents when storage runs short.
+///
+/// ```no_run
+/// use crossbank::{Bank, BankConfig, LazyLocker, LockerConfig, Policy};
+///
+/// # async fn demo() -> crossbank::Result<()> {
+/// let bank = Bank::open(BankConfig::at("app.crossbank")).await?;
+///
+/// // Regenerable data, capped. Least-recently-used entries are shed to stay
+/// // under the budget, which crossbank accounts for itself.
+/// let cache: LazyLocker<Vec<u8>> = bank
+///     .lazy_locker_with(
+///         "thumbnails",
+///         LockerConfig::default().with_policy(Policy::Evictable { max_bytes: 8 << 20 }),
+///     )
+///     .await?;
+/// cache.put("a", &vec![0u8; 4096]).await?;
+/// println!("{} bytes accounted for", cache.budget_used());
+///
+/// // Anything that cannot be regenerated stays `Precious`, which is the
+/// // default and needs no `with_policy` call at all.
+/// let vault: LazyLocker<Vec<u8>> = bank.lazy_locker("vault").await?;
+/// # let _ = vault;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Policy {
     /// Never shed anything. The right choice for data that cannot be
@@ -68,6 +93,29 @@ pub enum OnCorrupt {
 /// When a write reaches storage.
 ///
 /// The default is [`Commit::Immediate`] and it is never chosen for you.
+///
+/// ```no_run
+/// use crossbank::{Bank, BankConfig, Commit, LazyLocker, LockerConfig};
+///
+/// # async fn demo() -> crossbank::Result<()> {
+/// let bank = Bank::open(BankConfig::at("app.crossbank")).await?;
+/// let locker: LazyLocker<Vec<u8>> = bank
+///     .lazy_locker_with(
+///         "ingest",
+///         LockerConfig::default().with_commit(Commit::Deferred { after: 64 }),
+///     )
+///     .await?;
+///
+/// locker.put("a", &vec![1u8; 16]).await?;
+/// assert_eq!(locker.pending(), 1); // staged, not stored
+///
+/// // NOTHING flushes this for you — no timer, no task, no destructor.
+/// // Call it from your stop hook, or from `pagehide` on the web.
+/// locker.flush().await?;
+/// assert_eq!(locker.pending(), 0);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Commit {
     /// Every write is its own commit, and `put` returns once it has landed.
@@ -128,6 +176,38 @@ pub use crate::backend::api::Durability;
 ///
 /// Cloneable rather than `Copy`: a locker may carry its own filter chain, and
 /// a chain is a `dyn Filter` list behind an `Arc`.
+///
+/// Every field has a safe default and none of them is ever chosen for you.
+/// Build with the `with_*` methods:
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use crossbank::codec::{FilterChain, Lz4};
+/// use crossbank::{Bank, BankConfig, Commit, Durability, LazyLocker, LockerConfig, Policy};
+///
+/// # async fn demo() -> crossbank::Result<()> {
+/// let bank = Bank::open(BankConfig::at("app.crossbank")).await?;
+///
+/// let config = LockerConfig::default()
+///     // Shed the least recently used entries to stay under a budget
+///     // crossbank enforces itself.
+///     .with_policy(Policy::Evictable { max_bytes: 64 << 20 })
+///     // Stage writes and commit them in batches. YOU own the flush.
+///     .with_commit(Commit::Deferred { after: 32 })
+///     // Skip the per-commit fsync until `flush`.
+///     .with_durability(Durability::Eventual)
+///     .with_chunk_size(256 * 1024)
+///     // This locker compresses; the rest of the bank need not.
+///     .with_chain(Arc::new(FilterChain::new(7, vec![Box::new(Lz4)])));
+///
+/// let cache: LazyLocker<Vec<u8>> = bank.lazy_locker_with("candles", config).await?;
+/// cache.put("BTCUSDT", &vec![0u8; 4096]).await?;
+///
+/// // Nothing above stores anything until this.
+/// cache.flush().await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct LockerConfig {
     /// Largest value an eager locker will accept.

@@ -3,17 +3,26 @@ members = [".", "crossbank-conformance"]
 
 [package]
 name = "crossbank"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "Cross-platform persistent key/value storage for Rust — one API on native and in the browser."
+description = "Local, on-device key/value storage for Rust — one API on native (redb) and in the browser (IndexedDB). A Hive-shaped replacement, with no network, server, or sync."
 repository = "https://github.com/john-says-hi/crossbank"
 readme = "README.md"
+documentation = "https://docs.rs/crossbank"
 keywords = ["storage", "key-value", "wasm", "indexeddb", "embedded"]
 categories = ["database-implementations", "wasm"]
-# Flipped on at M6. Guards against an accidental early publish.
-publish = false
+# Everything a consumer of the published crate cannot use: browser bench
+# harnesses, CI plumbing, and the end-to-end page. The lib, its tests, its
+# examples and both licences still ship.
+#
+# `src/bin/` is here for a different reason: `crash_child` is the process the
+# crash-recovery tests abort on purpose, and it needs `futures`' executor
+# feature, which only the dev-dependency turns on. Publishing strips
+# dev-dependencies, so the packaged bin would not compile — and nobody
+# installing crossbank wants a binary whose whole job is to die.
+exclude = ["bench/", "ci/", ".github/", "tests/web_e2e/", "src/bin/"]
 
 [features]
 # Opt-in, and OFF everywhere by default. Its only job is to compile the wasm

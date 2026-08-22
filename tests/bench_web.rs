@@ -54,8 +54,29 @@ async fn web_workload_timings() {
     }
     let get_ms = (now_ms() - start) / 200.0;
 
+    // A chunked write: ONE commit carrying many puts. The bulk loop above is
+    // 200 commits of a single op each, which cannot show whether a commit
+    // batches its requests — this can. It is also the shape wise_apple
+    // actually stores: a candle series is one large value, chunked.
+    let chunky = bank
+        .lazy_locker_with::<Vec<u8>>(
+            "chunky",
+            crossbank::LockerConfig::default().with_chunk_size(64 * 1024),
+        )
+        .await
+        .unwrap();
+    let big = payload(4 * 1024 * 1024, 9);
+    let start = now_ms();
+    chunky.put("series", &big).await.unwrap();
+    let chunked_put_4mib_ms = now_ms() - start;
+
+    let start = now_ms();
+    let read = chunky.get("series").await.unwrap().unwrap();
+    let chunked_get_4mib_ms = now_ms() - start;
+    assert_eq!(read.len(), big.len(), "the chunked value must round-trip");
+
     let doc = format!(
-        "{{\"backend\":\"indexeddb\",\"settings_get_ms\":{settings_get:.4},\"bulk_put_200_ms\":{put_ms:.4},\"bulk_get_ms\":{get_ms:.4}}}"
+        "{{\"backend\":\"indexeddb\",\"settings_get_ms\":{settings_get:.4},\"bulk_put_200_ms\":{put_ms:.4},\"bulk_get_ms\":{get_ms:.4},\"chunked_put_4mib_ms\":{chunked_put_4mib_ms:.4},\"chunked_get_4mib_ms\":{chunked_get_4mib_ms:.4}}}"
     );
     web_sys::console::log_1(&doc.into());
 

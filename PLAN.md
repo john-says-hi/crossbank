@@ -283,7 +283,7 @@ every workflow is `workflow_dispatch`-only.
 | lint | fmt, clippy, shellcheck | per PR |
 | native | memory + redb, Linux/macOS/Windows, nextest + doctests | per PR |
 | wasm | plain and atomics × Chrome and Firefox | per PR |
-| wasm-safari | plain lane on `macos-latest` via `safaridriver` | per PR (non-blocking) |
+| wasm-safari | plain lane on `macos-latest` via `safaridriver` | per PR (required) |
 | mobile-check | Android ×3, iOS ×2 `cargo check` | per PR |
 | mobile persistence | write, kill, reopen on emulator/simulator | nightly |
 | torture, crash, proptest | multi-GB, quota, fault matrix | nightly |
@@ -300,16 +300,14 @@ Every wasm lane asserts a per-lane expected passing test count from `ci/expected
 "At least one test ran" caught a lane that ran nothing; it does not catch a lane that quietly
 stopped compiling a suite in. Adding cases means bumping those numbers in the same commit.
 
-**Follow-up — flip the Safari lane to required.** It landed non-blocking so a first-run
-infrastructure surprise on macOS cannot wedge every PR. Once John has seen **one green
-`wasm-safari` run** on master, make both changes in a single commit to
-`.github/workflows/ci.yml`:
-
-1. delete `continue-on-error: true` from the `wasm-safari` job, and
-2. add `wasm-safari` to `ci-green`'s `needs:` list.
-
-Until both are done, a red Safari lane proves nothing about the merge — `ci-green` cannot
-see it.
+**The Safari lane is required as of 2026-08-21. ✅** It landed non-blocking so a first-run
+infrastructure surprise on macOS could not wedge every PR, and it got one immediately: the
+first run died before a test executed because bash 3.2 on the macOS runner aborts on an
+empty array under `set -u`. The next run, after the fix, was green with the full 154 — red
+then green, which is the standing rule for trusting a lane. So `continue-on-error: true` is
+gone from the job and `wasm-safari` is in `ci-green`'s `needs:`. That second half is the one
+that matters: until it was in `needs`, a red Safari lane proved nothing about the merge,
+because `ci-green` could not see it.
 
 Lane rustflags live in `ci/wasm-atomics.toml`, selected with `cargo --config`. **Never** via
 a `RUSTFLAGS` env var, which *replaces* a cargo-config array instead of appending and
@@ -429,6 +427,16 @@ and enforced from the next. `LockerConfig` lost `Copy` as a result — a chain i
 *Publish readiness.* `publish = false` off, version 0.1.0, an `exclude` list, `CHANGELOG.md`,
 13 doc examples where the doc-test target previously ran **zero**, and
 `examples/{settings,candles,flush_on_pagehide}.rs`. `cargo publish --dry-run` passes.
+
+**Release pass — 0.1.0 landed. ✅ (2026-08-21)** The closeout wave (value-id reuse after a
+reopen, one shared locker state per name with `Hive.box(name)` semantics, the race in the
+shared-open path, eager delete after `Event::Stale`, `delete_bank` refused while open, the
+LRU tick floor, `LazyLocker::get_or`, seven new Hive-surface conformance cases, MSRV 1.90,
+and the CI additions) is on `master`, and `v0.1.0` is tagged. **CI is fully green on
+GitHub — every lane, including `wasm-safari`, which is now required.** The crate is *not*
+on crates.io: `cargo publish --dry-run` passes and the real publish is John's call. The
+review items this pass deliberately did not fix are in *Known limitations / review notes*
+below; nothing here is a second copy of them.
 
 ---
 

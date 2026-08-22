@@ -14,7 +14,8 @@
 //!
 //! # Status
 //!
-//! **0.1.0 candidate; the API may still change before 1.0.** M0–M6 are
+//! **v0.1.0 tagged; crates.io publish pending. The API may still change
+//! before 1.0.** M0–M6 are
 //! complete: data persists natively (`redb`) and in real browsers
 //! (IndexedDB), large lazy values are chunked with streaming
 //! [`Writer`]/[`Reader`] access, and storage pressure is answered by

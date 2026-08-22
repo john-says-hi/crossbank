@@ -7,8 +7,8 @@ Android and iOS, and real IndexedDB in the browser, behind one API. There is **n
 code, no server, no sync and no cloud** anywhere in it. crossbank never talks to anything —
 not to us, not to anyone. Data goes in, data comes back out, on that device only.
 
-> **Status: 0.1.0 candidate; API may still change before 1.0.** The in-memory, `redb` and
-> IndexedDB backends all pass one shared conformance suite, natively and in real browsers
+> **Status: v0.1.0 tagged; crates.io publish pending. API may still change before 1.0.**
+> The in-memory, `redb` and IndexedDB backends all pass one shared conformance suite, natively and in real browsers
 > (Chrome and Firefox, plain and atomics lanes). Data persists on desktop, mobile and the
 > web. Large values are chunked and streamable with bounded memory, storage pressure is
 > answered by a real byte budget, and cross-tab coherence and write coalescing are there

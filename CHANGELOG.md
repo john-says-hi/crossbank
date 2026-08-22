@@ -7,36 +7,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- Two opens of one locker name that overlap in time now end up as one locker. The registry
-  check ran before `prepare` and the locker open were awaited, so two callers could both
-  pass it, build an `Inner`, a resident state and an index each, and the second registration
-  overwrote the first — leaving a live locker that `is_locker_open`, `delete_locker` and the
-  next `locker(name)` could not see, and two indexes on one name each willing to prove a key
-  absent that the other had chunk-written, which orphaned those chunks permanently. The name
-  is now claimed under the registry lock *after* the awaits: the caller that loses the race
-  discards the locker it opened (it has only read) and hands out a view of the winner.
-- An eager `Locker`'s `delete` of a key whose resident copy was dropped as `Event::Stale` is
-  no longer a silent no-op. The fast path treated "not in the resident map" as "not stored",
-  but a stale key is precisely a key that is stored while this tab holds no value for it —
-  another tab wrote something too large to carry in a coherence message, or bytes this one
-  could not decode. The delete returned `Ok(())` without touching storage or announcing
-  anything, and the record was back at the next reopen, while `delete_all` on the same key
-  wrote the op. Such keys are now remembered and count as present, so the delete reaches
-  storage and raises `Event::Deleted`.
-- `delete_bank` no longer unlinks a native bank file that is still open. Doing so left the
-  live `Bank` committing into a file with no name on Unix — every write after the delete was
-  lost silently — and failed with an opaque backend error on Windows. A bank still open in
-  this process is now refused with `Error::InvalidConfig` saying *close the bank first*, and
-  nothing is removed. Closing the bank, or simply dropping it, frees the name again.
-- An eager `Locker`'s `delete` and `delete_all` no longer announce `Event::Deleted` for a key
-  that was not there. Hive fires only for keys that existed, so a `listenable(keys:)`-shaped
-  rebuild was repainting for nothing. A key skipped as corrupt still counts as present — its
-  bytes are on disk — and is still really deleted. `LazyLocker` keeps only the key index, so
-  it cannot answer "was it there?" without a read; it still announces unconditionally, and
-  the asymmetry is documented on both `delete` methods.
-
 ## [0.1.0] — 2026-08-21
 
 Initial release. crossbank is local, on-device key/value storage for Rust — a direct
@@ -136,6 +106,37 @@ because Hive's `get(key, defaultValue:)` is used on a `LazyBox` as readily as on
   defined only for `Arc<dyn Any + Send + Sync>`), and recovering a key after `Event::Stale`
   means closing the locker before opening it again, since opening it again on its own now
   returns the same resident state.
+
+- Two opens of one locker name that overlap in time now end up as one locker. The registry
+  check ran before `prepare` and the locker open were awaited, so two callers could both
+  pass it, build an `Inner`, a resident state and an index each, and the second registration
+  overwrote the first — leaving a live locker that `is_locker_open`, `delete_locker` and the
+  next `locker(name)` could not see, and two indexes on one name each willing to prove a key
+  absent that the other had chunk-written, which orphaned those chunks permanently. The name
+  is now claimed under the registry lock *after* the awaits: the caller that loses the race
+  discards the locker it opened (it has only read) and hands out a view of the winner.
+
+- An eager `Locker`'s `delete` of a key whose resident copy was dropped as `Event::Stale` is
+  no longer a silent no-op. The fast path treated "not in the resident map" as "not stored",
+  but a stale key is precisely a key that is stored while this tab holds no value for it —
+  another tab wrote something too large to carry in a coherence message, or bytes this one
+  could not decode. The delete returned `Ok(())` without touching storage or announcing
+  anything, and the record was back at the next reopen, while `delete_all` on the same key
+  wrote the op. Such keys are now remembered and count as present, so the delete reaches
+  storage and raises `Event::Deleted`.
+
+- `delete_bank` no longer unlinks a native bank file that is still open. Doing so left the
+  live `Bank` committing into a file with no name on Unix — every write after the delete was
+  lost silently — and failed with an opaque backend error on Windows. A bank still open in
+  this process is now refused with `Error::InvalidConfig` saying *close the bank first*, and
+  nothing is removed. Closing the bank, or simply dropping it, frees the name again.
+
+- An eager `Locker`'s `delete` and `delete_all` no longer announce `Event::Deleted` for a key
+  that was not there. Hive fires only for keys that existed, so a `listenable(keys:)`-shaped
+  rebuild was repainting for nothing. A key skipped as corrupt still counts as present — its
+  bytes are on disk — and is still really deleted. `LazyLocker` keeps only the key index, so
+  it cannot answer "was it there?" without a read; it still announces unconditionally, and
+  the asymmetry is documented on both `delete` methods.
 
 ### Notes
 

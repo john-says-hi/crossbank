@@ -9,10 +9,11 @@ you rediscover them the hard way.
 - **Local checkout:** `~/Documents/crossbank`
 - **Owner:** John (`john-says-hi`)
 - **Started:** 2026-08-15 · **Last worked:** 2026-08-21
-- **State:** **M0–M6 complete. The crate is a 0.1.0 candidate** — `publish = false` is off,
-  `cargo publish --dry-run` passes, and `cargo publish` has deliberately **not** been run.
-  Includes a Phase 3 performance pass (see `PLAN.md` → Performance) and the two review
-  must-fixes that came out of it.
+- **State:** **M0–M6 complete and 0.1.0 is tagged** — `v0.1.0` on GitHub, and **not**
+  published to crates.io: `cargo publish --dry-run` passes and `cargo publish` has
+  deliberately not been run, because that is John's call. CI is fully green on GitHub,
+  every lane including Safari, which is now required. Includes a Phase 3 performance pass
+  (see `PLAN.md` → Performance) and the release pass in §5.
 
 ---
 
@@ -168,7 +169,8 @@ fixed the chunk-size default at **256 KiB** and showed LZ4 is free on f64 candle
 comparison on identical byte workloads is recorded in `PLAN.md` → Performance: crossbank reads
 and big values win, Hive's non-fsync puts win, `transact` is the answer for bulk writes.
 
-**192 tests native. 22-case suite × 3 backends in browsers on both wasm lanes.**
+**At that point: 192 tests native, and the 22-case suite × 3 backends in browsers on both
+wasm lanes.** (For the counts at HEAD, see the release pass below.)
 
 **M5 — complete.** Quota (`Bank::usage`, `Bank::is_persisted` beside the existing
 `persist()`), a byte-budget LRU for `Policy::Evictable` lazy lockers on a bank-wide logical
@@ -195,8 +197,8 @@ is answered in prose (README → Web caveats), because nothing in code can answe
 - **Publish readiness.** Version 0.1.0, `exclude` list, `CHANGELOG.md`, 13 doc examples where
   there had been **zero**, and `examples/{settings,candles,flush_on_pagehide}.rs`.
 
-**375 tests native, 14 doctests, 153 per wasm lane. The conformance suite × 3 backends in
-browsers, plus browser-only coherence tests.**
+**At M6: 375 tests native, 14 doctests, 153 per wasm lane. The conformance suite × 3
+backends in browsers, plus browser-only coherence tests.**
 
 **Post-M6 — one locker name is one open locker.** `Bank::locker` handed out an independent
 handle per call, so two handles on a name served each other stale reads with no error — the
@@ -204,20 +206,60 @@ single biggest accuracy risk for the Hive-replacement goal, since `Hive.box(name
 process-wide singleton. Every handle on a name is now a view of one open locker. See traps
 16, 27 and 35, and `PLAN.md` → Known limitations.
 
+**Release pass (2026-08-21) — the 0.1.0 closeout.** Everything below landed on `master`
+before the tag, and the whole of CI went green on GitHub on the first run (lint, msrv,
+native ×3 OSes, mobile-check, all four wasm lanes, scale, web-e2e ×3 engines) with the
+Safari lane going red and then green, which is what earned it its `required` status.
+
+- **Value ids are no longer reused after a reopen.** The chunk counter was saved from the
+  number a writer *took* rather than the number the bank had *reached*, so a slow write
+  could push it backwards and a reopened bank handed the same id out twice — two values
+  sharing one set of chunks, and deleting either deleting both.
+- **One locker name is one shared locker state**, with `Hive.box(name)` semantics: one
+  resident map or index, one staged batch, one watcher set; a second open must agree on
+  type, kind and config; `close()` on any handle closes them all; and an eager value type
+  is now `T: Send + Sync` because the shared map is held type-erased. See trap 16.
+- **The race in the shared-open path is closed.** The registry check happened before the
+  awaits, so two overlapping opens on one name each built their own state and the second
+  registration hid the first. The name is claimed under the lock *after* the awaits now.
+  See trap 39.
+- **An eager `delete` after `Event::Stale` really deletes.** "Not resident" was being read
+  as "not stored"; a stale key is exactly a stored key this tab holds no value for.
+- **`delete_bank` on a still-open native bank is refused**, not attempted — unlinking under
+  a live fd lost every later write silently on Unix.
+- **The LRU tick clock is seeded from the `lru::` records at open**, so a reopened bank
+  cannot re-issue a tick already recorded and shed the wrong key.
+- **`LazyLocker::get_or` / `get_or_by`** — Hive's `get(key, defaultValue:)` is used on a
+  `LazyBox` as readily as on a `Box`.
+- **Seven new conformance cases** covering Hive-surface behaviour (delete-event fidelity
+  among them), taking `CASE_COUNT` to 61.
+- **MSRV is 1.90**, which is a number that has actually been run — the old `1.85` was
+  fiction and failed at resolve time on `redb`. See trap 36.
+- **CI:** a `msrv` job, `cargo publish --dry-run` and `cargo-semver-checks` in `lint` (the
+  latter `continue-on-error` until there is a published baseline), `--lib` on the mobile
+  check lanes, and the Safari lane flipped to required.
+
+**379 tests native, 14 doctests, 154 per wasm lane. `CASE_COUNT` is 61, and
+`crash_recovery` spawns 5 real child processes. The conformance suite × 3 backends in
+browsers, plus browser-only coherence tests.**
+
 ### Remaining work
 
-- **`cargo publish` for real.** Not run, on purpose. John's call.
-- Two CI steps are worth adding to the `lint` job: `cargo publish --dry-run` and
-  `cargo-semver-checks`. Neither is in `.github/workflows/ci.yml` yet.
+- **`cargo publish` 0.1.0 for real.** Not run, on purpose — John's call. When it lands,
+  remove `continue-on-error: true` from the `cargo-semver-checks` step in `lint` in the
+  same commit: it only errors today because there is no published baseline to diff
+  against (trap 34).
+- **The wise_apple migration is the next task, and it does not happen here.** The
+  Hive-shaped Dart shim backed by crossbank belongs in wise_apple's own repo (§2, §4).
 
 ## 6. How to run everything
 
 ```sh
 cd ~/Documents/crossbank
 
-cargo nextest run                      # native, all backends (375 tests)
+cargo nextest run                      # native, all backends (379 tests)
 cargo +1.97.1 clippy --workspace --all-targets --all-features   # see §7
-cargo test --doc                       # nextest does NOT run doctests (13 of them)
+cargo test --doc                       # nextest does NOT run doctests (14 of them)
 cargo run --example settings           # the Hive `Box` shape, end to end
 cargo run --example candles            # lazy: transact, Writer/Reader, Evictable
 cargo publish --dry-run                # must pass; do NOT publish without John
@@ -533,10 +575,11 @@ Every one of these was hit and paid for already. Do not rediscover them.
 1. Read `PLAN.md`.
 2. Run `cargo nextest run`, `cargo test --doc` and one browser lane, and confirm green before
    changing anything.
-3. Every milestone is done. What is left is **publishing**, and that is John's call — run
-   `cargo publish --dry-run`, never `cargo publish`, without being told to. If you are here
-   to change the API instead, remember it is a 0.1.0 candidate: breaking changes are still
-   allowed, but they belong in `CHANGELOG.md` under `[Unreleased]`.
+3. Every milestone is done and **0.1.0 is tagged** (`v0.1.0` on GitHub). What is left is
+   **the crates.io publish**, and that is John's call — run `cargo publish --dry-run`,
+   never `cargo publish`, without being told to. If you are here to change the API
+   instead, 0.x still allows breaking changes, but they belong in `CHANGELOG.md` under
+   `[Unreleased]` and they need a version bump before the next tag.
 4. Trap 8 still applies to any IndexedDB work: every backend method must be **one**
    `db.transaction(...).run(...)` awaiting only IDB requests.
 5. Safari CI has a lane: `wasm-safari` on `macos-latest`, plain lane only, running

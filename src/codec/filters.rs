@@ -11,7 +11,9 @@ use crate::error::{Error, Result};
 ///
 /// Whether this earns its CPU is workload-dependent — densely packed `f64`
 /// series compress close to 1.0x — which is why the filter chain is
-/// configurable per bank rather than mandatory.
+/// configurable rather than mandatory, per **locker** as well as per bank.
+/// See [`crate::LockerConfig::chain`]: a bank can compress a candle series
+/// and store settings raw at the same time.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Lz4;
 

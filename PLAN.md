@@ -448,8 +448,8 @@ retired.
 LZ4 is ~1.0× on candle-shaped bytes — it neither helps nor measurably hurts — and 1.8× faster
 end-to-end on compressible data (less to write). **LZ4 stays on by default.** A consumer with
 a known-incompressible workload can open its bank with `FilterChain::raw()`; making the chain
-selectable per locker rather than per bank is noted as an M6 ergonomics item, not a default
-change.
+selectable per locker rather than per bank landed at M6 (`LockerConfig::with_chain`), so a bank
+can compress a candle series and store settings raw at the same time; the default is unchanged.
 
 Reproduce: `cargo bench --bench kv -- "chunk_sweep|lz4_f64"`. A second full run put the 8 MiB
 chunk at 17.5 ms; the ordering never changed.
@@ -649,7 +649,9 @@ did not. A future web optimisation should be aimed at the former.
 - Whether `indexed-db`'s age (latest stable Jan 2025, 0.5.0 yanked) forces hand-rolled
   `web-sys` bindings. Revisit if M3 hits a wall.
 - ~~Whether LZ4 earns its CPU on f64 candle data~~ — **measured in M4: ~1.0×, free.** It
-  stays on. `FilterChain::raw()` is the opt-out; per-locker chain selection is an M6 nicety.
+  stays on. `FilterChain::raw()` is the opt-out, per bank or — since M6 —
+  per locker via `LockerConfig::with_chain`, whose id is recorded in `meta` and enforced on
+  every later open.
 
 ## Known limitations / review notes
 

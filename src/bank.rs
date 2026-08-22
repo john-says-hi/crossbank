@@ -40,6 +40,7 @@ const META_FORMAT_VERSION: &[u8] = b"format_version";
 const META_NEXT_LOCKER_ID: &[u8] = b"next_locker_id";
 const META_LOCKER_PREFIX: &[u8] = b"locker::";
 const META_SCHEMA_PREFIX: &[u8] = b"schema::";
+const META_CHAIN_PREFIX: &[u8] = b"chain::";
 
 fn locker_key(name: &str) -> Vec<u8> {
     let mut k = META_LOCKER_PREFIX.to_vec();
@@ -49,6 +50,12 @@ fn locker_key(name: &str) -> Vec<u8> {
 
 fn schema_key(id: LockerId) -> Vec<u8> {
     let mut k = META_SCHEMA_PREFIX.to_vec();
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+fn chain_key(id: LockerId) -> Vec<u8> {
+    let mut k = META_CHAIN_PREFIX.to_vec();
     k.extend_from_slice(&id.to_be_bytes());
     k
 }
@@ -514,10 +521,11 @@ impl Bank {
         T: Serialize + DeserializeOwned + 'static,
     {
         self.refuse_second_deferred_handle(name, &config)?;
-        let id = self.prepare::<T>(name).await?;
+        let chain = self.chain_for(&config);
+        let id = self.prepare::<T>(name, &chain).await?;
         let locker = Locker::open(
             self.backend.clone(),
-            self.chain.clone(),
+            chain,
             id,
             name.to_string(),
             config,
@@ -556,10 +564,11 @@ impl Bank {
         T: Serialize + DeserializeOwned,
     {
         self.refuse_second_deferred_handle(name, &config)?;
-        let id = self.prepare::<T>(name).await?;
+        let chain = self.chain_for(&config);
+        let id = self.prepare::<T>(name, &chain).await?;
         let locker = LazyLocker::open(
             self.backend.clone(),
-            self.chain.clone(),
+            chain,
             id,
             name.to_string(),
             config,
@@ -572,12 +581,65 @@ impl Bank {
         Ok(locker)
     }
 
-    /// Resolve the id and bind the value type, so reopening a locker under a
-    /// different `T` is caught rather than silently mis-decoded.
-    async fn prepare<T>(&self, name: &str) -> Result<LockerId> {
+    /// The chain a locker opened with `config` reads and writes through.
+    fn chain_for(&self, config: &LockerConfig) -> Arc<FilterChain> {
+        config.chain.clone().unwrap_or_else(|| self.chain.clone())
+    }
+
+    /// Resolve the id and bind both the value type and the filter chain, so
+    /// reopening a locker under a different `T` — or a different chain — is
+    /// caught rather than silently mis-decoded.
+    async fn prepare<T>(&self, name: &str, chain: &FilterChain) -> Result<LockerId> {
         let id = self.locker_id(name).await?;
         self.bind_schema(id, &type_tag::<T>()).await?;
+        self.bind_chain(id, chain).await?;
         Ok(id)
+    }
+
+    /// Record, or verify, the filter chain a locker is stored under.
+    ///
+    /// The same first-write-wins rule as [`Bank::bind_schema`], and for the
+    /// same reason: a chain id names how bytes were transformed, so opening a
+    /// locker under a different one would hand stored values to the wrong
+    /// inverse transform and decode them into plausible garbage.
+    ///
+    /// A locker written before this record existed simply has none. That is
+    /// not a mismatch — it was written with whatever the bank chain was, which
+    /// is what an open with no per-locker chain still uses — so the id is
+    /// written on this open and enforced from the next one.
+    async fn bind_chain(&self, id: LockerId, chain: &FilterChain) -> Result<()> {
+        let key = chain_key(id);
+        match self.backend.get(Table::Meta, &key).await? {
+            Some(raw) => {
+                let [stored] = raw[..] else {
+                    return Err(Error::Corrupt(
+                        "a locker's filter chain id is not a single byte".into(),
+                    ));
+                };
+                if stored != chain.id() {
+                    return Err(Error::SchemaMismatch {
+                        stored: format!(
+                            "filter chain {stored}; this locker's values were sealed with it"
+                        ),
+                        requested: format!(
+                            "{} — reopen the locker with the chain it was written under, \
+                             or use a new locker name",
+                            chain.describe()
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            None => {
+                self.backend
+                    .commit(vec![Op::Put {
+                        table: Table::Meta,
+                        key,
+                        value: vec![chain.id()],
+                    }])
+                    .await
+            }
+        }
     }
 
     pub(crate) fn job_sender(&self) -> mpsc::Sender<Job> {
@@ -593,8 +655,12 @@ impl Bank {
     /// Values go through the same envelope and filter chain as typed ones, and
     /// bind the same schema tag, so a locker reached this way is precisely a
     /// `Locker<Vec<u8>>` — the two views cannot disagree.
+    /// Always the **bank** chain: a handle carries no config, so a locker
+    /// given its own chain is refused here rather than read through the wrong
+    /// one.
     async fn raw_locker(&self, name: &str) -> Result<LockerId> {
-        self.prepare::<Vec<u8>>(name).await
+        let chain = self.chain.clone();
+        self.prepare::<Vec<u8>>(name, &chain).await
     }
 
     pub(crate) async fn raw_get(&self, locker: &str, key: &str) -> Result<Option<Vec<u8>>> {

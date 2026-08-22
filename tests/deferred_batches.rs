@@ -399,11 +399,11 @@ fn a_second_deferred_handle_on_one_name_is_refused() {
         let deferred = LockerConfig::default().with_commit(Commit::Deferred { after: 8 });
 
         let first = bank
-            .lazy_locker_with::<String>("only_one", deferred)
+            .lazy_locker_with::<String>("only_one", deferred.clone())
             .await
             .expect("first open");
 
-        let second = bank.lazy_locker_with::<String>("only_one", deferred).await;
+        let second = bank.lazy_locker_with::<String>("only_one", deferred.clone()).await;
         assert!(
             matches!(second, Err(Error::InvalidConfig(_))),
             "a second deferred handle must be refused: {second:?}"
@@ -453,11 +453,11 @@ fn a_second_handle_overwriting_a_chunked_key_leaves_no_orphan_chunks() {
         let config = LockerConfig::default().with_chunk_size(256);
 
         let a = bank
-            .lazy_locker_with::<Vec<u8>>("twohanded", config)
+            .lazy_locker_with::<Vec<u8>>("twohanded", config.clone())
             .await
             .expect("first handle");
         let b = bank
-            .lazy_locker_with::<Vec<u8>>("twohanded", config)
+            .lazy_locker_with::<Vec<u8>>("twohanded", config.clone())
             .await
             .expect("second handle");
 
@@ -496,10 +496,10 @@ fn a_batch_of_one_does_not_count_as_deferral_for_the_handle_rule() {
         let bank = Bank::open(BankConfig::memory()).await.expect("bank");
         let config = LockerConfig::default().with_commit(Commit::Deferred { after: 1 });
         let _one = bank
-            .lazy_locker_with::<String>("degenerate", config)
+            .lazy_locker_with::<String>("degenerate", config.clone())
             .await
             .expect("first");
-        bank.lazy_locker_with::<String>("degenerate", config)
+        bank.lazy_locker_with::<String>("degenerate", config.clone())
             .await
             .expect("a batch of one stages nothing, so a second handle is fine");
     });

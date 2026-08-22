@@ -85,6 +85,8 @@ where
             )));
         }
 
+        let budget = config.eager_budget;
+        let on_corrupt = config.on_corrupt;
         let inner = Arc::new(Inner {
             write_lock: futures::lock::Mutex::new(()),
             backend,
@@ -102,7 +104,6 @@ where
         let mut values = BTreeMap::new();
         let mut corrupt: Vec<Vec<u8>> = Vec::new();
         let mut loaded: u64 = 0;
-        let budget = config.eager_budget;
         let mut overflow: Option<u64> = None;
 
         inner
@@ -131,7 +132,7 @@ where
                         // Skip records the decoder chokes on, when asked to.
                         // The stored bytes are left untouched, so a later
                         // build with a working decoder can still read them.
-                        Err(e) if config.on_corrupt == OnCorrupt::Skip && e.is_corruption() => {
+                        Err(e) if on_corrupt == OnCorrupt::Skip && e.is_corruption() => {
                             corrupt.push(key);
                         }
                         Err(e) => return Err(e),

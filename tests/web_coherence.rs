@@ -120,8 +120,8 @@ async fn an_eager_locker_absorbs_small_writes_and_goes_stale_on_large_ones() {
     let a = Bank::open(config(name)).await.unwrap();
     let b = Bank::open(config(name)).await.unwrap();
     let config = LockerConfig::default().with_max_inline(1024 * 1024);
-    let ea = a.locker_with::<Vec<u8>>("e", config).await.unwrap();
-    let eb = b.locker_with::<Vec<u8>>("e", config).await.unwrap();
+    let ea = a.locker_with::<Vec<u8>>("e", config.clone()).await.unwrap();
+    let eb = b.locker_with::<Vec<u8>>("e", config.clone()).await.unwrap();
 
     // Small enough to ride along inside the message.
     eb.put("small", incompressible(64)).await.unwrap();

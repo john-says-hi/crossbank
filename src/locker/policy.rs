@@ -125,7 +125,10 @@ pub enum Commit {
 pub use crate::backend::api::Durability;
 
 /// Limits applied to one locker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Cloneable rather than `Copy`: a locker may carry its own filter chain, and
+/// a chain is a `dyn Filter` list behind an `Arc`.
+#[derive(Debug, Clone)]
 pub struct LockerConfig {
     /// Largest value an eager locker will accept.
     ///
@@ -157,7 +160,39 @@ pub struct LockerConfig {
     /// Peak memory on the streaming path is a small multiple of this, not of
     /// the value. 256 KiB is the starting default; benches may move it.
     pub chunk_size: usize,
+
+    /// The filter chain this locker's values are sealed with.
+    ///
+    /// `None` — the default — means the bank's chain. Set it to give one
+    /// locker a different one: LZ4 on a candle series next to a raw chain on
+    /// settings, in the same bank.
+    ///
+    /// The choice is **persistent**, not a runtime option. The chain id is
+    /// recorded in `meta` the first time the locker is opened, and every later
+    /// open under a different id is refused with [`crate::Error::SchemaMismatch`]
+    /// rather than handing stored bytes to the wrong inverse transform. Chunks
+    /// are sealed piece by piece with the same chain, and so is anything a
+    /// coherence message carries inline.
+    pub chain: Option<std::sync::Arc<crate::codec::FilterChain>>,
 }
+
+/// Two configs are equal when they would behave identically. A filter chain
+/// compares by its id, which is exactly the thing that gates format
+/// compatibility — see [`crate::codec::FilterChain`].
+impl PartialEq for LockerConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_inline == other.max_inline
+            && self.eager_budget == other.eager_budget
+            && self.policy == other.policy
+            && self.commit == other.commit
+            && self.durability == other.durability
+            && self.on_corrupt == other.on_corrupt
+            && self.chunk_size == other.chunk_size
+            && self.chain_id() == other.chain_id()
+    }
+}
+
+impl Eq for LockerConfig {}
 
 impl Default for LockerConfig {
     fn default() -> Self {
@@ -169,6 +204,7 @@ impl Default for LockerConfig {
             durability: Durability::Immediate,
             on_corrupt: OnCorrupt::Fail,
             chunk_size: 256 * 1024,
+            chain: None,
         }
     }
 }
@@ -225,6 +261,20 @@ impl LockerConfig {
     pub fn with_chunk_size(mut self, bytes: usize) -> Self {
         self.chunk_size = bytes.max(1);
         self
+    }
+
+    /// Give this locker its own filter chain instead of the bank's.
+    ///
+    /// Recorded in `meta` at first open and enforced on every later one. See
+    /// [`LockerConfig::chain`].
+    pub fn with_chain(mut self, chain: std::sync::Arc<crate::codec::FilterChain>) -> Self {
+        self.chain = Some(chain);
+        self
+    }
+
+    /// This locker's own chain id, if it has one.
+    pub(crate) fn chain_id(&self) -> Option<u8> {
+        self.chain.as_ref().map(|c| c.id())
     }
 }
 
@@ -286,12 +336,26 @@ mod tests {
             .with_policy(Policy::Evictable { max_bytes: 4096 })
             .with_on_corrupt(OnCorrupt::Skip)
             .with_chunk_size(64)
-            .with_durability(Durability::Eventual);
+            .with_durability(Durability::Eventual)
+            .with_chain(std::sync::Arc::new(crate::codec::FilterChain::raw()));
         assert_eq!(c.on_corrupt, OnCorrupt::Skip);
         assert_eq!(c.durability, Durability::Eventual);
         assert_eq!(c.max_inline, 1024);
         assert_eq!(c.eager_budget, 2048);
         assert_eq!(c.policy, Policy::Evictable { max_bytes: 4096 });
         assert_eq!(c.chunk_size, 64);
+        assert_eq!(c.chain_id(), Some(0));
+    }
+
+    /// A chain compares by the id that gates format compatibility, not by
+    /// pointer identity — two `Arc`s over the same chain must not read as two
+    /// different configs.
+    #[test]
+    fn configs_compare_a_chain_by_its_id() {
+        use std::sync::Arc;
+        let a = LockerConfig::default().with_chain(Arc::new(crate::codec::FilterChain::raw()));
+        let b = LockerConfig::default().with_chain(Arc::new(crate::codec::FilterChain::raw()));
+        assert_eq!(a, b);
+        assert_ne!(a, LockerConfig::default());
     }
 }

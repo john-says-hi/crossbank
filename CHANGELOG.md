@@ -9,6 +9,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Two opens of one locker name that overlap in time now end up as one locker. The registry
+  check ran before `prepare` and the locker open were awaited, so two callers could both
+  pass it, build an `Inner`, a resident state and an index each, and the second registration
+  overwrote the first — leaving a live locker that `is_locker_open`, `delete_locker` and the
+  next `locker(name)` could not see, and two indexes on one name each willing to prove a key
+  absent that the other had chunk-written, which orphaned those chunks permanently. The name
+  is now claimed under the registry lock *after* the awaits: the caller that loses the race
+  discards the locker it opened (it has only read) and hands out a view of the winner.
 - `delete_bank` no longer unlinks a native bank file that is still open. Doing so left the
   live `Bank` committing into a file with no name on Unix — every write after the delete was
   lost silently — and failed with an opaque backend error on Windows. A bank still open in

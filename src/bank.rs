@@ -752,16 +752,7 @@ impl Bank {
         self.ensure_open()?;
         let chain = self.chain_for(&config);
         if let Some(open) = self.open_locker(name) {
-            Self::check_shared::<T>(name, &open, TxMode::Eager, &config)?;
-            let values = open
-                .values
-                .clone()
-                .and_then(|erased| erased.downcast::<EagerValues<T>>().ok())
-                .ok_or_else(|| Error::SchemaMismatch {
-                    stored: open.type_tag.clone(),
-                    requested: type_tag::<T>(),
-                })?;
-            return Ok(Locker::from_shared(open.inner, values, open.resident));
+            return Self::share_eager(name, open, &config);
         }
 
         let id = self.prepare::<T>(name, &chain).await?;
@@ -774,22 +765,44 @@ impl Bank {
             self.shared.clone(),
         )
         .await?;
-        self.register_open(
-            name,
-            OpenLocker {
-                inner: Arc::downgrade(locker.inner()),
-                resident: Arc::downgrade(locker.resident()),
-                values: Some(
-                    Arc::downgrade(locker.shared_values()) as Weak<dyn std::any::Any + Send + Sync>
-                ),
-                kind: TxMode::Eager,
-                type_tag: type_tag::<T>(),
-                config,
-            },
-        );
+        // The registry check above is not a claim: `prepare` and `open` both
+        // await, and a second open of this name can pass the same check and
+        // finish first. Claiming the name under the lock — and sharing the
+        // winner when someone else holds it — is what makes one name one
+        // locker even then. See trap 39.
+        let claim = OpenLocker {
+            inner: Arc::downgrade(locker.inner()),
+            resident: Arc::downgrade(locker.resident()),
+            values: Some(
+                Arc::downgrade(locker.shared_values()) as Weak<dyn std::any::Any + Send + Sync>
+            ),
+            kind: TxMode::Eager,
+            type_tag: type_tag::<T>(),
+            config: config.clone(),
+        };
+        if let Some(open) = self.claim_open(name, claim) {
+            return Self::share_eager(name, open, &config);
+        }
         self.register_resident(locker.resident());
         locker.join_coherence();
         Ok(locker)
+    }
+
+    /// Another handle onto the open eager locker `name`, if it agrees.
+    fn share_eager<T>(name: &str, open: Shared, config: &LockerConfig) -> Result<Locker<T>>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+    {
+        Self::check_shared::<T>(name, &open, TxMode::Eager, config)?;
+        let values = open
+            .values
+            .clone()
+            .and_then(|erased| erased.downcast::<EagerValues<T>>().ok())
+            .ok_or_else(|| Error::SchemaMismatch {
+                stored: open.type_tag.clone(),
+                requested: type_tag::<T>(),
+            })?;
+        Ok(Locker::from_shared(open.inner, values, open.resident))
     }
 
     /// Open a lazy locker: key index resident, values fetched on demand.
@@ -823,8 +836,7 @@ impl Bank {
         self.ensure_open()?;
         let chain = self.chain_for(&config);
         if let Some(open) = self.open_locker(name) {
-            Self::check_shared::<T>(name, &open, TxMode::Lazy, &config)?;
-            return Ok(LazyLocker::from_shared(open.inner, open.resident));
+            return Self::share_lazy(name, open, &config);
         }
 
         let id = self.prepare::<T>(name, &chain).await?;
@@ -837,20 +849,30 @@ impl Bank {
             self.shared.clone(),
         )
         .await?;
-        self.register_open(
-            name,
-            OpenLocker {
-                inner: Arc::downgrade(locker.inner()),
-                resident: Arc::downgrade(locker.resident()),
-                values: None,
-                kind: TxMode::Lazy,
-                type_tag: type_tag::<T>(),
-                config,
-            },
-        );
+        // See `locker_with`: the check before the awaits is not a claim.
+        let claim = OpenLocker {
+            inner: Arc::downgrade(locker.inner()),
+            resident: Arc::downgrade(locker.resident()),
+            values: None,
+            kind: TxMode::Lazy,
+            type_tag: type_tag::<T>(),
+            config: config.clone(),
+        };
+        if let Some(open) = self.claim_open(name, claim) {
+            return Self::share_lazy(name, open, &config);
+        }
         self.register_resident(locker.resident());
         locker.join_coherence();
         Ok(locker)
+    }
+
+    /// Another handle onto the open lazy locker `name`, if it agrees.
+    fn share_lazy<T>(name: &str, open: Shared, config: &LockerConfig) -> Result<LazyLocker<T>>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        Self::check_shared::<T>(name, &open, TxMode::Lazy, config)?;
+        Ok(LazyLocker::from_shared(open.inner, open.resident))
     }
 
     /// The chain a locker opened with `config` reads and writes through.
@@ -1604,12 +1626,37 @@ impl Bank {
         }
     }
 
-    /// Record the one open locker for `name`, replacing any dead entry.
-    fn register_open(&self, name: &str, open: OpenLocker) {
-        if let Ok(mut guard) = self.open_lockers.lock() {
-            Self::prune(&mut guard);
-            guard.insert(name.to_string(), open);
+    /// Claim `name` for a freshly opened locker, or report who holds it.
+    ///
+    /// The claim is what the registry check in `locker_with` is not. That
+    /// check runs, releases the lock, and then awaits `prepare` and `open`;
+    /// two callers can both pass it and each build an `Inner`, a `Resident`
+    /// and an index of their own, and whichever registered last used to
+    /// **overwrite** the first — leaving a live locker no `is_locker_open`,
+    /// `delete_locker` or later `locker(name)` could see, and two indexes on
+    /// one name each willing to prove a key absent that the other had
+    /// chunk-written (trap 27). So the last word on a name is spoken under
+    /// the registry lock, after the awaits, and never before them.
+    ///
+    /// `Some` means somebody else won: the caller must discard the locker it
+    /// just opened and hand out a view of the returned state instead. That
+    /// locker has done nothing but read, so dropping it loses nothing.
+    ///
+    /// Both `Inner`s are marked `name_shared` when that happens. The loser is
+    /// discarded, so nothing should be able to reach its index — the mark is
+    /// the belt to that reasoning, and it costs only a read before a write.
+    fn claim_open(&self, name: &str, open: OpenLocker) -> Option<Shared> {
+        let mut guard = self.open_lockers.lock().ok()?;
+        Self::prune(&mut guard);
+        if let Some(winner) = guard.get(name).and_then(OpenLocker::upgrade) {
+            winner.inner.mark_name_shared();
+            if let Some(mine) = open.inner.upgrade() {
+                mine.mark_name_shared();
+            }
+            return Some(winner);
         }
+        guard.insert(name.to_string(), open);
+        None
     }
 
     /// The live state behind `name`, if this bank still has it open.

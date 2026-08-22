@@ -479,6 +479,32 @@ Every one of these was hit and paid for already. Do not rediscover them.
     end with a terminating write on a key that IS watched, so a missing event
     shifts the terminator forward instead of leaving nothing to poll.
 
+39. **A registry check before an `.await` is not a claim.** `Bank::locker` /
+    `lazy_locker` asked the open-locker registry whether the name was already
+    open, dropped the lock, and only *then* awaited `prepare` and the locker
+    open. Two callers on one name could both pass that check — natively
+    through a shared `Bank` on two threads, on the web through two futures
+    joined together, where the second is polled while the first is suspended
+    in a backend read. Each then built its own `Inner`, resident state and
+    index, and `register_open`'s `HashMap::insert` meant the *second* one won:
+    the first locker stayed alive, invisible to `is_locker_open`,
+    `delete_locker` and the next `locker(name)`, still serving reads and
+    writes to whoever held it. Worse, it was trap 27 back from the dead — two
+    indexes on one name, each authoritative, each able to prove absent a key
+    the other had chunk-written, so an overwrite skipped the read that finds
+    the old chunks and orphaned them forever. The fix is that the last word on
+    a name is spoken **under the lock, after the awaits**: `claim_open` either
+    inserts or reports the winner, and the loser throws away the locker it
+    just opened (it has done nothing but read) and shares the winner instead.
+    `Inner::mark_name_shared` came back as the belt — both `Inner`s are marked
+    when a race is detected, so even a path that got past the resolution would
+    read before writing. The general rule: **a check and the action it
+    authorises must happen under one hold of the lock, or the check is only a
+    hint.** Two of the tests for it are in `tests/shared_handles.rs` behind a
+    backend decorator that suspends in `scan`, because the memory backend's
+    futures are all ready on their first poll and cannot produce the window at
+    all; the browser needs no such help (`tests/web_shared_handles.rs`).
+
 ## 8. Where the detail lives
 
 - **`PLAN.md`** — the full technical plan: all 25 decisions with rationale, architecture, the

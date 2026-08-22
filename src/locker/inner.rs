@@ -132,13 +132,15 @@ pub(crate) struct Inner {
     /// Set when this locker's stored data is reachable by an index this one
     /// will never hear from, so its own index may not prove a key *absent*.
     ///
-    /// Two handles on one name no longer set it: they share one `Inner` and
-    /// one index, so there is no second index to go stale (see
-    /// [`crate::Bank::locker_with`]). What still does is a locker the bank
-    /// fabricates for maintenance, which carries no index at all. The
-    /// remaining in-process way to reach the hazard is two `Bank`s over one
-    /// backend, which is documented as unsupported for exactly this reason.
-    /// See [`Prior`].
+    /// Two handles on one name do not normally set it: they share one `Inner`
+    /// and one index, so there is no second index to go stale (see
+    /// [`crate::Bank::locker_with`]). What does set it is a locker the bank
+    /// fabricates for maintenance, which carries no index at all; two `Bank`s
+    /// over one backend, which is documented as unsupported for exactly this
+    /// reason; and the one moment two `Inner`s *can* exist on one name — two
+    /// opens of a name racing each other across an await, where the loser is
+    /// discarded but both are marked anyway, because the flag is the belt and
+    /// the resolution is the braces. See [`Prior`].
     pub(crate) name_shared: AtomicBool,
 }
 
@@ -224,6 +226,15 @@ impl Inner {
             return Err(Error::Closed);
         }
         Ok(())
+    }
+
+    /// Note that another `Inner` has, however briefly, existed on this
+    /// locker's name.
+    ///
+    /// One-way on purpose: closing or discarding the other one does not undo
+    /// what it may already have written. See [`Prior`].
+    pub(crate) fn mark_name_shared(&self) {
+        self.name_shared.store(true, Ordering::Release);
     }
 
     /// Whether this handle's RAM index is allowed to prove a key *absent*.

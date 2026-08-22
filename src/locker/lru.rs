@@ -299,7 +299,9 @@ impl LruState {
                 // The key exists, so it must be in the index and in the
                 // ordering; only its size is unknown. Account it as zero and
                 // let the reload correct the total.
-                self.entries.entry(key.to_vec()).or_insert(Entry { tick, bytes: 0 });
+                self.entries
+                    .entry(key.to_vec())
+                    .or_insert(Entry { tick, bytes: 0 });
                 self.mark_dirty();
             }
         }

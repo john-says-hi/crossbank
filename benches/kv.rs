@@ -112,7 +112,7 @@ fn settings_eager(c: &mut Criterion) {
             let mut i = 0usize;
             b.iter(|| {
                 // 90/10 get/put, Hive Box shaped.
-                if i % 10 == 0 {
+                if i.is_multiple_of(10) {
                     wait(locker.put(&key(i % SETTINGS_N), payload(SETTINGS_BYTES, i as u8)))
                         .unwrap();
                 } else {

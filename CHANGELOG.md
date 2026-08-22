@@ -75,6 +75,9 @@ consumer whose storage trait requires `Send` futures, because the IndexedDB back
 **No async runtime dependency.** `futures` only, never `tokio`. crossbank spawns nothing;
 the consumer decides where work runs.
 
+**Defaults on a lazy read.** `LazyLocker::get_or` / `get_or_by`, the twin of `Locker::get_or`,
+because Hive's `get(key, defaultValue:)` is used on a `LazyBox` as readily as on a `Box`.
+
 ### Fixed
 
 - The LRU tick clock is now seeded from the `lru::` records themselves at open, so a reopened

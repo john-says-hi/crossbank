@@ -185,6 +185,42 @@ where
         found
     }
 
+    /// Read a value, falling back to `default` when the key is absent.
+    ///
+    /// Hive's `get(key, defaultValue:)`, which app code uses on a `LazyBox`
+    /// just as readily as on a `Box`; [`crate::Locker::get_or`] is the eager
+    /// twin. The default is *not* written — a read stays a read.
+    ///
+    /// A **stored empty value is not a missing key** and comes back as
+    /// itself. That distinction is one of the reasons crossbank exists, so it
+    /// holds here too: only a key that was never written, or was deleted,
+    /// yields `default`.
+    ///
+    /// ```no_run
+    /// use crossbank::{Bank, BankConfig, LazyLocker};
+    ///
+    /// # async fn demo() -> crossbank::Result<()> {
+    /// let bank = Bank::open(BankConfig::at("app.crossbank")).await?;
+    /// let notes: LazyLocker<String> = bank.lazy_locker("notes").await?;
+    ///
+    /// notes.put("greeting", &String::new()).await?;
+    ///
+    /// // Stored, and empty: the stored value wins over the default.
+    /// assert_eq!(notes.get_or("greeting", "hello".into()).await?, "");
+    /// // Never written: the default.
+    /// assert_eq!(notes.get_or("missing", "hello".into()).await?, "hello");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_or(&self, key: &str, default: T) -> Result<T> {
+        self.get_or_by(key.as_bytes(), default).await
+    }
+
+    /// As [`LazyLocker::get_or`], under a binary key.
+    pub async fn get_or_by(&self, key: &[u8], default: T) -> Result<T> {
+        Ok(self.get_by(key).await?.unwrap_or(default))
+    }
+
     async fn load_and_note(&self, key: &[u8]) -> Result<Option<T>> {
         match self.inner.load_value(key).await {
             Err(e) if self.inner.config.on_corrupt == OnCorrupt::Skip && e.is_corruption() => {
@@ -1098,6 +1134,46 @@ mod tests {
             block_on(l.put(k, &v.to_string())).unwrap();
         }
         l
+    }
+
+    /// `get_or` answers a missing key with the default and a stored **empty**
+    /// value with the value.
+    ///
+    /// The second half is the one that matters. wise_apple's current bridge
+    /// treats an empty payload as absent, which is precisely the behaviour
+    /// crossbank refuses: a default handed back for a value someone
+    /// deliberately stored is silent data loss at the read.
+    #[test]
+    fn get_or_falls_back_only_for_a_key_that_is_not_there() {
+        let l = seeded(&[("stored", "value"), ("empty", "")]);
+
+        block_on(async {
+            assert_eq!(
+                l.get_or("stored", "fallback".into()).await.unwrap(),
+                "value"
+            );
+            assert_eq!(l.get_or("empty", "fallback".into()).await.unwrap(), "");
+            assert_eq!(
+                l.get_or("missing", "fallback".into()).await.unwrap(),
+                "fallback"
+            );
+            // The default is not written: a read stays a read.
+            assert!(!l.contains_key("missing"));
+
+            // The binary twin answers identically.
+            assert_eq!(l.get_or_by(b"empty", "fallback".into()).await.unwrap(), "");
+            assert_eq!(
+                l.get_or_by(b"missing", "fallback".into()).await.unwrap(),
+                "fallback"
+            );
+
+            // A deleted key is missing again.
+            l.delete("stored").await.unwrap();
+            assert_eq!(
+                l.get_or("stored", "fallback".into()).await.unwrap(),
+                "fallback"
+            );
+        });
     }
 
     /// Another tab's write appears in this tab's index, and is announced.

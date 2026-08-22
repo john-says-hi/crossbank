@@ -48,7 +48,7 @@ every file that imported it. The root handle is `Bank` rather than the `Hive` st
 |---|---|
 | `Box<T>` | `Locker<T>` |
 | `LazyBox<T>` | `LazyLocker<T>` |
-| `box.get(key, defaultValue: v)` | `locker.get_or(key, v)` |
+| `box.get(key, defaultValue: v)` / `lazyBox.get(…)` | `locker.get_or(key, v)` — on both `Locker` and `LazyLocker` |
 | `box.put(k, v)` | `locker.put(k, v)` |
 | `box.putAll(map)` | `locker.put_all(pairs)` |
 | `box.delete(k)` | `locker.delete(k)` |

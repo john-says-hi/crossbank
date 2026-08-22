@@ -1459,7 +1459,9 @@ pub async fn a_batch_is_never_its_own_eviction_victim<H: Harness>(h: &H) -> Resu
         .with_commit(Commit::Deferred { after: 32 });
 
     let bank = bank(h).await?;
-    let locker = bank.lazy_locker_with::<Vec<u8>>("self_evict", config).await?;
+    let locker = bank
+        .lazy_locker_with::<Vec<u8>>("self_evict", config)
+        .await?;
 
     // Two older keys, committed, that eviction is free to shed.
     for key in ["old_a", "old_b"] {
@@ -1681,5 +1683,187 @@ pub async fn chunked_reads_are_whole_after_get_many<H: Harness>(h: &H) -> Result
         Some(value),
         "get_many reassembly and the streaming reader must not disagree"
     );
+    Ok(())
+}
+
+// ---- fault injection ---------------------------------------------------
+//
+// These three need a backend that fails on cue, so they open through
+// `Harness::open_with_fault` and arm the plan *after* the locker exists —
+// locker registration is itself a commit, and counting it would make `at_op`
+// depend on bookkeeping the case is not about.
+
+/// A commit that fails writes nothing: the previous state is exactly intact.
+///
+/// The failure mode this rules out is the one a naive engine has — applying a
+/// write-set op by op, so a failure part-way leaves some keys new and some
+/// old. crossbank hands the backend one op list, and every backend must apply
+/// all of it or none.
+pub async fn a_torn_commit_leaves_the_previous_state<H: Harness>(h: &H) -> Result<()> {
+    let faulty = h.open_with_fault().await?;
+    let bank = Bank::with_backend(faulty.clone()).await?;
+    let locker = bank.lazy_locker::<V>("torn").await?;
+
+    // Groundwork, committed normally.
+    locker
+        .put_all(vec![
+            ("a".to_string(), v("old-a")),
+            ("b".to_string(), v("old-b")),
+            ("c".to_string(), v("old-c")),
+        ])
+        .await?;
+
+    // The very next op-carrying commit dies before storage sees it.
+    faulty.arm(crate::fault::FaultPlan::new(
+        0,
+        crate::fault::Injection::Abort,
+    ))?;
+
+    let torn = locker
+        .put_all(vec![
+            ("a".to_string(), v("new-a")),
+            ("b".to_string(), v("new-b")),
+            ("d".to_string(), v("new-d")),
+        ])
+        .await;
+    assert!(
+        torn.is_err(),
+        "an aborted commit must be reported as an error"
+    );
+    assert!(faulty.fired()?, "the plan must have fired");
+
+    // Nothing partial: no new key appeared, and no old value moved.
+    assert_eq!(locker.get("a").await?, Some(v("old-a")));
+    assert_eq!(locker.get("b").await?, Some(v("old-b")));
+    assert_eq!(locker.get("c").await?, Some(v("old-c")));
+    assert_eq!(
+        locker.get("d").await?,
+        None,
+        "a key that only the torn commit wrote must not exist"
+    );
+
+    bank.close().await?;
+    Ok(())
+}
+
+/// Running out of storage mid-batch stores none of the batch.
+///
+/// `Error::QuotaExceeded` is the browser's characteristic failure and the one
+/// most likely to be met in the field, so the spec pins that the whole batch
+/// is refused rather than truncated — and that the locker's own view agrees
+/// with storage afterwards, which is where a RAM index would betray it.
+pub async fn quota_exhaustion_mid_batch_writes_nothing<H: Harness>(h: &H) -> Result<()> {
+    let faulty = h.open_with_fault().await?;
+    let bank = Bank::with_backend(faulty.clone()).await?;
+    let locker = bank.lazy_locker::<V>("quota").await?;
+
+    locker.put("kept", &v("before")).await?;
+
+    faulty.arm(crate::fault::FaultPlan::new(
+        0,
+        crate::fault::Injection::Quota,
+    ))?;
+
+    let entries: Vec<(String, V)> = (0..20)
+        .map(|i| (format!("q{i:02}"), v(&format!("value {i}"))))
+        .collect();
+    let refused = locker.put_all(entries).await;
+    assert!(
+        matches!(refused, Err(Error::QuotaExceeded { .. })),
+        "a full device must surface as QuotaExceeded, not as a generic failure"
+    );
+
+    assert_eq!(
+        locker.get("kept").await?,
+        Some(v("before")),
+        "the write that already landed must survive the one that did not"
+    );
+    for i in 0..20 {
+        assert_eq!(
+            locker.get(&format!("q{i:02}")).await?,
+            None,
+            "no part of a quota-refused batch may be stored"
+        );
+    }
+    assert_eq!(
+        locker.len(),
+        1,
+        "the key index must not claim keys that were never written"
+    );
+
+    bank.close().await?;
+    Ok(())
+}
+
+/// A chunk damaged in storage is reported, never returned and never panicked.
+///
+/// Truncation is the interesting shape: the record still points at the right
+/// number of chunks and every one of them is still there, so nothing but the
+/// per-chunk CRC can catch it. The contract is `Error::Corrupt` — and, just as
+/// importantly, that the caller is never handed a short or partly-correct
+/// value that looks like data.
+pub async fn a_truncated_chunk_is_reported_as_corrupt<H: Harness>(h: &H) -> Result<()> {
+    let faulty = h.open_with_fault().await?;
+    let bank = Bank::with_backend(faulty.clone()).await?;
+    let locker = bank
+        .lazy_locker_with::<Vec<u8>>("chunked", tiny_chunks())
+        .await?;
+
+    // A chunked put commits, in order: the value-id counter, then one put per
+    // chunk, then the record's pointer. Op 1 is therefore the first chunk —
+    // damaging the counter or the pointer would be a different test.
+    faulty.arm(crate::fault::FaultPlan::new(
+        1,
+        crate::fault::Injection::Truncate { keep: 4 },
+    ))?;
+
+    let value: Vec<u8> = (0..200u8).map(|i| i.wrapping_mul(3)).collect();
+    locker.put("big", &value).await?;
+    assert!(faulty.fired()?, "the truncation must have been applied");
+
+    match locker.get("big").await {
+        Err(Error::Corrupt(_)) => {}
+        Err(other) => panic!("a truncated chunk must be Corrupt, got {other:?}"),
+        Ok(got) => panic!(
+            "a truncated chunk must not read back as a value ({} bytes)",
+            got.map(|g| g.len()).unwrap_or(0)
+        ),
+    }
+
+    // The streaming path must agree: no partial bytes there either.
+    let mut reader = locker
+        .reader("big")
+        .await?
+        .expect("the record itself is intact, so a reader must open");
+    let mut streamed = Vec::new();
+    let mut hit = None;
+    loop {
+        match reader.next_chunk().await {
+            Ok(Some(piece)) => streamed.extend_from_slice(&piece),
+            Ok(None) => break,
+            Err(e) => {
+                hit = Some(e);
+                break;
+            }
+        }
+    }
+    match hit {
+        Some(Error::Corrupt(_)) => {}
+        Some(other) => panic!("the streaming reader must report Corrupt, got {other:?}"),
+        None => panic!(
+            "the streaming reader returned {} bytes of a damaged value",
+            streamed.len()
+        ),
+    }
+    assert!(
+        streamed.len() < value.len(),
+        "the reader must stop at the damage rather than complete the value"
+    );
+
+    // And the damage is confined: an undamaged key alongside it still reads.
+    locker.put("small", &vec![7u8; 8]).await?;
+    assert_eq!(locker.get("small").await?, Some(vec![7u8; 8]));
+
+    bank.close().await?;
     Ok(())
 }

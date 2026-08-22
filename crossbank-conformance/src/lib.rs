@@ -29,6 +29,7 @@ use crossbank::backend::Backend;
 use crossbank::Result;
 
 pub mod cases;
+pub mod fault;
 pub mod harness;
 
 /// Differences between backends that a case may legitimately branch on.
@@ -64,6 +65,23 @@ impl Default for Caps {
 pub trait Harness {
     fn open(&self) -> impl Future<Output = Result<Arc<dyn Backend>>>;
 
+    /// The same store, behind a [`fault::Fault`] the case can arm.
+    ///
+    /// Provided rather than required: every harness gets fault injection for
+    /// free, because the decorator only needs a backend, and a harness that
+    /// forgot to implement it would silently drop a whole class of cases.
+    ///
+    /// The returned handle is *both* the backend to hand to a `Bank` and the
+    /// controller — arm it after the bank and locker are open, so locker
+    /// registration commits are not counted against `at_op`.
+    fn open_with_fault(&self) -> impl Future<Output = Result<Arc<fault::SharedFault>>> {
+        async move {
+            Ok(Arc::new(fault::Fault::new(fault::Shared(
+                self.open().await?,
+            ))))
+        }
+    }
+
     /// Destroy everything this harness owns. Called after every case, so a
     /// failing case cannot leak state into the next one.
     fn destroy(&self) -> impl Future<Output = Result<()>>;
@@ -74,7 +92,7 @@ pub trait Harness {
 }
 
 /// Number of cases in the spec. The arity guard compares against this.
-pub const CASE_COUNT: usize = 48;
+pub const CASE_COUNT: usize = 51;
 
 /// Run `block_on` without pulling in an async runtime.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -140,6 +158,9 @@ macro_rules! __for_each_case {
         $crate::__emit!(listings_see_staged_deferred_writes, $make);
         $crate::__emit!(eventual_durability_survives_flush_then_reopen, $make);
         $crate::__emit!(chunked_reads_are_whole_after_get_many, $make);
+        $crate::__emit!(a_torn_commit_leaves_the_previous_state, $make);
+        $crate::__emit!(quota_exhaustion_mid_batch_writes_nothing, $make);
+        $crate::__emit!(a_truncated_chunk_is_reported_as_corrupt, $make);
     };
 }
 
@@ -280,5 +301,8 @@ macro_rules! __count_cases {
         $counter!(listings_see_staged_deferred_writes, ());
         $counter!(eventual_durability_survives_flush_then_reopen, ());
         $counter!(chunked_reads_are_whole_after_get_many, ());
+        $counter!(a_torn_commit_leaves_the_previous_state, ());
+        $counter!(quota_exhaustion_mid_batch_writes_nothing, ());
+        $counter!(a_truncated_chunk_is_reported_as_corrupt, ());
     };
 }

@@ -56,7 +56,7 @@ plaintext even in encrypted boxes.
 | 5 | Native backend | `redb` 4.1 |
 | 6 | Multi-tab | Broadcast invalidation; native is in-process only |
 | 7 | Reactivity | `watch()` / `watch_key()`, bounded fan-out |
-| 8 | Encryption | Pluggable `Cipher`, no crypto shipped |
+| 8 | Encryption | The pluggable `Filter` trait (a `Cipher` trait was never built), no crypto shipped |
 | 9 | Storage full | `Evictable { max_bytes }` per locker + quota API |
 | 10 | Atomicity | **Closure-scoped** transactions, staged write-set |
 | 11 | Key scans | Ordered keys: prefix, range, reverse, limit |

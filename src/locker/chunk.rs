@@ -214,12 +214,21 @@ impl ValueIds {
     }
 
     /// Persist the current high-water mark. Belongs in every allocating commit.
-    pub(crate) fn counter_op(&self) -> Result<Op> {
+    ///
+    /// `None` while the cursor has never been seeded, because there is no
+    /// high-water mark to persist and writing one anyway would mean writing
+    /// **zero** — walking the stored counter backwards past ids whose chunks
+    /// are still there. No caller can reach that today (every one of them
+    /// allocates first, and allocating seeds), but the op is built from
+    /// whatever the cursor happens to hold, so the safe answer is to write
+    /// nothing rather than to rely on that staying true. [`super::lru::Ticks`]
+    /// answers the same question with its floor.
+    pub(crate) fn counter_op(&self) -> Result<Option<Op>> {
         let guard = self
             .next
             .lock()
             .map_err(|_| Error::backend("value id cursor was poisoned"))?;
-        Ok(counter_op_for(guard.unwrap_or(0)))
+        Ok(guard.map(counter_op_for))
     }
 }
 
@@ -285,6 +294,28 @@ pub fn gc_ops(pointer: &ChunkPointer) -> Op {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
+
+    /// A cursor nobody has allocated from persists nothing.
+    ///
+    /// The op is built from whatever the cursor holds, and an unseeded cursor
+    /// holds nothing — so writing one anyway meant storing `next_value_id = 0`
+    /// over a counter that may be far ahead of it, and the next open would
+    /// hand out ids whose chunks are still stored. Unreachable today, because
+    /// every caller allocates before it asks; the point is that it stays
+    /// harmless if one ever stops.
+    #[test]
+    fn an_unseeded_cursor_writes_no_counter_op() {
+        let ids = ValueIds::default();
+        assert!(ids.counter_op().unwrap().is_none());
+
+        let seeded = ValueIds::default();
+        block_on(seeded.allocate(&crate::backend::MemoryBackend::new())).unwrap();
+        assert!(
+            seeded.counter_op().unwrap().is_some(),
+            "a cursor that has handed an id out must persist its high-water mark"
+        );
+    }
 
     #[test]
     fn pointer_round_trips() {

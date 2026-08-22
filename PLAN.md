@@ -891,6 +891,46 @@ a cost we have chosen to carry. None of them loses data.
   handle on a name is a view of one open locker, that call returns the same
   resident state, stale key and all. `close()` then open, or read the key
   through a lazy handle, which never answers from a resident value at all.
+- **`delete_bank`'s open-bank guard is keyed by the path as it was at open.**
+  `OPEN_BANKS` records the canonicalised path a `Bank` was opened from, and
+  nothing re-derives it afterwards. A file renamed or moved while the bank is
+  open therefore has no entry under its new name, so `delete_bank` on that
+  name unlinks it under the live fd — the hazard the guard exists to prevent.
+  Re-canonicalising on every check would not fix it either (the old key would
+  still be there under the old name); the honest fix is a handle the OS keeps
+  for us, which `redb` does not expose. Renaming a bank file out from under a
+  live `Bank` is not a supported thing to do.
+- **A poisoned `OPEN_BANKS` mutex makes every native bank undeletable until
+  the process restarts.** The registry is a process-wide `std::sync::Mutex`,
+  and a panic while it is held poisons it; `delete_bank` then cannot prove a
+  bank closed and refuses rather than guessing. That is the right direction to
+  fail — the alternative is unlinking a file something may still be writing —
+  but it is unrecoverable in-process, and the only panic that can reach it is
+  one inside the registry's own two-line critical sections.
+- **`Bank::open_locker` racing a concurrent `close` can hand back a dead
+  handle.** The registry check upgrades the weak entry and reads `is_closed`
+  under the lock, but another thread may close the locker between that read
+  and the caller's first operation. The handle is real and shares the right
+  state; its first `get`, `put` or `delete` simply reports `Error::Closed`.
+  Closing a locker other threads are still using is the caller's race, and
+  answering it with a fresh open would be worse — it would silently resurrect
+  a name someone deliberately closed.
+- **`Ticks::counter_op` can lower the stored `next_tick` on a delete-only
+  commit in a fresh bank.** The op persists the LRU clock's current cursor, or
+  its floor when nothing has been allocated yet, and a commit that only
+  deletes allocates no tick — so a bank whose stored counter ran ahead of its
+  floor (a previous session that allocated and stored nothing) can have it
+  written back down. Harmless: the cursor is re-seeded from the stored counter
+  at the next open and only ever moves forward from there, and a tick is a
+  recency ordering rather than an identity, so re-issuing one costs nothing.
+  `ValueIds::counter_op` — where re-issuing *is* an identity collision — now
+  writes nothing at all when unseeded rather than writing zero.
+- **A conformance case `.expect()`s a chunk key it reads back.**
+  `cases.rs` (the chunk-GC case, around line 2060) unwraps the key layout of a
+  row it scanned out of `Table::Chunks`. A backend that returned a short key
+  there would panic the case rather than fail it — a worse report of a real
+  bug, but only inside a test, and only for a backend that is already
+  violating the key contract the same suite pins elsewhere.
 - **A key written twice in one transaction is collapsed.** Only the last write
   per key is committed (and everything before a `clear` is dropped), so the
   eager size check applies to what actually lands rather than to every

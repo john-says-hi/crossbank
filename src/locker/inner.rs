@@ -441,7 +441,9 @@ impl Inner {
     /// **here**, as late as possible in the commit's op list — not back where
     /// the id was taken. See [`super::chunk::ValueIds`] for what persisting
     /// the allocation-time number cost.
-    pub(crate) fn value_counter_op(&self) -> Result<Op> {
+    /// `None` when the cursor has never handed an id out, which no commit
+    /// that needs the op can be in — see [`super::chunk::ValueIds::counter_op`].
+    pub(crate) fn value_counter_op(&self) -> Result<Option<Op>> {
         self.shared.values.counter_op()
     }
 
@@ -505,7 +507,9 @@ impl Inner {
         // cursor is the one the backend applies. A commit builder that calls
         // this for several keys pushes several of these; ops land in order, so
         // the highest wins.
-        ops.push(self.value_counter_op()?);
+        if let Some(op) = self.value_counter_op()? {
+            ops.push(op);
+        }
         Ok(ops)
     }
 

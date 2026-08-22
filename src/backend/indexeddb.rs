@@ -17,7 +17,6 @@ use std::rc::Rc;
 
 use indexed_db::{CursorDirection, Database, Factory};
 use js_sys::Uint8Array;
-use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 
 use super::api::{BFut, Backend, KeyRange, Op, ScanPage, ScanRequest, Table, Usage};

@@ -8,12 +8,13 @@ you rediscover them the hard way.
 - **Repo:** `github.com/john-says-hi/crossbank` (public)
 - **Local checkout:** `~/Documents/crossbank`
 - **Owner:** John (`john-says-hi`)
-- **Started:** 2026-08-15 · **Last worked:** 2026-08-21
-- **State:** **M0–M6 complete and 0.1.0 is tagged** — `v0.1.0` on GitHub, and **not**
+- **Started:** 2026-08-15 · **Last worked:** 2026-08-24
+- **State:** **M0–M6 complete and 0.1.1 is tagged** — `v0.1.1` on GitHub, and **not**
   published to crates.io: `cargo publish --dry-run` passes and `cargo publish` has
   deliberately not been run, because that is John's call. CI is fully green on GitHub,
   every lane including Safari, which is now required. Includes a Phase 3 performance pass
-  (see `PLAN.md` → Performance) and the release pass in §5.
+  (see `PLAN.md` → Performance), the 0.1.0 release pass, and the additive 0.1.1
+  `BankHandle` pass — both in §5.
 
 ---
 
@@ -239,9 +240,30 @@ Safari lane going red and then green, which is what earned it its `required` sta
   latter `continue-on-error` until there is a published baseline), `--lib` on the mobile
   check lanes, and the Safari lane flipped to required.
 
-**379 tests native, 14 doctests, 154 per wasm lane. `CASE_COUNT` is 61, and
+**0.1.1 (2026-08-24) — the `BankHandle` surface a Hive-shaped shim needs.** Purely
+additive; every 0.1.0 program still compiles and behaves the same. `BankHandle` is the
+**only** usable path on the web (a `Bank` is `!Send` there), and it could do `get` / `put`
+/ `delete` / `keys` / `clear` and nothing else — so the operations a real application leans
+on hardest were unreachable from the one API the web can use. Added, each as a `Job`
+variant, a `BankHandle` method, a `serve` arm and a `raw_*` on `Bank`: `put_all`
+(`putAll` — one atomic commit, one fsync, one IDB transaction), `delete_all`
+(`deleteAll`), `get_many` (one backend round trip, answered positionally), `entries`
+(the pairs behind `toMap`, paging from `backend.scan_page_size()` per trap 25),
+`contains_key` (`containsKey`), `len` (`length`), and pass-throughs for `locker_exists`
+(`boxExists`), `locker_names`, `delete_locker` (`deleteBoxFromDisk`), `flush_all`,
+`persist`, `is_persisted` and `usage`. An empty `put_all` / `delete_all` never reaches the
+backend at all. Also `FilterChain::checksum_only()` (CRC32, no LZ4) and
+`BankConfig::with_chain`, because a chain could only be chosen through
+`Bank::with_backend_and_chain` — never from a *location*, so picking one for a real file
+meant giving up `Bank::open` and, natively, the open-bank tracking `delete_bank` needs.
+`BankConfig` gained a public field as a result, so a struct-literal construction now needs
+`chain: None`; the constructors and builders are unaffected.
+
+**391 tests native, 16 doctests, 154 per wasm lane. `CASE_COUNT` is 61, and
 `crash_recovery` spawns 5 real child processes. The conformance suite × 3 backends in
-browsers, plus browser-only coherence tests.**
+browsers, plus browser-only coherence tests.** The twelve new tests are native `#[test]`s
+(eleven in `src/handle.rs`, one in `tests/handle_bulk.rs`), so no wasm lane count moved and
+`ci/expected-tests.txt` is untouched — see trap 20.
 
 ### Remaining work
 
@@ -257,9 +279,9 @@ browsers, plus browser-only coherence tests.**
 ```sh
 cd ~/Documents/crossbank
 
-cargo nextest run                      # native, all backends (379 tests)
+cargo nextest run                      # native, all backends (391 tests)
 cargo +1.97.1 clippy --workspace --all-targets --all-features   # see §7
-cargo test --doc                       # nextest does NOT run doctests (14 of them)
+cargo test --doc                       # nextest does NOT run doctests (16 of them)
 cargo run --example settings           # the Hive `Box` shape, end to end
 cargo run --example candles            # lazy: transact, Writer/Reader, Evictable
 cargo publish --dry-run                # must pass; do NOT publish without John

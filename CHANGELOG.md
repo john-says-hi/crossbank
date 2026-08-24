@@ -7,6 +7,56 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-08-24
+
+Additive only. Every 0.1.0 program still compiles and behaves the same.
+
+`BankHandle` — the bytes-only `Send + Sync` proxy that is the *only* usable path on the web,
+where a `Bank` is `!Send` — could do `get` / `put` / `delete` / `keys` / `clear` and nothing
+else. That is a thin slice of the Hive surface a shim in front of it has to reproduce, and
+the gaps were exactly the operations a real application leans on hardest: bulk writes, bulk
+reads, and the bank-level questions. This release closes them.
+
+### Added
+
+- **`BankHandle::put_all`** — Hive's `putAll`. Many entries in **one** atomic commit: one
+  fsync natively, one IndexedDB transaction on the web. An empty list is `Ok(())` and never
+  reaches the backend. Raw values are stored unchunked, so keep a single value well under
+  ~100 MiB on the web.
+- **`BankHandle::delete_all`** — Hive's `deleteAll`. Many keys in one atomic commit;
+  removing an absent key is not an error, and an empty list is a no-op.
+- **`BankHandle::get_many`** — many keys in one backend round trip, answered positionally,
+  which on IndexedDB is one transaction instead of one per key.
+- **`BankHandle::entries`** — the key/value pairs behind Hive's `toMap`, filtered by prefix
+  and in byte order, paging from the backend's own `scan_page_size` rather than a constant.
+- **`BankHandle::contains_key`** — Hive's `containsKey`. One read, and the value is never
+  decoded.
+- **`BankHandle::len`** — Hive's `length`, counted over storage: the bytes-only view keeps
+  no RAM index, so there is no number to remember.
+- **`BankHandle::locker_exists` / `locker_names` / `delete_locker`** — Hive's `boxExists`,
+  the registry listing, and `deleteBoxFromDisk`, from a handle rather than only from the
+  `Bank` itself.
+- **`BankHandle::flush_all` / `persist` / `is_persisted` / `usage`** — the durability and
+  storage-pressure calls, reachable from the thread the handle is on.
+- **`FilterChain::checksum_only()`** and **`codec::CHECKSUM_ONLY_CHAIN_ID`** — a CRC32-only
+  chain, the middle option between `FilterChain::raw()` (no corruption detection at all) and
+  the default LZ4-then-CRC32. For payloads LZ4 cannot shrink — densely packed floats,
+  already-compressed media, encrypted blobs — where bit rot should still be caught.
+- **`BankConfig::with_chain(Arc<FilterChain>)`** and the `BankConfig::chain` field — pick the
+  bank's filter chain from a *location*. `Bank::with_backend_and_chain` could already do this
+  over a backend you constructed yourself, but not through `Bank::open`, so choosing a chain
+  for a real file or a real IndexedDB database meant giving up the location-based open (and,
+  natively, the open-bank tracking that lets `delete_bank` refuse a bank that is still open).
+
+### Notes
+
+- `BankConfig` gained a public field. Constructing it with a struct literal rather than
+  `BankConfig::at` / `web` / `memory` therefore needs the extra `chain: None`; every
+  constructor and builder call is unaffected.
+- The chain a bank opens under is persisted per locker and enforced on every later open, so
+  `with_chain` is a decision about a *store*: reopening the same bank under a different chain
+  is `Error::SchemaMismatch`, not a re-encode.
+
 ## [0.1.0] — 2026-08-21
 
 Initial release. crossbank is local, on-device key/value storage for Rust — a direct
@@ -145,5 +195,6 @@ because Hive's `get(key, defaultValue:)` is used on a `LazyBox` as readily as on
 - Safari's Intelligent Tracking Prevention deletes IndexedDB after seven days without user
   interaction. Nothing in code can answer that; see the README's "Web caveats".
 
-[Unreleased]: https://github.com/john-says-hi/crossbank/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/john-says-hi/crossbank/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/john-says-hi/crossbank/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/john-says-hi/crossbank/releases/tag/v0.1.0

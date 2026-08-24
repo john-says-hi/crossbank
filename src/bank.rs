@@ -243,6 +243,13 @@ pub struct BankConfig {
     /// Native accepts the flag and does nothing — `redb` takes an exclusive
     /// file lock, so there is no second process to stay coherent with.
     pub coherence: bool,
+
+    /// The filter chain every locker in this bank reads and writes through,
+    /// unless a locker names its own with [`LockerConfig::with_chain`].
+    ///
+    /// `None` means [`crate::codec::default_chain`] — LZ4 then CRC32. Set it
+    /// with [`BankConfig::with_chain`].
+    pub chain: Option<Arc<FilterChain>>,
 }
 
 impl BankConfig {
@@ -250,6 +257,7 @@ impl BankConfig {
         Self {
             location: Location::Memory,
             coherence: false,
+            chain: None,
         }
     }
 
@@ -257,6 +265,7 @@ impl BankConfig {
         Self {
             location: Location::Path(path.into()),
             coherence: false,
+            chain: None,
         }
     }
 
@@ -264,12 +273,44 @@ impl BankConfig {
         Self {
             location: Location::Web(name.into()),
             coherence: false,
+            chain: None,
         }
     }
 
     /// See [`BankConfig::coherence`]. Never on by default.
     pub fn with_coherence(mut self, on: bool) -> Self {
         self.coherence = on;
+        self
+    }
+
+    /// Open the bank under a specific filter chain.
+    ///
+    /// [`Bank::with_backend_and_chain`] can already do this over a backend you
+    /// built yourself; this is the same choice from a *location*, so a
+    /// consumer opening a real file or a real IndexedDB database does not have
+    /// to reach past [`Bank::open`] to make it.
+    ///
+    /// The chain id is persisted per locker and enforced on every later open
+    /// (see [`Bank::bind_schema`]'s neighbour, `bind_chain`), so this is a
+    /// decision about a *store*, not a runtime option: reopening the same bank
+    /// under a different chain is [`Error::SchemaMismatch`], not a re-encode.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use crossbank::{Bank, BankConfig, FilterChain};
+    ///
+    /// # async fn demo() -> crossbank::Result<()> {
+    /// // Checksums, no compression — for payloads LZ4 cannot shrink.
+    /// let bank = Bank::open(
+    ///     BankConfig::at("candles.crossbank").with_chain(Arc::new(FilterChain::checksum_only())),
+    /// )
+    /// .await?;
+    /// assert_eq!(bank.chain().describe(), "chain 2 (crc32)");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_chain(mut self, chain: Arc<FilterChain>) -> Self {
+        self.chain = Some(chain);
         self
     }
 }
@@ -496,9 +537,18 @@ impl Bank {
             (Location::Web(name), true) => crate::coherence::Coherence::open(name),
             _ => crate::coherence::Coherence::disabled(),
         };
+        let chain = config
+            .chain
+            .clone()
+            .unwrap_or_else(|| Arc::new(default_chain()));
         match config.location {
             Location::Memory => {
-                Self::assembled(Arc::new(crate::backend::MemoryBackend::new()), coherence).await
+                Self::assembled(
+                    Arc::new(crate::backend::MemoryBackend::new()),
+                    chain,
+                    coherence,
+                )
+                .await
             }
             Location::Path(path) => {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -509,6 +559,7 @@ impl Bank {
                     let located = path.clone();
                     let bank = Self::assembled(
                         Arc::new(crate::backend::RedbBackend::open(path)?),
+                        chain,
                         coherence,
                     )
                     .await?;
@@ -531,7 +582,7 @@ impl Bank {
                 #[cfg(target_arch = "wasm32")]
                 {
                     let backend = crate::backend::IndexedDbBackend::open(&name).await?;
-                    Self::assembled(Arc::new(backend), coherence).await
+                    Self::assembled(Arc::new(backend), chain, coherence).await
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -569,19 +620,17 @@ impl Bank {
         backend: Arc<dyn Backend>,
         chain: FilterChain,
     ) -> Result<Self> {
-        Self::assembled_with_chain(backend, chain, crate::coherence::Coherence::disabled()).await
+        Self::assembled(
+            backend,
+            Arc::new(chain),
+            crate::coherence::Coherence::disabled(),
+        )
+        .await
     }
 
     async fn assembled(
         backend: Arc<dyn Backend>,
-        coherence: crate::coherence::Coherence,
-    ) -> Result<Self> {
-        Self::assembled_with_chain(backend, default_chain(), coherence).await
-    }
-
-    async fn assembled_with_chain(
-        backend: Arc<dyn Backend>,
-        chain: FilterChain,
+        chain: Arc<FilterChain>,
         coherence: crate::coherence::Coherence,
     ) -> Result<Self> {
         let shared = Arc::new(crate::locker::inner::Shared {
@@ -591,7 +640,7 @@ impl Bank {
         let (job_sender, job_receiver) = mpsc::channel(JOB_QUEUE);
         let bank = Self {
             backend,
-            chain: Arc::new(chain),
+            chain,
             registry: Mutex::new(HashMap::new()),
             chains: Mutex::new(HashMap::new()),
             job_sender,
@@ -1137,6 +1186,165 @@ impl Bank {
         }
 
         Ok(keys)
+    }
+
+    /// Read many keys in **one** backend round trip.
+    ///
+    /// The answers come back positionally: slot `i` is the value for `keys[i]`,
+    /// and `None` there means that key is absent. On IndexedDB this is the
+    /// difference between one transaction and N of them.
+    pub(crate) async fn raw_get_many(
+        &self,
+        locker: &str,
+        keys: Vec<String>,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id = self.raw_locker(locker).await?;
+        let encoded: Vec<Vec<u8>> = keys.iter().map(|k| crate::key::encode(id, k)).collect();
+        let stored = self.backend.get_many(Table::Records, encoded).await?;
+
+        stored
+            .into_iter()
+            .map(|slot| match slot {
+                Some(bytes) => Ok(Some(crate::codec::decode(&bytes, &self.chain)?)),
+                None => Ok(None),
+            })
+            .collect()
+    }
+
+    /// Write many entries in **one** atomic commit.
+    ///
+    /// Everything lands together or nothing does — one fsync natively, one
+    /// IndexedDB transaction on the web. An empty list is `Ok(())` and never
+    /// reaches the backend at all.
+    pub(crate) async fn raw_put_all(
+        &self,
+        locker: &str,
+        entries: Vec<(String, Vec<u8>)>,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let id = self.raw_locker(locker).await?;
+        let mut ops = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            ops.push(Op::Put {
+                table: Table::Records,
+                key: crate::key::encode(id, &key),
+                value: crate::codec::encode(&value, &self.chain)?,
+            });
+        }
+        self.backend.commit(ops).await
+    }
+
+    /// Remove many keys in **one** atomic commit. Removing an absent key is
+    /// not an error, and an empty list never reaches the backend.
+    pub(crate) async fn raw_delete_all(&self, locker: &str, keys: Vec<String>) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let id = self.raw_locker(locker).await?;
+        let ops = keys
+            .into_iter()
+            .map(|key| Op::Delete {
+                table: Table::Records,
+                key: crate::key::encode(id, &key),
+            })
+            .collect();
+        self.backend.commit(ops).await
+    }
+
+    /// Every key/value pair under `prefix`, in byte order.
+    ///
+    /// The same paging loop as [`Bank::raw_keys`], asking the backend for
+    /// values as well as keys. The page size comes from the backend rather
+    /// than a constant, so a backend that pages cheaply is not held to a
+    /// browser-shaped number.
+    pub(crate) async fn raw_entries(
+        &self,
+        locker: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let id = self.raw_locker(locker).await?;
+        let mut range = crate::key::prefix_range(id, prefix);
+        let mut entries = Vec::new();
+        let limit = self.backend.scan_page_size();
+
+        loop {
+            let page = self
+                .backend
+                .scan(ScanRequest {
+                    table: Table::Records,
+                    range: range.clone(),
+                    reverse: false,
+                    limit,
+                    want_values: true,
+                })
+                .await?;
+
+            for (encoded, value) in &page.items {
+                let key = crate::key::decode(id, encoded)?.to_string();
+                // A scan asked for values and given a key without one is a
+                // backend that did not honour `want_values`. Say so, rather
+                // than quietly dropping the key from the answer — a listing
+                // that is silently short is the worst of the three outcomes.
+                let stored = value.as_deref().ok_or_else(|| {
+                    Error::Corrupt(format!(
+                        "the backend returned no value for {key:?} in a scan that asked for values"
+                    ))
+                })?;
+                entries.push((key, crate::codec::decode(stored, &self.chain)?));
+            }
+
+            match page.resume {
+                Some(last) => range.start = std::ops::Bound::Excluded(last),
+                None => break,
+            }
+        }
+
+        Ok(entries)
+    }
+
+    /// Whether one key is stored, without decoding its value.
+    pub(crate) async fn raw_contains_key(&self, locker: &str, key: &str) -> Result<bool> {
+        let id = self.raw_locker(locker).await?;
+        let encoded = crate::key::encode(id, key);
+        Ok(self.backend.get(Table::Records, &encoded).await?.is_some())
+    }
+
+    /// How many records one locker holds.
+    ///
+    /// A key-only scan: the bytes-only view keeps no RAM index, so this is a
+    /// count over storage rather than a number already known.
+    pub(crate) async fn raw_len(&self, locker: &str) -> Result<usize> {
+        let id = self.raw_locker(locker).await?;
+        let mut range = crate::key::locker_range(id);
+        let mut total = 0usize;
+        let limit = self.backend.scan_page_size();
+
+        loop {
+            let page = self
+                .backend
+                .scan(ScanRequest {
+                    table: Table::Records,
+                    range: range.clone(),
+                    reverse: false,
+                    limit,
+                    want_values: false,
+                })
+                .await?;
+
+            total += page.items.len();
+
+            match page.resume {
+                Some(last) => range.start = std::ops::Bound::Excluded(last),
+                None => break,
+            }
+        }
+
+        Ok(total)
     }
 
     /// Record, or verify, the schema tag a locker was written with.

@@ -14,7 +14,7 @@
 //!
 //! # Status
 //!
-//! **v0.1.0 tagged; crates.io publish pending. The API may still change
+//! **v0.1.1 tagged; crates.io publish pending. The API may still change
 //! before 1.0.** M0–M6 are
 //! complete: data persists natively (`redb`) and in real browsers
 //! (IndexedDB), large lazy values are chunked with streaming
@@ -43,7 +43,11 @@
 //!
 //! Bulk work goes through [`Locker::put_all`] / [`Locker::delete_all`], each
 //! one atomic commit, and change notification through [`Locker::watch`],
-//! [`Locker::watch_key`] and [`Locker::watch_keys`].
+//! [`Locker::watch_key`] and [`Locker::watch_keys`]. [`BankHandle`] carries the
+//! same bulk shapes over its channel ([`BankHandle::put_all`],
+//! [`BankHandle::delete_all`], [`BankHandle::get_many`],
+//! [`BankHandle::entries`]) plus the bank-level questions, which is what a
+//! Hive-shaped shim in front of it needs.
 //!
 //! Damaged data is survivable rather than fatal: [`OnCorrupt::Skip`] opens a
 //! locker without its unreadable records and lists them via

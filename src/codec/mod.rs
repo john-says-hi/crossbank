@@ -13,6 +13,13 @@ pub use value::{decode, encode, type_tag};
 /// Id of the chain returned by [`default_chain`].
 pub const DEFAULT_CHAIN_ID: u8 = 1;
 
+/// Id of the chain returned by [`FilterChain::checksum_only`].
+///
+/// Distinct from [`DEFAULT_CHAIN_ID`] and from [`FilterChain::raw`]'s `0`,
+/// because the id is what gates format compatibility: two chains that
+/// transform bytes differently must never share one.
+pub const CHECKSUM_ONLY_CHAIN_ID: u8 = 2;
+
 /// The chain used unless a locker asks for another: LZ4, then CRC32.
 ///
 /// Compression first so the checksum covers what is actually stored — bit rot

@@ -130,6 +130,30 @@ impl FilterChain {
         Self::new(0, Vec::new())
     }
 
+    /// A chain that checksums and nothing else: CRC32, no compression.
+    ///
+    /// The middle option between [`FilterChain::raw`], which detects no
+    /// corruption at all, and [`crate::codec::default_chain`], which pays LZ4
+    /// for every value. Reach for it where the payload will not compress —
+    /// densely packed floats, already-compressed media, encrypted blobs — but
+    /// bit rot should still be caught rather than decoded.
+    ///
+    /// ```
+    /// use crossbank::FilterChain;
+    ///
+    /// let chain = FilterChain::checksum_only();
+    /// assert_eq!(chain.describe(), "chain 2 (crc32)");
+    ///
+    /// let sealed = chain.seal_slice(b"incompressible").unwrap();
+    /// assert_eq!(chain.open(&sealed).unwrap(), b"incompressible");
+    /// ```
+    pub fn checksum_only() -> Self {
+        Self::new(
+            crate::codec::CHECKSUM_ONLY_CHAIN_ID,
+            vec![Box::new(super::filters::Crc32)],
+        )
+    }
+
     pub fn id(&self) -> u8 {
         self.id
     }

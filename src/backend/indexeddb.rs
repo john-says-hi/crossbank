@@ -43,11 +43,73 @@ impl IndexedDbBackend {
     /// Version stays at 1 forever. Creating an object store requires a
     /// `versionchange` transaction, which force-closes every other connection,
     /// so we create the three fixed tables once and never bump again.
+    ///
+    /// # Repairing an empty shell
+    ///
+    /// A database can already exist at `VERSION` and still hold no object
+    /// stores at all. A bare `indexedDB.open(name)` from anywhere else on the
+    /// page — a devtools probe, a hand-typed console line, another library
+    /// sniffing for the name — creates exactly that: version 1, zero stores.
+    /// The version then already matches, so `connect`'s upgrade
+    /// callback never runs, `open` reports success, and every later
+    /// transaction dies with `NotFoundError` ("Cannot change something that
+    /// does not exists"). Reopening cannot clear it, because reopening is what
+    /// created it.
+    ///
+    /// A store-less database provably holds no data — there is nowhere for a
+    /// record to live — so deleting it costs nothing, and it is the one repair
+    /// that keeps `VERSION` pinned at 1. Bumping the version instead would
+    /// strand every other connection still asking for 1.
+    ///
+    /// Deleting waits on other connections to the same name the way IndexedDB
+    /// always does; a second tab pinning the shell open delays the repair
+    /// until it lets go.
     pub async fn open(name: impl Into<String>) -> Result<Self> {
         let name = name.into();
+        let db = Self::connect(&name).await?;
+
+        let db = if db.object_store_names().is_empty() {
+            db.close();
+            Factory::<Infallible>::get()
+                .map_err(map_err)?
+                .delete_database(&name)
+                .await
+                .map_err(map_err)?;
+            Self::connect(&name).await?
+        } else {
+            db
+        };
+
+        // A *partial* table set is a different animal. An upgrade transaction
+        // is atomic, so crossbank cannot have left one behind: something else
+        // owns this name, and deleting it would destroy a stranger's data.
+        // Refuse rather than repair.
+        let present = db.object_store_names();
+        let missing: Vec<&str> = STORES
+            .into_iter()
+            .filter(|store| !present.iter().any(|have| have.as_str() == *store))
+            .collect();
+        if !missing.is_empty() {
+            db.close();
+            return Err(Error::Corrupt(format!(
+                "IndexedDB database {name:?} is not a crossbank bank: missing [{}], has [{}]",
+                missing.join(", "),
+                present.join(", "),
+            )));
+        }
+
+        Ok(Self {
+            db: RefCell::new(Some(Rc::new(db))),
+            name,
+        })
+    }
+
+    /// One `factory.open` at `VERSION`, creating the three fixed tables if
+    /// the database is new.
+    async fn connect(name: &str) -> Result<Database<Infallible>> {
         let factory = Factory::<Infallible>::get().map_err(map_err)?;
-        let db = factory
-            .open(&name, VERSION, async move |evt| {
+        factory
+            .open(name, VERSION, async move |evt| {
                 let database = evt.database();
                 for store in STORES {
                     database.build_object_store(store).create()?;
@@ -55,11 +117,7 @@ impl IndexedDbBackend {
                 Ok(())
             })
             .await
-            .map_err(map_err)?;
-        Ok(Self {
-            db: RefCell::new(Some(Rc::new(db))),
-            name,
-        })
+            .map_err(map_err)
     }
 
     /// The open connection, or [`Error::Closed`].

@@ -11,16 +11,21 @@
 # WHEN YOU ADD TEST CASES YOU MUST BUMP THESE NUMBERS. Run the lane, take the
 # "OK: N test(s) actually ran and passed." number, and write N here.
 #
-# Last verified: 2026-08-21, racing opens on the web: 154 per lane.
-# (138 at shared locker handles, +14 for the seven new conformance cases x
-#  two browser backends, +1 for tests/web_delete_bank.rs — delete_bank takes
-#  a BankConfig, not a Backend, so it cannot be a conformance case, +1 for
-#  tests/web_shared_handles.rs, the racing-opens case, which needs a bank
-#  rather than a backend for the same reason.)
-plain-firefox    154
-plain-chrome     154
-atomics-chrome   154
-atomics-firefox  154
-# Safari runs the same plain suite; the lane is required as of 2026-08-21,
-# verified at 154.
-plain-safari     154
+# Last verified: 2026-08-24, the 0.1.2 release pass: 157 per lane.
+# (154 at racing opens on the web, +2 that landed with 0.1.1 and were never
+#  written down here — proof that a floor left too low is a guard gone quiet,
+#  since the lanes stayed green while the real count moved — and +1 for
+#  tests/web_shell_recovery.rs, the store-less-database repair, which cannot
+#  be a conformance case because the broken shell has to be built through the
+#  raw IndexedDB factory.)
+#
+# plain-chrome, plain-firefox and atomics-chrome were each measured directly
+# on this pass and all three came back 157. atomics-firefox runs the same
+# cases as atomics-chrome, and Safari runs the plain suite, so all five carry
+# the same number.
+plain-firefox    157
+plain-chrome     157
+atomics-chrome   157
+atomics-firefox  157
+# Safari runs the same plain suite; the lane is required as of 2026-08-21.
+plain-safari     157

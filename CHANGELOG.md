@@ -7,6 +7,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-08-24
+
+The release that goes to crates.io, and the one real defect found on the way there.
+
+### Fixed
+
+- **An IndexedDB database that exists but holds no object stores is repaired when the bank
+  is opened, instead of poisoning every operation that follows.** A bare
+  `indexedDB.open(name)` from anywhere else on the page — a devtools probe, a hand-typed
+  console line, another library sniffing for the name — creates that database at version 1
+  with nothing inside it. crossbank asks for version 1 too, so its upgrade callback never
+  fired, `open` reported success, and the first real read or write died with `NotFoundError`
+  ("Cannot change something that does not exists"). Reopening could never clear it, because
+  reopening was what created it. A store-less database provably holds no data — there is
+  nowhere for a record to live — so it is now deleted and rebuilt on open. That keeps
+  `VERSION` pinned at 1; bumping the version instead would have stranded every other
+  connection still asking for 1. A database carrying some *other* set of stores is left
+  untouched and reported as `Error::Corrupt`: an upgrade transaction is atomic, so crossbank
+  cannot have left a partial set behind, which means the name belongs to something else and
+  deleting it would destroy a stranger's data. Covered by `tests/web_shell_recovery.rs` in
+  every browser lane.
+
+### Changed
+
+- docs.rs is now asked to build `wasm32-unknown-unknown` alongside the native target. It
+  builds one target by default, so `IndexedDbBackend` and everything else behind
+  `cfg(target_arch = "wasm32")` would have been missing from the only documentation most
+  people ever read — for a crate whose whole reason to exist is that it spans both.
+- `PLAN.md` and `RESUME_HERE.md` no longer ship inside the published tarball. They are this
+  project's inward-facing working notes, both are one click away in the repository, and a
+  crates.io version can never be edited or withdrawn — only yanked — so what goes into one
+  is permanent.
+- `ci/expected-tests.txt` re-verified at 157 per lane. It had been left at 154 through the
+  0.1.1 additions, which is exactly how this guard goes quiet: a floor that is too low
+  cannot notice a suite that stopped being compiled in.
+
+### Added
+
+- A `release` workflow that publishes from a `v*` tag through crates.io Trusted Publishing,
+  refusing to upload when the tag and `Cargo.toml` disagree. The first publish is still
+  manual: crates.io can only be told to trust a workflow for a crate that already exists.
+
 ## [0.1.1] — 2026-08-24
 
 Additive only. Every 0.1.0 program still compiles and behaves the same.
@@ -195,6 +237,7 @@ because Hive's `get(key, defaultValue:)` is used on a `LazyBox` as readily as on
 - Safari's Intelligent Tracking Prevention deletes IndexedDB after seven days without user
   interaction. Nothing in code can answer that; see the README's "Web caveats".
 
-[Unreleased]: https://github.com/john-says-hi/crossbank/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/john-says-hi/crossbank/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/john-says-hi/crossbank/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/john-says-hi/crossbank/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/john-says-hi/crossbank/releases/tag/v0.1.0

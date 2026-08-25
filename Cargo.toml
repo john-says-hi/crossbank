@@ -3,7 +3,7 @@ members = [".", "crossbank-conformance"]
 
 [package]
 name = "crossbank"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -43,7 +43,26 @@ exclude = [
     "tests/conformance_memory.rs",
     "tests/conformance_redb.rs",
     "tests/conformance_indexeddb.rs",
+    # ~100 KB of this project's own working notes: the original plan and the
+    # handoff doc. They are written inward, to whoever picks the project back
+    # up, and both are one click away in the repository the README points at.
+    # A published tarball is what someone's build downloads, and a crates.io
+    # version can never be edited or withdrawn — only yanked — so what ships
+    # in it is a permanent decision. Code, tests, examples and the README are
+    # what a dependency owes its users.
+    "PLAN.md",
+    "RESUME_HERE.md",
 ]
+
+# docs.rs builds ONE target unless told otherwise, and its default is the
+# native one — which would leave `IndexedDbBackend` and every other
+# `cfg(target_arch = "wasm32")` item missing from the only documentation most
+# people ever read, for a crate whose whole reason to exist is that it spans
+# both. Naming wasm32 here puts it in the platform picker at the top of the
+# page. docs.rs builds a version exactly once, so this has to be right BEFORE
+# the publish, not after it.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 
 [features]
 # Opt-in, and OFF everywhere by default. Its only job is to compile the wasm

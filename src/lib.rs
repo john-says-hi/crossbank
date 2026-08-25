@@ -9,13 +9,15 @@
 //! Hive's architecture and ergonomics, deliberately not its file format, and
 //! Hive's own data is not migrated.
 //!
-//! See `README.md` for the Hive-to-crossbank mapping and `PLAN.md` for the
-//! design and its rationale.
+//! See the [README](https://github.com/john-says-hi/crossbank#readme) for the
+//! Hive-to-crossbank mapping, and `PLAN.md` in the
+//! [repository](https://github.com/john-says-hi/crossbank) for the design and
+//! its rationale. The plan is inward-facing working notes and deliberately
+//! does not ship inside the published crate.
 //!
 //! # Status
 //!
-//! **v0.1.1 tagged; crates.io publish pending. The API may still change
-//! before 1.0.** M0–M6 are
+//! **0.1.x — the API may still change before 1.0.** M0–M6 are
 //! complete: data persists natively (`redb`) and in real browsers
 //! (IndexedDB), large lazy values are chunked with streaming
 //! [`Writer`]/[`Reader`] access, and storage pressure is answered by

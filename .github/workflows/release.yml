@@ -1,0 +1,85 @@
+name: release
+
+# Publish to crates.io from a tag, using Trusted Publishing: crates.io trades
+# GitHub's OIDC claim for a short-lived token, so no long-lived API token ever
+# has to live in a repository secret or on a laptop. The token is minted for
+# this job and revoked when it ends.
+#
+# ONE-TIME SETUP, and the order matters: crates.io can only be told to trust a
+# workflow for a crate that ALREADY exists, so the FIRST version has to be
+# published by hand with a personal token. After that, on
+# https://crates.io/crates/crossbank/settings, add a trusted publisher for
+# repository `john-says-hi/crossbank` and workflow `release.yml`, and every
+# later release is just a tag push.
+#
+# `ci.yml` runs on pushes to master, NOT on tags, so tag a commit whose CI is
+# already green. `cargo publish` still builds and verifies the packaged crate
+# before uploading, and the version guard below runs before either.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # The whole mechanism. Without this the OIDC claim cannot be minted and the
+  # auth action has nothing to trade.
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      # A crates.io version is permanent — it can be yanked but never edited or
+      # withdrawn — so a tag that disagrees with the manifest must stop the
+      # release here, before anything is uploaded.
+      - name: Tag and Cargo.toml must agree
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "crossbank"))')"
+          echo "tag=${tag} manifest=${manifest}"
+          if [ "${tag}" != "${manifest}" ]; then
+            echo "FAIL: tag v${tag} does not match Cargo.toml version ${manifest}." >&2
+            exit 1
+          fi
+
+      # Idempotent on purpose. The first version has to go up by hand, so its
+      # tag arrives here with the version already on crates.io — and a re-tag
+      # of any release would too. Neither is a failure, and neither should
+      # paint the repository red.
+      - name: Skip a version that is already published
+        id: existing
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'User-Agent: crossbank release workflow (github.com/john-says-hi/crossbank)' \
+            "https://crates.io/api/v1/crates/crossbank/${v}" || echo 000)"
+          if [ "${code}" = 200 ]; then
+            echo "crossbank ${v} is already on crates.io — nothing to publish."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "crossbank ${v} is not published yet (HTTP ${code})."
+            echo "skip=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Authenticate with crates.io
+        id: auth
+        if: steps.existing.outputs.skip != 'true'
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: cargo publish
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked

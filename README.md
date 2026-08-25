@@ -1,5 +1,10 @@
 # crossbank
 
+[![crates.io](https://img.shields.io/crates/v/crossbank.svg)](https://crates.io/crates/crossbank)
+[![docs.rs](https://docs.rs/crossbank/badge.svg)](https://docs.rs/crossbank)
+[![ci](https://github.com/john-says-hi/crossbank/actions/workflows/ci.yml/badge.svg)](https://github.com/john-says-hi/crossbank/actions/workflows/ci.yml)
+[![license](https://img.shields.io/crates/l/crossbank.svg)](#license)
+
 **crossbank is local, on-device key/value storage for Rust — a direct replacement for
 Flutter's [Hive](https://github.com/IO-Design-Team/hive_ce) (`hive_ce`).** It saves your
 application's data on the machine it is running on: a `redb` file on Linux, macOS, Windows,
@@ -18,6 +23,16 @@ not to us, not to anyone. Data goes in, data comes back out, on that device only
 > **Picking this up after a break?** Read **[RESUME_HERE.md](RESUME_HERE.md)** first — the
 > original plan, why this project exists, the Hive parity we are matching, and the traps
 > that cost a day each.
+
+## Install
+
+```toml
+[dependencies]
+crossbank = "0.1"
+```
+
+Nothing else to turn on: the native backend (`redb`) and the browser backend (IndexedDB) are
+selected by the target you build for, and there are no default features to argue with.
 
 ## Why
 

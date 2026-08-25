@@ -42,14 +42,12 @@ jobs:
       # dev-only feature was caught (trap 32). Catch that on every PR rather
       # than on publish day.
       - run: cargo publish --dry-run
-      # The crate is not on crates.io yet, so there is no published baseline to
-      # diff against — and cargo-semver-checks *errors* in that situation, it
-      # does not pass. `continue-on-error` keeps that from turning `lint` red
-      # and, through `ci-green`'s `needs`, the whole first push red. Remove
-      # `continue-on-error` in the same commit that follows the first
-      # `cargo publish`, which is when this step starts earning its keep.
+      # 0.1.2 is on crates.io, so there is finally a published baseline to diff
+      # against and this step can do its job: fail the lane when a change breaks
+      # the public API without the version saying so. It carried
+      # `continue-on-error` until now only because cargo-semver-checks *errors*
+      # rather than passes when the crate has never been published.
       - uses: obi1kenobi/cargo-semver-checks-action@v2
-        continue-on-error: true
 
   # Cargo.toml declares `rust-version = "1.90"`, and nothing checked it until
   # this job existed — the first run of this lane is what proved the old
